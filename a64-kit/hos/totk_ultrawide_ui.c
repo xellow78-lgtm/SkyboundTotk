@@ -17,7 +17,12 @@
 extern float hos_view_aspect;
 extern const char *hos_user_dir;
 
+/* (each build names its layout archive after itself: v1.4.3's is Common.Product.140.Nin_NX_NVN.blarc.zs) */
+#if GAME_VERSION == 143
+static const char *const kArchive = "content:/UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs";
+#else
 static const char *const kArchive = "content:/UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs";
+#endif
 
 static uint8_t *read_host(const char *path, size_t *n) {
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);

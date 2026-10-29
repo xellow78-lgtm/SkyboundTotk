@@ -250,6 +250,12 @@ static int realtime_on(void) {
     if (on < 0) {
         const char *e = getenv("HOS_REALTIME");
         on = !(e && *e == '0');
+#if GAME_VERSION != 100
+        /* (the two step splices below are v1.0.0's: on another build the game keeps its own interval step, so the
+           pacing must not assume ours. v1.4.3: found but changed, see FINDINGS / the port notes) */
+        if (on && e) hos_log("vi: HOS_REALTIME: not for this game build yet (no step hooks): the game's own step");
+        on = 0;
+#endif
     }
     return on;
 }
@@ -304,6 +310,7 @@ static void frame_step_present(int64_t now) {
     for (int i = 0; i < n; i++) sum += samples[i];
     InterlockedExchange64(&frame_step_bits, (LONG64)step_bits((float)(sum / n)));
 }
+#if GAME_VERSION == 100
 SPLICE_AFTER(0x087a83e4, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") {
     if (!realtime_on()) return;
     const uint64_t v = frame_step();
@@ -316,6 +323,12 @@ SPLICE_AFTER(0x088f689c, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") {
     if (!realtime_on()) return;
     G32(c->x[8]) = (uint32_t)frame_step();
 }
+#endif
+/* v1.4.3 (not hooked yet): the step is f_083e67f0, which now takes the interval as a float in s0 and stores ratio =
+   s0 * 0.5 at +0x10, 1 / ratio at +0x14, s0 / 60 at +0x18 and an integer at +0x1c; the global ratio is written in
+   f_082daa20 as (60 / interval) * 0.5, after the frame-rate controller, now at framework + 0x200 with its current
+   interval at +0x50. The controller checks below (fw + 0x248, current at +0x14) do not match there, so they leave
+   the interval as the game asks. */
 
 static void totk_set_interval(int n) {
     if (!totk_ctl) return;
@@ -335,7 +348,7 @@ static void read_interval_mode(void) {
 }
 static int pin_totk_interval(Ctx *c, int requested) {
     read_interval_mode();
-    if (interval_mode == 0) return requested;
+    if (interval_mode == 0 || GAME_VERSION != 100) return requested;   /* (the controller's layout is v1.0.0's) */
     const uint64_t sp = c->x[31];
     const uint64_t ctl = G64(sp + 0x20), fw = G64(sp + 0x28);
     if (!ctl || ctl != fw + 0x248 || (int)G32(ctl + 0x14) != requested) {
@@ -559,7 +572,9 @@ static int64_t native_next_vsync;
 int hos_vi_native_interval(Ctx *c, int requested) {
     uint64_t hos_guest_size(void);
     read_interval_mode();
-    if (interval_mode == 0) return requested;
+    /* (the checks below are loose enough that other data could pass them on a build whose controller moved: v1.0.0's
+       layout only) */
+    if (interval_mode == 0 || GAME_VERSION != 100) return requested;
     const uint64_t ctl = c->x[20];
     if (ctl != totk_ctl) {
         MEMORY_BASIC_INFORMATION mi;

@@ -15,6 +15,8 @@
 #include "hos.h"
 #include <stdlib.h>
 
+#if GAME_VERSION == 100   /* v1.0.0's core setup and job pools */
+
 void f_0c82bea0(Ctx *);   /* (sdk, called by the original with (0xC63C000+304, 0)) */
 
 int hos_game_cores(void) {
@@ -65,3 +67,7 @@ SPLICE_AFTER(0x09247560, "c->x[26]=recomp_load32(c,c->x[8] + 0);") {
     hos_log("cores: the BaseProc job pool gets %d executors (the game is set up for %u cores)", n, (unsigned)c->x[26]);
     c->x[26] = (uint64_t)n;
 }
+#else
+/* (other builds: the core setup is not found there, so the game keeps its own 3 cores) */
+int hos_game_cores(void) { return 0; }
+#endif   /* GAME_VERSION == 100 */

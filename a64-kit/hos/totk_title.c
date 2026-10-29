@@ -27,6 +27,8 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#if GAME_VERSION == 100   /* v1.0.0's title menu and system window; for v1.4.3 only partly found */
+
 void f_086f7164(Ctx *);   /* (ui2d layout of a UI object, +40; pane name) -> pane */
 void f_08b90810(Ctx *);   /* (same layout; "Part/Pane" path; message view; 1; 0): set a text pane's string */
 void f_08b906ec(Ctx *);   /* (message view): empty view { text 0, length 0, message -1 } */
@@ -357,3 +359,7 @@ uint64_t hos_title_input(uint64_t buttons) {
     }
     return buttons;
 }
+#else
+/* (other builds: no credits entries; the player's buttons as they are) */
+uint64_t hos_title_input(uint64_t buttons) { return buttons; }
+#endif   /* GAME_VERSION == 100 */

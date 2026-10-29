@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if GAME_VERSION == 100   /* v1.0.0's Frustum::isVisible; not found in v1.4.3 yet, where the lifted code runs */
 #pragma clang fp contract(off)
 
 void f_08704b7c(Ctx *);
@@ -120,3 +121,4 @@ static int native_visible(Ctx *c, uint64_t *visible_out) {
     *visible_out = (uint64_t)visible;
     return 1;
 }
+#endif   /* GAME_VERSION == 100 */

@@ -1,0 +1,8 @@
+# TOTK builds this port knows, by the build ID of their main module (NSO header +0x40; build_game.py and nso.py
+# print it). a64-kit/build.py compiles the OS layer (hos/) with -DGAME_VERSION=<version> for the build it lifted,
+# and applies only the hooks, splices and HLE functions whose `#if GAME_VERSION ...` holds for it; an unlisted
+# build is refused. Profiles are per build too: their function names are that build's addresses ("-": none).
+#
+# main build ID                              version  hot functions   link order
+082ce09b06e33a123cb1e2770f5f9147709033db     100      hot_funcs.txt   link_order.txt
+277178b7dba1b6d4949a84778d4abc58b31b34f5     143      -               -

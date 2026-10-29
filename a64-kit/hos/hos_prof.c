@@ -556,7 +556,8 @@ static DWORD WINAPI prof_main(void *p) {
             const char *nm = hits[i].name;
             unsigned long long a = 0;
             if (!strncmp(nm, "f_", 2) && sscanf(nm + 2, "%llx", &a) == 1) {
-                if (a < 0xc700000) m_main += hits[i].self;
+                /* (the sdk module's base in the image: after main, which is a different size in each build) */
+                if (a < (GAME_VERSION == 143 ? 0xbb00000ULL : 0xc700000ULL)) m_main += hits[i].self;
                 else m_sdk += hits[i].self;
             } else if (!strncmp(nm, "Zw", 2) || !strncmp(nm, "Nt", 2) || strstr(nm, "Wait") || strstr(nm, "Sleep")) {
                 m_wait += hits[i].self;

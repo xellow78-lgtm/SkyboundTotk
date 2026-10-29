@@ -1126,8 +1126,16 @@ HLE(_ZN2nn5audio13SetVoicePitchEPNS0_9VoiceTypeEf) {
     au_unlock();
 }
 HLE(_ZN2nn5audio16SetVoicePriorityEPNS0_9VoiceTypeEi) {}
-/* BiquadFilterParameter: bool enable @0, int16 numerator[3] @2, int16 denominator[2] @8 (Q14) */
-HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_21BiquadFilterParameterE) {
+/* BiquadFilterParameter: bool enable @0, int16 numerator[3] @2, int16 denominator[2] @8 (Q14). SDK 21 (TOTK v1.4.3)
+   renamed it TBiquadFilterParameter<short>, same layout: its SetVoiceBiquadFilterParameter reads the byte at +0 and
+   int16s at +2, +4, +6, +8, +0xa. */
+static void voice_biquad(Ctx *c);
+#if GAME_VERSION != 143
+HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_21BiquadFilterParameterE) { voice_biquad(c); }
+#else
+HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_22TBiquadFilterParameterIsEE) { voice_biquad(c); }
+#endif
+static void voice_biquad(Ctx *c) {
     au_lock();
     Voice *v = voice_of(ARG(0));
     const int f = (int)ARG(1);

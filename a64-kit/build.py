@@ -36,15 +36,126 @@ def dirs(a):
     return root, os.path.join(root, "image"), os.path.join(root, "gen"), os.path.join(root, "native")
 
 
-def entry_hooks(img_dir=None):
-    """Lifted functions with an entry hook in hos/*.c, address -> the hook's C name: ENTRY_HOOK(0x0xxxxxxx), and
-    ENTRY_HOOK_SYM(name) for a function the image exports by that name (image/image.json)."""
-    out = {}
-    exports = None
+# ---- game versions ----------------------------------------------------------------------------------------------
+# A port's versions.txt (ports/zelda-<name>/) lists the builds of the game it knows by their main module's build ID.
+# The OS layer is compiled with -DGAME_VERSION=<n> for the build that was lifted, and its address hooks, splices and
+# HLE functions are read the way the compiler sees them: one inside `#if GAME_VERSION ...` belongs to the builds that
+# condition holds for. An address hook outside such a condition would fire on any build, where that address is some
+# other code, so with a versions table it is an error. Without a table (another port) nothing changes: GAME_VERSION 0.
+
+def port_dir(name):
+    return os.path.join(HERE, "..", "ports", "zelda-" + name)
+
+
+def versions(name):
+    """The rows of ports/zelda-<name>/versions.txt: {build_id, version, hot, order} ([] without the file)."""
+    path = os.path.join(port_dir(name), "versions.txt")
+    out = []
+    if os.path.isfile(path):
+        for line in open(path, encoding="utf-8"):
+            f = line.split("#", 1)[0].split()
+            if not f:
+                continue
+            if len(f) < 2 or len(f[0]) < 16 or not f[1].isdigit():
+                sys.exit("%s: expected '<main build ID> <version> [hot functions] [link order]': %s" % (path, line.strip()))
+            opt = lambda i: f[i] if len(f) > i and f[i] != "-" else None
+            out.append({"build_id": f[0].lower(), "version": int(f[1]), "hot": opt(2), "order": opt(3)})
+    return out
+
+
+def game_version(name, main_build_id):
+    """The versions.txt row for this main build ID; the build stops on a build the table does not list."""
+    rows = versions(name)
+    if not rows:
+        hot = os.path.join(port_dir(name), "hot_funcs.txt")
+        order = os.path.join(port_dir(name), "link_order.txt")
+        return {"build_id": main_build_id, "version": 0, "hot": "hot_funcs.txt" if os.path.isfile(hot) else None,
+                "order": "link_order.txt" if os.path.isfile(order) else None, "table": False}
+    for r in rows:
+        if main_build_id.lower().startswith(r["build_id"]) or r["build_id"].startswith(main_build_id.lower()):
+            return dict(r, table=True)
+    sys.exit("this game build (main %s) is not in %s: its hooks have not been ported. Known builds:\n  %s"
+             % (main_build_id, os.path.join(port_dir(name), "versions.txt"),
+                "\n  ".join("%s  %d" % (r["build_id"], r["version"]) for r in rows)))
+
+
+def image_version(name, img_dir):
+    """game_version of a lifted image (image/image.json)."""
+    meta = json.load(open(os.path.join(img_dir, "image.json")))
+    main = next(m for m in meta["modules"] if m["name"] == "main")
+    return game_version(name, main["build_id"])
+
+
+_DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+_VERSION_TOKENS = re.compile(r"GAME_VERSION|\d+|==|!=|<=|>=|<|>|&&|\|\||!|\(|\)|\s+")
+
+
+def version_condition(expr, version):
+    """True/False for a preprocessor condition over GAME_VERSION alone, None for any other condition."""
+    e = re.sub(r"/\*.*?\*/", " ", expr.split("//", 1)[0]).strip()
+    if "GAME_VERSION" not in e:
+        return None
+    toks = _VERSION_TOKENS.findall(e)
+    if "".join(toks) != e:
+        return None
+    py = " ".join({"&&": "and", "||": "or", "!": "not"}.get(t, t) for t in toks if not t.isspace())
+    return bool(eval(py, {"__builtins__": {}}, {"GAME_VERSION": version}))
+
+
+def version_lines(src, version):
+    """[(line, active, versioned)]: whether the compiler sees the line with -DGAME_VERSION=<version>, and whether it
+    sits inside a condition on GAME_VERSION. Other conditions (#ifdef _WIN32, ...) keep every branch."""
+    out, stack = [], []   # frames: [parent active, known, taken, active, versioned]
+    active, versioned = True, False
+    for line in src.split("\n"):
+        m = _DIRECTIVE.match(line)
+        if m:
+            kw, rest = m.groups()
+            if kw in ("if", "ifdef", "ifndef"):
+                c = version_condition(rest, version) if kw == "if" else None
+                known = c is not None
+                stack.append([active, known, bool(c), active and (c if known else True), versioned or known])
+            elif kw == "elif" and stack:
+                parent, known, taken, _, ver = stack[-1]
+                c = version_condition(rest, version)
+                if known and c is not None:
+                    stack[-1] = [parent, True, taken or c, parent and not taken and c, ver]
+                else:
+                    stack[-1] = [parent, False, taken, parent, ver]
+            elif kw == "else" and stack:
+                parent, known, taken, _, ver = stack[-1]
+                stack[-1] = [parent, known, True, parent and (not taken if known else True), ver]
+            elif kw == "endif" and stack:
+                stack.pop()
+            active, versioned = (stack[-1][3], stack[-1][4]) if stack else (True, False)
+            out.append((line, True, versioned))
+            continue
+        out.append((line, active, versioned))
+    return out
+
+
+def hos_sources(gv):
+    """(file name, the text the compiler sees for game version gv) for hos/*.c; inactive lines are blank, so line
+    numbers stay. With a versions table, an address hook outside every GAME_VERSION condition stops the build."""
     for f in sorted(os.listdir(HOS)):
         if not f.endswith(".c"):
             continue
-        src = open(os.path.join(HOS, f)).read()
+        lines = version_lines(open(os.path.join(HOS, f), encoding="utf-8", errors="replace").read(), gv["version"])
+        if gv.get("table"):
+            unversioned = "\n".join(l for l, _, ver in lines if not ver)
+            bad = re.findall(r"^(ENTRY_HOOK|SPLICE_AFTER|SPLICE_AFTER_EACH)\((0x[0-9a-fA-F]+)", unversioned, re.M)
+            if bad:
+                sys.exit("hos/%s: %s outside any `#if GAME_VERSION ...`: an address hook belongs to one game build "
+                         "(versions.txt)" % (f, ", ".join("%s(%s)" % b for b in bad)))
+        yield f, "\n".join(l if act else "" for l, act, _ in lines)
+
+
+def entry_hooks(gv, img_dir=None):
+    """Lifted functions with an entry hook in hos/*.c for game version gv, address -> the hook's C name:
+    ENTRY_HOOK(0x0xxxxxxx), and ENTRY_HOOK_SYM(name) for a function the image exports by that name (image.json)."""
+    out = {}
+    exports = None
+    for f, src in hos_sources(gv):
         for a in re.findall(r"^ENTRY_HOOK\((0x[0-9a-fA-F]+)\)", src, re.M):
             if len(a) != 10:
                 sys.exit("%s: ENTRY_HOOK(%s): write the address with 8 hex digits" % (f, a))
@@ -60,10 +171,10 @@ def entry_hooks(img_dir=None):
     return out
 
 
-def apply_entry_hooks(gen, img_dir=None):
+def apply_entry_hooks(gen, gv, img_dir=None):
     """Splice `if (entry_...(c)) return;` into the lifted functions that have an entry hook, and take it out of
     the ones that no longer do. Files are only rewritten when the set changed (gen/entry_hooks.json)."""
-    want = entry_hooks(img_dir)
+    want = entry_hooks(gv, img_dir)
     state = os.path.join(gen, "entry_hooks.json")
     have = {}
     if os.path.exists(state):
@@ -94,13 +205,11 @@ def apply_entry_hooks(gen, img_dir=None):
     json.dump({str(k): v for k, v in sorted(want.items())}, open(state, "w"))
 
 
-def splices():
-    """SPLICE_AFTER(0x0xxxxxxx, "text") in hos/*.c: address -> the anchor text (the C string literal's contents)."""
+def splices(gv):
+    """SPLICE_AFTER(0x0xxxxxxx, "text") in hos/*.c for game version gv: address -> the anchor text (the C string
+    literal's contents)."""
     out = {}
-    for f in sorted(os.listdir(HOS)):
-        if not f.endswith(".c"):
-            continue
-        src = open(os.path.join(HOS, f)).read()
+    for f, src in hos_sources(gv):
         for each, a, text in re.findall(r'^SPLICE_AFTER(_EACH)?\((0x[0-9a-fA-F]+),\s*"((?:[^"\\]|\\.)*)"\)', src, re.M):
             if len(a) != 10:
                 sys.exit("%s: SPLICE_AFTER(%s): write the address with 8 hex digits" % (f, a))
@@ -109,10 +218,10 @@ def splices():
     return out
 
 
-def apply_splices(gen):
+def apply_splices(gen, gv):
     """Put `splice_0x...(c);` after the first line of each spliced lifted function that contains its anchor, and
     take out the ones no longer wanted. Files are only rewritten when the set changed (gen/splices.json)."""
-    want = splices()
+    want = splices(gv)
     state = os.path.join(gen, "splices.json")
     have = {int(k): v for k, v in json.load(open(state)).items()} if os.path.exists(state) else {}
     if want == have:
@@ -151,14 +260,13 @@ def apply_splices(gen):
     json.dump({str(k): v for k, v in sorted(want.items())}, open(state, "w"))
 
 
-def implemented():
-    """C names of the HLE functions in hos/*.c: `void imp_x(Ctx` definitions and `HLE(x)` macros."""
+def implemented(gv):
+    """C names of the HLE functions in hos/*.c for game version gv: `void imp_x(Ctx` definitions and `HLE(x)`
+    macros."""
     names = set()
-    for f in os.listdir(HOS):
-        if f.endswith(".c"):
-            src = open(os.path.join(HOS, f)).read()
-            names |= set(re.findall(r"^void (imp_\w+)\(Ctx", src, re.M))
-            names |= {"imp_" + n for n in re.findall(r"^HLE\((\w+)\)", src, re.M)}
+    for f, src in hos_sources(gv):
+        names |= set(re.findall(r"^void (imp_\w+)\(Ctx", src, re.M))
+        names |= {"imp_" + n for n in re.findall(r"^HLE\((\w+)\)", src, re.M)}
     return names
 
 
@@ -171,8 +279,8 @@ def demangle(syms):
         return {s: s for s in syms}
 
 
-def gen_stubs(gen, meta):
-    have = implemented()
+def gen_stubs(gen, meta, gv):
+    have = implemented(gv)
     hooks = [h for h in meta["hooks"] if h["c"] not in have]
     dm = demangle([h["sym"] for h in hooks])
     lines = ['#include "a64.h"', "void a64_unimplemented(Ctx *A64_NOESC c, const char *sym, int *seen);", ""]
@@ -221,11 +329,9 @@ def check_hle(img, hle):
     for m in img.modules:
         known |= {s["name"] for s in m.symbols if s["name"]}
     bad = sorted(h for h in hle if h not in known)
-    if bad and os.environ.get("A64_ALLOW_MISSING_HLE"):   # (another game version: the symbol may be gone or renamed)
-        print("hos/ defines imp_ functions for symbols no module has (left out, A64_ALLOW_MISSING_HLE):\n  "
-              + "\n  ".join(bad))
-    elif bad:
-        sys.exit("hos/ defines imp_ functions for symbols no module has (typo?):\n  " + "\n  ".join(bad))
+    if bad:
+        sys.exit("hos/ defines imp_ functions for symbols no module has (a typo, or a symbol another game build "
+                 "has: put it in an `#if GAME_VERSION ...`):\n  " + "\n  ".join(bad))
 
 
 def thread_hooks(img, meta):
@@ -368,16 +474,19 @@ def mod_patches(img, mods_dir):
 def cmd_lift(a):
     import nx_image, a64_lift, a64_rtgen
     root, img_dir, gen, _ = dirs(a)
-    hot = a.hot or os.path.join(HERE, "..", "ports", "zelda-" + a.name, "hot_funcs.txt")
-    if hot != "none" and os.path.isfile(hot) and not os.environ.get("A64_HOT_FUNCS"):
-        os.environ["A64_HOT_FUNCS"] = hot
     t0 = time.time()
-    hle = {n[4:] for n in implemented()}
-    if a.hle:
-        hle |= {l.strip() for l in open(a.hle) if l.strip() and not l.startswith("#")}
     import nso
     mods = nso.load_exefs(a.exefs)
     main = next(m for m in mods if m.name == "main")
+    gv = game_version(a.name, main.build_id)
+    print("game build: main %s, GAME_VERSION %d" % (main.build_id[:16], gv["version"]))
+    # (the profile's hot functions are that build's addresses: versions.txt names them per build)
+    hot = a.hot or (os.path.join(port_dir(a.name), gv["hot"]) if gv["hot"] else "none")
+    if hot != "none" and os.path.isfile(hot) and not os.environ.get("A64_HOT_FUNCS"):
+        os.environ["A64_HOT_FUNCS"] = hot
+    hle = {n[4:] for n in implemented(gv)}
+    if a.hle:
+        hle |= {l.strip() for l in open(a.hle) if l.strip() and not l.startswith("#")}
     kind = {s["name"]: s["type"] for m in mods for s in m.symbols if s["defined"] and s["name"]}
     stubbed = {s["name"] for s in main.symbols if not s["defined"] and s["name"] and os_facing(s["name"])
                and kind.get(s["name"], "func") == "func"} - hle
@@ -407,7 +516,7 @@ def cmd_lift(a):
             os.remove(os.path.join(gen, f))
     files = L.write(gen)
     a64_rtgen.write(gen)
-    stubs = gen_stubs(gen, meta)
+    stubs = gen_stubs(gen, meta, gv)
     L.report()
     print("wrote %d code files, %d import stubs to %s (%.0fs)" % (len(files), stubs, gen, time.time() - t0))
     with open(os.path.join(gen, "indirect_br.txt"), "w") as f:
@@ -479,6 +588,10 @@ def compile_one(job):
 
 def cmd_native(a):
     root, img_dir, gen, nat = dirs(a)
+    gv = image_version(a.name, img_dir)
+    # (the OS layer only: the lifted code is one build's already, and its objects keep their flags and cache)
+    version_flag = ["-DGAME_VERSION=%d" % gv["version"]]
+    print("game build: main %s, GAME_VERSION %d" % (gv["build_id"][:16], gv["version"]))
     # (RX_OBJ_DIR=<name>: objects in native/<name>, so builds with other flags do not recompile each other's)
     obj_dir = os.path.join(nat, os.environ.get("RX_OBJ_DIR", "obj"))
     # RX_LIFTED_LTO=1 (experiment): the lifted code as ThinLTO bitcode, so small functions inline across the 42 code
@@ -516,8 +629,8 @@ def cmd_native(a):
     runtime = [os.path.join(RT, f) for f in os.listdir(RT) if f.endswith(".c")] + \
               [os.path.join(HOS, f) for f in os.listdir(HOS) if f.endswith(".c")]
     # lifted chunks include only rt/ and generated headers; the OS layer also includes hos/*.h and the renderer's API
-    apply_entry_hooks(gen, img_dir)
-    apply_splices(gen)
+    apply_entry_hooks(gen, gv, img_dir)
+    apply_splices(gen, gv)
     deps_lifted = headers_key(RT, gen)
     deps_runtime = headers_key(RT, HOS, gen, os.path.join(GPU, "render"))
     # the renderer: WebGPU through wgpu-native (a release of github.com/gfx-rs/wgpu-native: include/, lib/)
@@ -541,7 +654,8 @@ def cmd_native(a):
         # (-ffunction-sections: each lifted function in a section of its own, so RX_LINK_ORDER can place them)
         flags = ["-" + a.opt, "-g" if a.debug else "-g0", "-mllvm", "-rotation-max-header-size=0",
                  "-ffunction-sections"] + (["-mllvm", capture_flag] if capture_flag else []) + fpx + lifted_lto \
-            if src in lifted else ["-O2", "-g", "-I" + os.path.join(HERE, "..", "third_party", "opus", "include")]
+            if src in lifted else ["-O2", "-g", "-I" + os.path.join(HERE, "..", "third_party", "opus", "include")] \
+            + version_flag
         # (the profile's hot functions, lifted with A64_HOT_CHUNK=1: RX_HOT_CFLAGS, e.g. a higher inline threshold)
         if os.path.basename(src) == "code_hot.c" and os.environ.get("RX_HOT_CFLAGS"):
             flags = flags + os.environ["RX_HOT_CFLAGS"].split()
@@ -601,12 +715,12 @@ def cmd_native(a):
             shutil.copyfile(sdl, dst)
     # RX_LINK_ORDER=<file>: lifted functions laid out in that order first (hos_prof.c's HOS_PROFILE_ORDER writes one:
     # the sampled functions, hottest first), so the hot code shares pages and cache lines. Default: the port's
-    # link_order.txt when there is one (TOTK: castle profile, 2966 functions; game threads -1.4% CPU a frame, 3 rounds,
-    # 2026-10-22); RX_LINK_ORDER=none: the compiler's order
+    # link order for this game build (versions.txt; TOTK 1.0.0: castle profile, 2966 functions; game threads -1.4% CPU
+    # a frame, 3 rounds, 2026-10-22); RX_LINK_ORDER=none: the compiler's order
     order = os.environ.get("RX_LINK_ORDER")
     if order is None:
-        port_order = os.path.join(HERE, "..", "ports", "zelda-" + a.name, "link_order.txt")
-        order = port_order if os.path.isfile(port_order) else None
+        port_order = os.path.join(port_dir(a.name), gv["order"]) if gv["order"] else None
+        order = port_order if port_order and os.path.isfile(port_order) else None
     if order == "none":
         order = None
     order_flags = ["-Wl,/ORDER:@" + os.path.abspath(order).replace("\\", "/"), "-Wl,/IGNORE:4037"] if order else []
@@ -645,8 +759,9 @@ def cmd_web(a):
     # lifted code's are shared (a full lifted compile for the web takes hours)
     mt = os.environ.get("RX_WEB_MT") == "1"
     mt_flags, mt_pre = (["-DRX_WEB_MT=1"], "mt_") if mt else ([], "")
-    apply_entry_hooks(gen, img_dir)
-    apply_splices(gen)
+    gv = image_version(a.name, img_dir)
+    apply_entry_hooks(gen, gv, img_dir)
+    apply_splices(gen, gv)
     deps_lifted = headers_key(RT, gen)
     lifted = sorted(os.path.join(gen, f) for f in os.listdir(gen) if f.endswith(".c"))
     fpx = ["-DA64_FPX_FN=static inline __attribute__((always_inline))"] if os.environ.get("RX_FPX_INLINE") else []
@@ -660,7 +775,8 @@ def cmd_web(a):
         runtime = [os.path.join(RT, f) for f in os.listdir(RT) if f.endswith(".c")] +                   [os.path.join(HOS, f) for f in os.listdir(HOS) if f.endswith(".c") and f not in WEB_SKIP] +                   [os.path.join(web_hos, f) for f in os.listdir(web_hos) if f.endswith(".c")]
         deps_runtime = headers_key(RT, HOS, web_hos, gen, os.path.join(GPU, "render"))
         opus = os.path.join(HERE, "..", "third_party", "opus")
-        rflags = common + mt_flags + ["-I" + web_hos, "-I" + HOS, "-I" + os.path.join(opus, "include"), "-O2", "-g"]
+        rflags = common + mt_flags + ["-I" + web_hos, "-I" + HOS, "-I" + os.path.join(opus, "include"), "-O2", "-g",
+                                      "-DGAME_VERSION=%d" % gv["version"]]
         for src in runtime:
             name = mt_pre + ("web_" if os.path.dirname(src) == web_hos else "") + os.path.basename(src)[:-2]
             jobs.append((emcc, src, os.path.join(obj_dir, name + ".o"), rflags, deps_runtime))
@@ -734,10 +850,12 @@ def cmd_stubs(a):
     an HLE or a stub, so nothing else changes (no re-lift). A symbol that was never hooked needs a re-lift."""
     root, img_dir, gen, _ = dirs(a)
     meta = json.load(open(os.path.join(img_dir, "image.json")))
+    gv = image_version(a.name, img_dir)
     hooked = {h["c"] for h in meta["hooks"]}
-    missing = sorted(n for n in implemented() if n not in hooked)
-    n = gen_stubs(gen, meta)
-    print("%d stubs left; %d HLE functions in hos/" % (n, len(implemented())))
+    have = implemented(gv)
+    missing = sorted(n for n in have if n not in hooked)
+    n = gen_stubs(gen, meta, gv)
+    print("%d stubs left; %d HLE functions in hos/" % (n, len(have)))
     if missing:
         print("not hooked in this lift (re-lift to use them):\n  " + "\n  ".join(missing))
 

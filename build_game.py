@@ -1,4 +1,4 @@
-"""Build SkyboundTOTK from an already-extracted TOTK 1.0.0 dump."""
+"""Build SkyboundTOTK from an already-extracted TOTK dump (1.0.0; 1.4.3 experimentally, see GAME_BUILDS)."""
 import hashlib
 import json
 import os
@@ -13,10 +13,17 @@ BUILD = ROOT / "build"
 KIT = ROOT / "a64-kit"
 WGPU = ROOT / "third_party" / "wgpu-native"
 DIST = ROOT / "dist" / "SkyboundTOTK"
-# The original base-game module IDs used by this port; this is not a full content-integrity check.
-EXPECTED_IDS = {
-    "main": "082ce09b06e33a123cb1e2770f5f9147709033db",
-    "sdk": "b9046c31eb5d31271be970fe732d38df49c6aa21",
+# The game builds this port knows, by their module IDs (ports/zelda-totk/versions.txt lists the same main IDs for
+# a64-kit/build.py, which picks each build's hooks); this is not a full content-integrity check. An experimental
+# build lifts and links, but not every hook is ported to it (ports/zelda-totk/versions.txt, hos/ GAME_VERSION):
+# set SKYBOUND_EXPERIMENTAL=1 to build one.
+GAME_BUILDS = {
+    "1.0.0": {"main": "082ce09b06e33a123cb1e2770f5f9147709033db", "sdk": "b9046c31eb5d31271be970fe732d38df49c6aa21",
+              "experimental": False},
+    # 1.4.3: no frame-pacing, native frustum-cull, ultrawide-HUD or title-credit hooks yet; RomFS = the base's with
+    # the update applied (a64-kit/tools/nx.py romfs <base.nsp> <out> --update <update.nsp>)
+    "1.4.3": {"main": "277178b7dba1b6d4949a84778d4abc58b31b34f5", "sdk": "574284b40c06cf1821a44857939083bee5716820",
+              "experimental": True},
 }
 
 
@@ -24,19 +31,35 @@ def fail(message):
     raise SystemExit("ERROR: " + message)
 
 
+def module_id(path):
+    with path.open("rb") as f:
+        header = f.read(0x60)
+    if len(header) < 0x60 or header[:4] != b"NSO0":
+        fail(f"{path} is not an NSO module. Put your extracted TOTK ExeFS and RomFS in game/. See README.md.")
+    return header[0x40:0x60].rstrip(b"\0").hex()
+
+
 def check_game():
+    """The extracted game's ExeFS and RomFS folders, and which known build it is."""
     exefs, romfs = GAME / "exefs", GAME / "romfs"
-    for name, expected in EXPECTED_IDS.items():
-        path = exefs / name
-        if not path.is_file():
-            fail(f"Missing {path}. Put your extracted TOTK 1.0.0 ExeFS and RomFS in game/. See README.md.")
-        with path.open("rb") as f:
-            header = f.read(0x60)
-        if len(header) < 0x60 or header[:4] != b"NSO0" or header[0x40:0x60].rstrip(b"\0").hex() != expected:
-            fail(f"{path} is not the expected TOTK 1.0.0 module. Updates and other versions are unsupported.")
+    for name in ("main", "sdk"):
+        if not (exefs / name).is_file():
+            fail(f"Missing {exefs / name}. Put your extracted TOTK ExeFS and RomFS in game/. See README.md.")
+    ids = {name: module_id(exefs / name) for name in ("main", "sdk")}
+    version = next((v for v, b in GAME_BUILDS.items() if b["main"] == ids["main"]), None)
+    if version is None:
+        fail(f"{exefs / 'main'} is not a TOTK build this port knows (main {ids['main']}). Known: "
+             + ", ".join(GAME_BUILDS) + ".")
+    if ids["sdk"] != GAME_BUILDS[version]["sdk"]:
+        fail(f"{exefs / 'sdk'} is not TOTK {version}'s sdk module: main and sdk are from different dumps.")
+    if GAME_BUILDS[version]["experimental"]:
+        if os.environ.get("SKYBOUND_EXPERIMENTAL") != "1":
+            fail(f"TOTK {version} support is experimental (not every hook is ported). Set SKYBOUND_EXPERIMENTAL=1 "
+                 "to build it anyway.")
+        print(f"WARNING: building TOTK {version}, which is experimental: see GAME_BUILDS in build_game.py.", flush=True)
     if not (romfs / "Event").is_dir() or not (romfs / "ActorSystem").is_dir():
         fail(f"{romfs} does not look like an extracted TOTK RomFS. See README.md.")
-    return exefs, romfs
+    return exefs, romfs, GAME_BUILDS[version]
 
 
 def check_tools():
@@ -72,7 +95,8 @@ def lift_identity(exefs):
             if path.is_file() and path.suffix in (".py", ".c", ".cpp", ".h"):
                 digest.update(path.relative_to(ROOT).as_posix().encode())
                 digest.update(path.read_bytes())
-    for path in (KIT / "build.py", KIT / "tools/nso.py", ROOT / "ports/zelda-totk/hot_funcs.txt"):
+    for path in (KIT / "build.py", KIT / "tools/nso.py", ROOT / "ports/zelda-totk/hot_funcs.txt",
+                 ROOT / "ports/zelda-totk/versions.txt"):
         if path.is_file():
             digest.update(path.relative_to(ROOT).as_posix().encode())
             digest.update(path.read_bytes())
@@ -106,7 +130,7 @@ def package(romfs):
 
 
 def main():
-    exefs, romfs = check_game()
+    exefs, romfs, game = check_game()
     check_tools()
     # A matching completed lift is reusable; changed inputs or an interrupted lift need a fresh directory.
     identity = lift_identity(exefs)
@@ -117,9 +141,9 @@ def main():
     if complete and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == identity:
         with image.open(encoding="utf-8") as f:
             modules = {m["name"]: m["build_id"] for m in json.load(f)["modules"]}
-        if any(modules.get(name) != build_id for name, build_id in EXPECTED_IDS.items()):
+        if any(modules.get(name) != game[name] for name in ("main", "sdk")):
             fail("Existing build contains a different game version. Move the build folder aside before retrying.")
-        print("Reusing the existing lifted base-game code.", flush=True)
+        print("Reusing the existing lifted game code.", flush=True)
     else:
         if BUILD.exists() and any(BUILD.iterdir()):
             fail("Build inputs changed or the lift is incomplete. Move the build folder aside before rebuilding.")
