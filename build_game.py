@@ -150,7 +150,13 @@ def main():
         run(sys.executable, KIT / "build.py", "lift", "totk", "--exefs", exefs,
             "--skip", "subsdk0", "--build", BUILD)
         stamp.write_text(identity + "\n", encoding="ascii")
-    run(sys.executable, KIT / "build.py", "native", "totk", "--build", BUILD, "--wgpu", WGPU)
+    # SKYBOUND_JOBS=<n>: compile at most n files at once (default: one per CPU thread). Each lifted file is ~25 MB
+    # of C and takes a few GB of memory to compile, so a machine with less memory than threads x that wants fewer.
+    jobs = os.environ.get("SKYBOUND_JOBS", "")
+    if jobs and not (jobs.isdigit() and int(jobs) > 0):
+        fail(f"SKYBOUND_JOBS must be a positive number, not {jobs!r}.")
+    run(sys.executable, KIT / "build.py", "native", "totk", "--build", BUILD, "--wgpu", WGPU,
+        *(["-j", jobs] if jobs else []))
     package(romfs)
 
 
