@@ -24,7 +24,7 @@ import lz4.block
 DT = {1: "NEEDED", 2: "PLTRELSZ", 3: "PLTGOT", 4: "HASH", 5: "STRTAB", 6: "SYMTAB", 7: "RELA", 8: "RELASZ",
       9: "RELAENT", 10: "STRSZ", 11: "SYMENT", 12: "INIT", 13: "FINI", 20: "PLTREL", 23: "JMPREL",
       25: "INIT_ARRAY", 26: "FINI_ARRAY", 27: "INIT_ARRAYSZ", 28: "FINI_ARRAYSZ", 30: "FLAGS",
-      0x6FFFFEF5: "GNU_HASH", 0x6FFFFFF9: "RELACOUNT"}
+      35: "RELRSZ", 36: "RELR", 37: "RELRENT", 0x6FFFFEF5: "GNU_HASH", 0x6FFFFFF9: "RELACOUNT"}
 R_AARCH64 = {257: "ABS64", 1025: "GLOB_DAT", 1026: "JUMP_SLOT", 1027: "RELATIVE", 1030: "TLSDESC"}
 STT = {0: "notype", 1: "object", 2: "func", 3: "section", 4: "file", 6: "tls"}
 STB = {0: "local", 1: "global", 2: "weak"}
@@ -102,6 +102,28 @@ class Nso:
                 sym = r_info >> 32
                 self.relocs.append({"offset": r_off, "type": R_AARCH64.get(r_info & 0xFFFFFFFF, r_info & 0xFFFFFFFF),
                                     "sym": self.symbols[sym]["name"] if sym else None, "addend": addend})
+        # DT_RELR (newer toolchains: TOTK 1.4.3's main and sdk keep all their relative relocations this way): a list
+        # of words, each either a location (even: relocate that word, then continue after it) or a bitmap (odd: bit
+        # n of word >> 1 relocates the n-th word after the last location, then 63 words further on). A relocated
+        # word gets the module base added to what it holds, so its addend is the value stored there (Atmosphere,
+        # libmesosphere init/kern_init_elf.cpp). They become ordinary RELATIVE relocations here.
+        relr, relr_size = d("RELR"), d("RELRSZ")
+        if relr_size:
+            if d("RELRENT") not in (0, 8):
+                raise ValueError(f"{self.name}: DT_RELRENT {d('RELRENT')}, expected 8")
+            where = None
+            for i in range(relr_size // 8):
+                entry = self.u64(relr + 8 * i)
+                if not entry & 1:
+                    places, where = [entry], entry + 8
+                else:
+                    if where is None:
+                        raise ValueError(f"{self.name}: DT_RELR starts with a bitmap")
+                    bits = entry >> 1
+                    places = [where + 8 * b for b in range(63) if bits >> b & 1]
+                    where += 63 * 8
+                for at in places:
+                    self.relocs.append({"offset": at, "type": "RELATIVE", "sym": None, "addend": self.u64(at)})
         self.init_array = [self.u64(d("INIT_ARRAY") + 8 * i) for i in range(d("INIT_ARRAYSZ") // 8)]
         self.eh_funcs = self._eh_frame_hdr_table()
 
