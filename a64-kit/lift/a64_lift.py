@@ -963,8 +963,12 @@ class Lifter:
         """True if the instruction w may write X`reg`: Rd/Rt (bits 0-4) of anything but a store, compare or
         branch, and Rt2 of a load pair."""
         if ((w >> 25) & 7) == 7:
-            # SIMD & FP data processing: Rd is a V register, except FP<->integer conversions/moves and UMOV/SMOV
-            return (w & 31) == reg and ((w & 0x5F20FC00) == 0x1E200000 or (w & 0xBFE0DC00) == 0x0E002C00)
+            # SIMD & FP data processing: Rd is a V register, except UMOV/SMOV and the FP<->integer conversions and
+            # moves whose result is an integer. In that group (sf 0 S 11110 type 1 rmode opcode Rn Rd) opcode 010
+            # SCVTF, 011 UCVTF and 111 FMOV Vd, Xn/Wn write a V register: counted as writing Xd, `fmov s1, w26`
+            # made x1 (a hoisted jump table address) unknown and left TOTK 1.4.3's br at 0x86e9708 unresolved.
+            return (w & 31) == reg and (((w & 0x5F20FC00) == 0x1E200000 and (w >> 16) & 7 not in (2, 3, 7))
+                                        or (w & 0xBFE0DC00) == 0x0E002C00)
         if (w & 0x0A000000) == 0x08000000 and (w >> 26) & 1:
             return False   # SIMD & FP load/store: Rt (and Rt2) are V registers
         if (w & 31) == reg and not cls.reads_rt_only(w):
