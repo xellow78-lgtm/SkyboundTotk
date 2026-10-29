@@ -9,16 +9,28 @@ Formats (switchbrew.org "NCA", "PFS0", "RomFS", "Ticket"):
     area (key_area_key_application_<gen>, slot 2 for CTR).
   - Section 0 of a program NCA is the ExeFS (PFS0 behind a SHA-256 hash table), section 1 the RomFS (behind IVFC).
 
+  - An update's program NCA has its own ExeFS, and a patch RomFS (crypt type 4, BKTR) that only makes sense over
+    the base game's RomFS: see PatchedSection. Its hash tree (IVFC) covers the patched result, so romfs-verify
+    checks the merge against hashes the update itself carries.
+
 Keys are read from ~/.switch/prod.keys (or --keys). Key values are never printed.
 
 Usage:
   python nx.py info  <game.nsp>
   python nx.py exefs <game.nsp> <out_dir>
-  python nx.py romfs-list <game.nsp> <out.tsv>             path, size, offset of every RomFS file
-  python nx.py romfs <game.nsp> <out_dir> [glob ...]       extract RomFS files (all, or those matching a glob)
+  python nx.py romfs-list <game.nsp> <out.tsv> [--update <update.nsp>]   path, size, offset of every RomFS file
+  python nx.py romfs <game.nsp> <out_dir> [glob ...] [--update <update.nsp>]
+                                                          extract RomFS files (all, or those matching a glob)
+  python nx.py romfs-verify <game.nsp> [--update <update.nsp>] [--sample N]
+                                                          check the RomFS against its hash tree (all of it, or
+                                                          N random blocks of the file data level)
+  With --update, <game.nsp> is the base game and the update's patch RomFS is applied over it.
 """
+import bisect
 import fnmatch
+import hashlib
 import os
+import random
 import struct
 import sys
 
@@ -119,14 +131,21 @@ class Nca:
                 "sparse": any(fsh[0x148:0x178]), "compressed": any(fsh[0x178:0x1A0]),
             })
 
-    def read_raw(self, sec, off, size):
-        """Decrypted bytes of section `sec` at section-relative `off`."""
+    def read_raw(self, sec, off, size, ctr_val=None):
+        """Decrypted bytes of section `sec` at section-relative `off`. ctr_val (AesCtrEx, a patch section's data):
+        the counter word that replaces IV bytes 4-7 for this subsection; a patch section's own BKTR tables are read
+        without it, with the section's plain counter."""
         a = sec["start"] + off
         lo = a & ~0xF
         self.f.seek(self.base + lo)
         data = self.f.read(a + size - lo)
-        if sec["crypt"] in (3, 5, 6):
-            iv = sec["ctr_hi"].to_bytes(8, "big") + (lo >> 4).to_bytes(8, "big")
+        if len(data) != a + size - lo:
+            raise ValueError(f"section {sec['index']}: read past the end of the NCA ({off:#x}+{size:#x})")
+        if sec["crypt"] in (3, 4, 5, 6):
+            hi = sec["ctr_hi"]
+            if ctr_val is not None:
+                hi = (hi & 0xFFFFFFFF00000000) | ctr_val
+            iv = hi.to_bytes(8, "big") + (lo >> 4).to_bytes(8, "big")
             d = Cipher(algorithms.AES(self.ctr_key), modes.CTR(iv)).decryptor()
             data = d.update(data) + d.finalize()
         elif sec["crypt"] != 1:
@@ -145,6 +164,9 @@ class Nca:
         raise NotImplementedError(f"hash type {sec['hash_type']}")
 
     def reader(self, sec):
+        if sec["crypt"] == 4:
+            raise ValueError(f"section {sec['index']} is an update's patch RomFS: read it over the base game's "
+                             "(--update, PatchedSection)")
         base, _ = self.data_region(sec)
         return lambda off, size: self.read_raw(sec, base + off, size)
 
@@ -183,6 +205,158 @@ class RomFs:
 
     def file_reader(self, off):
         return lambda o, size: self.read(self.data_off + off + o, size)
+
+
+class PatchedSection:
+    """An update's patch RomFS section (crypt type 4, "BKTR") over the base game's RomFS section.
+
+    Layout (switchbrew.org "NCA", PatchInfo at fs header +0x100; entry sizes and the counter as in hactool's bktr.h /
+    nca.c, github.com/SciresM/hactool, ISC):
+      - The fs header has two BKTR headers: the indirect (relocation) table at +0x100 and the AesCtrEx (subsection)
+        table at +0x120, each {offset u64, size u64, "BKTR", version u32, entry count u32, reserved u32}, offsets
+        relative to the section. Both tables sit at the section's end and are encrypted with its plain AES-CTR.
+      - A table: a 0x4000-byte header {u32, bucket count u32, total size u64, the buckets' first offsets u64[]},
+        then 0x4000-byte buckets {u32, entry count u32, end offset u64, entries}. Relocation entries are 0x14 bytes
+        {virtual offset u64, physical offset u64, 1 = from the patch / 0 = from the base u32}; subsection entries
+        0x10 bytes {physical offset u64, u32, counter value u32}.
+      - The patched section is a virtual space: each relocation maps a run of it to the same-length run at its
+        physical offset in the patch section or in the base section (decrypted as usual). Patch data is AES-CTR with
+        the counter value of the subsection it is in written over IV bytes 4-7; from the tables on, the section's
+        own counter (its low word) applies.
+      - The patched space has its own IVFC hash tree (the patch fs header's): the RomFS is its last level."""
+    HEADER = BUCKET = 0x4000
+
+    def __init__(self, patch, psec, base, bsec):
+        if psec["crypt"] != 4:
+            raise ValueError("not a patch (BKTR) section")
+        if bsec["crypt"] == 4:
+            raise ValueError("the base section is itself a patch")
+        self.patch, self.psec, self.base, self.bsec = patch, psec, base, bsec
+        fsh = psec["fsh"]
+        ind_off, ind_size, ind_magic, _, ind_n, _ = struct.unpack_from("<QQ4sIII", fsh, 0x100)
+        sub_off, sub_size, sub_magic, _, sub_n, _ = struct.unpack_from("<QQ4sIII", fsh, 0x120)
+        if ind_magic != b"BKTR" or sub_magic != b"BKTR":
+            raise ValueError("patch section: no BKTR headers")
+        self.size = psec["end"] - psec["start"]
+        if ind_off + ind_size != sub_off or sub_off + sub_size != self.size:
+            # (hactool insists on the tables ending the section; newer NCAs can have more after them. The hash
+            # tree, romfs-verify, is what says whether the merge is right, so this only reports the layout.)
+            extra = [name for name, a, b in (("sparse", 0x148, 0x178), ("compression", 0x178, 0x1A0),
+                                             ("metadata hash", 0x1A0, 0x1C8)) if any(fsh[a:b])]
+            print(f"note: patch section layout: indirect table {ind_off:#x}+{ind_size:#x}, AesCtrEx table "
+                  f"{sub_off:#x}+{sub_size:#x}, section size {self.size:#x}; fs header info present: "
+                  f"{', '.join(extra) or 'none'}", file=sys.stderr)
+        if ind_off + ind_size > self.size or sub_off + sub_size > self.size:
+            raise ValueError("patch section: BKTR tables outside the section")
+        ind = patch.read_raw(psec, ind_off, ind_size)
+        sub = patch.read_raw(psec, sub_off, sub_size)
+        rel, self.virt_size = self._table(ind, 0x14, "<QQI")
+        if len(rel) != ind_n:
+            raise ValueError(f"relocation table: {len(rel)} entries, header says {ind_n}")
+        self.r_virt = [e[0] for e in rel]
+        self.r_phys = [e[1] for e in rel]
+        self.r_patch = [e[2] for e in rel]
+        if self.r_virt != sorted(self.r_virt) or self.r_virt[0] != 0:
+            raise ValueError("relocation table not sorted from 0")
+        subs, _ = self._table(sub, 0x10, "<QII")
+        if len(subs) != sub_n:
+            raise ValueError(f"subsection table: {len(subs)} entries, header says {sub_n}")
+        # from the tables on, the section's own counter (hactool: the fake last entry with section_ctr_low)
+        subs.append((ind_off, 0, psec["ctr_hi"] & 0xFFFFFFFF))
+        self.s_off = [e[0] for e in subs]
+        self.s_ctr = [e[2] for e in subs]
+        if self.s_off != sorted(self.s_off):
+            raise ValueError("subsection table not sorted")
+
+    def _table(self, raw, esize, fmt):
+        _, nb, total = struct.unpack_from("<IIQ", raw, 0)
+        out = []
+        for b in range(nb):
+            at = self.HEADER + b * self.BUCKET
+            _, n, _end = struct.unpack_from("<IIQ", raw, at)
+            if 0x10 + n * esize > self.BUCKET:
+                raise ValueError(f"bucket {b}: {n} entries do not fit")
+            out += [struct.unpack_from(fmt, raw, at + 0x10 + i * esize) for i in range(n)]
+        return out, total
+
+    def _read_patch(self, off, size):
+        out = []
+        while size:
+            j = bisect.bisect_right(self.s_off, off) - 1
+            end = self.s_off[j + 1] if j + 1 < len(self.s_off) else self.size
+            n = min(size, end - off)
+            out.append(self.patch.read_raw(self.psec, off, n, ctr_val=self.s_ctr[j]))
+            off, size = off + n, size - n
+        return b"".join(out)
+
+    def read(self, off, size):
+        """Bytes of the patched section at `off` (section-relative, before its hash tree)."""
+        if off < 0 or off + size > self.virt_size:
+            raise ValueError(f"patched read {off:#x}+{size:#x} outside {self.virt_size:#x}")
+        out = []
+        while size:
+            i = bisect.bisect_right(self.r_virt, off) - 1
+            end = self.r_virt[i + 1] if i + 1 < len(self.r_virt) else self.virt_size
+            n = min(size, end - off)
+            phys = self.r_phys[i] + (off - self.r_virt[i])
+            if self.r_patch[i]:
+                out.append(self._read_patch(phys, n))
+            else:
+                out.append(self.base.read_raw(self.bsec, phys, n))
+            off, size = off + n, size - n
+        return b"".join(out)
+
+
+class Ivfc:
+    """A RomFS section's IVFC hash tree (fs header +0x8): six levels {offset u64, size u64, log2 block size u32,
+    u32} at +0x18; each level's blocks hash (SHA-256, the last block zero-padded) into the level before it, the
+    first level into the master hash at +0xC8. `read(off, size)` reads the section (or a PatchedSection)."""
+
+    def __init__(self, fsh, read):
+        if fsh[0x8:0xC] != b"IVFC":
+            raise ValueError("bad IVFC header")
+        self.read = read
+        self.levels = [struct.unpack_from("<QQI", fsh, 0x18 + i * 0x18) for i in range(6)]
+        self.master = fsh[0xC8:0xE8]
+        self.tables = {}
+
+    def data_region(self):
+        return self.levels[5][:2]
+
+    def blocks(self, k):
+        off, size, bs = self.levels[k]
+        return (size + (1 << bs) - 1) >> bs
+
+    def _block_ok(self, k, i, hashes):
+        off, size, bs = self.levels[k]
+        b = 1 << bs
+        n = min(b, size - i * b)
+        data = self.read(off + i * b, n) + bytes(b - n)
+        return hashlib.sha256(data).digest() == hashes[32 * i:32 * i + 32]
+
+    def verify(self, sample=None, rng=None, progress=None):
+        """Check levels 1-5 completely (they are the hash tables), and every block of the RomFS level or, with
+        `sample`, that many random blocks plus its first and last 64. Returns (blocks checked, bad blocks)."""
+        hashes = self.master
+        checked, bad = 0, []
+        for k in range(6):
+            n = self.blocks(k)
+            if k < 5 or sample is None:
+                which = range(n)
+            else:
+                rng = rng or random.Random(0)
+                which = sorted(set(range(min(64, n))) | set(range(max(0, n - 64), n)) |
+                               {rng.randrange(n) for _ in range(sample)})
+            for i in which:
+                checked += 1
+                if not self._block_ok(k, i, hashes):
+                    bad.append((k + 1, i))
+                if progress and checked % 4096 == 0:
+                    progress(k + 1, checked)
+            if k < 5:
+                off, size, _ = self.levels[k]
+                hashes = self.read(off, size)
+        return checked, bad
 
 
 class Nsp:
@@ -224,18 +398,41 @@ def copy_out(read, size, path, chunk=8 << 20):
             done += n
 
 
+def romfs_source(prog, update_prog=None):
+    """(RomFs, Ivfc) of a program NCA's RomFS (section 1), or of an update's patch RomFS applied over it."""
+    bsec = prog.sections[1]
+    if update_prog is None:
+        ivfc = Ivfc(bsec["fsh"], lambda o, n: prog.read_raw(bsec, o, n))
+    else:
+        if update_prog.program_id != prog.program_id:
+            raise SystemExit(f"the update is for program {update_prog.program_id:016x}, the base is "
+                             f"{prog.program_id:016x}")
+        psec = update_prog.sections[1]
+        patched = PatchedSection(update_prog, psec, prog, bsec)
+        ivfc = Ivfc(psec["fsh"], patched.read)
+    off, _ = ivfc.data_region()
+    return RomFs(lambda o, n: ivfc.read(off + o, n)), ivfc
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
     cmd, path = sys.argv[1], sys.argv[2]
     args = sys.argv[3:]
-    keys_path = None
-    if "--keys" in args:
-        i = args.index("--keys")
-        keys_path = args[i + 1]
+    def option(name):
+        if name not in args:
+            return None
+        i = args.index(name)
+        if i + 1 >= len(args):
+            raise SystemExit(f"{name} needs a value")
+        value = args[i + 1]
         del args[i:i + 2]
-    nsp = Nsp(path, load_keys(keys_path))
+        return value
+    keys = load_keys(option("--keys"))
+    update_path, sample = option("--update"), option("--sample")
+    nsp = Nsp(path, keys)
+    update = Nsp(update_path, keys) if update_path else None
 
     if cmd == "info":
         for name, (off, size) in nsp.pfs.files.items():
@@ -259,8 +456,17 @@ def main():
         for name, (off, size) in pfs.files.items():
             copy_out(lambda o, n, off=off: pfs.read(off + o, n), size, os.path.join(out, name))
             print(f"  {name:<12} {size:>12,}")
-    elif cmd in ("romfs-list", "romfs"):
-        rfs = prog.romfs(1)
+    elif cmd in ("romfs-list", "romfs", "romfs-verify"):
+        rfs, ivfc = romfs_source(prog, update.program() if update else None)
+        if cmd == "romfs-verify":
+            n6 = ivfc.blocks(5)
+            print(f"RomFS level: {n6:,} blocks of {1 << ivfc.levels[5][2]:,} bytes; checking "
+                  + (f"{int(sample):,} random blocks + the first and last 64" if sample else "all of them"), flush=True)
+            checked, bad = ivfc.verify(int(sample) if sample else None,
+                                       progress=lambda lvl, n: print(f"  level {lvl}: {n:,} blocks checked",
+                                                                     end="\r", flush=True))
+            print(f"\n{checked:,} blocks checked, {len(bad)} bad" + (f": first {bad[:5]}" if bad else ""))
+            sys.exit(1 if bad else 0)
         files = sorted(rfs.walk())
         if cmd == "romfs-list":
             with open(args[0], "w", encoding="utf-8") as out:
