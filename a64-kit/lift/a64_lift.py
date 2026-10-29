@@ -24,6 +24,7 @@ import sys
 from collections import Counter
 
 import a64emit
+import a64_extra
 
 COND = ["(c->z)", "(!c->z)", "(c->c)", "(!c->c)", "(c->n)", "(!c->n)", "(c->v)", "(!c->v)",
         "(c->c && !c->z)", "(!(c->c && !c->z))", "(c->n == c->v)", "(c->n != c->v)",
@@ -1264,6 +1265,12 @@ class Lifter:
                     keys.setdefault((w, pc) if pc_relative(w) else w, (pc, w))
         order = list(keys)
         tx, fl = a64emit.translate([keys[x] for x in order])
+        # what suyu leaves unhandled, a64_extra may cover (SQSHL & co.: TOTK 1.4.3's SDK); the rest still traps
+        for k, x in enumerate(order):
+            if fl[k] & a64emit.UNHANDLED:
+                extra = a64_extra.translate(keys[x][1])
+                if extra:
+                    tx[k], fl[k] = extra, fl[k] & ~a64emit.UNHANDLED
         fpx = set()
         texts = dict(zip(order, zip((stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(t, fpx))))) for t in tx), fl)))
         del tx, fl, keys, order

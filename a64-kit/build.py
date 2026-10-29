@@ -221,7 +221,10 @@ def check_hle(img, hle):
     for m in img.modules:
         known |= {s["name"] for s in m.symbols if s["name"]}
     bad = sorted(h for h in hle if h not in known)
-    if bad:
+    if bad and os.environ.get("A64_ALLOW_MISSING_HLE"):   # (another game version: the symbol may be gone or renamed)
+        print("hos/ defines imp_ functions for symbols no module has (left out, A64_ALLOW_MISSING_HLE):\n  "
+              + "\n  ".join(bad))
+    elif bad:
         sys.exit("hos/ defines imp_ functions for symbols no module has (typo?):\n  " + "\n  ".join(bad))
 
 
