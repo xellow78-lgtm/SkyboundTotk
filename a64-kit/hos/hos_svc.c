@@ -33,6 +33,9 @@ static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
     case 21: return hos_total_memory;                      /* TotalNonSystemMemorySize */
     case 22: return hos_program_size + hos_heap_size;      /* UsedNonSystemMemorySize */
     case 23: return 1;                                     /* IsApplication */
+    /* AliasRegionExtraSize (SDK 18+; TOTK 1.4.3's nnosInitialize asks): 0 unless the process was created for the
+       address sanitizer (Atmosphere's KPageTableBase::InitializeForProcess), which a retail game is not */
+    case 28: return 0;
     default: *ok = 0; return 0;
     }
 }
