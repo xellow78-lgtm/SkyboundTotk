@@ -717,8 +717,12 @@ class Lifter:
             w = img.word(pc)
             if (w & 0xFC000000) == 0x14000000 or (w & 0xFFFFFC1F) in (0xD65F0000, 0xD61F0000):
                 # ret / b / br: what follows is reached from elsewhere, so nothing above is known there
+                # (the bound too: a cmp + b.hi above an unconditional branch guards another dispatch. TOTK 1.4.3's
+                # f_08003ee0 has a table indexed by an enum byte with no check of its own, after `cmp w8, #7; b.hi;
+                # ... br; b`: kept, that bound cut it to 8 of its entries and entry 10 hit A64_IJUMP)
                 R.clear()
                 bounds.clear()
+                bound = None
                 continue
             d = w & 31
             n = (w >> 5) & 31
