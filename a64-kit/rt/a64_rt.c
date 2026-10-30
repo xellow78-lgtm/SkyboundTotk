@@ -242,7 +242,7 @@ static uint64_t load_n(uint64_t a, uint32_t size) {
 }
 
 #if defined(A64_WRITE_TRACK)
-uint8_t a64_dirty[1u << 20];   /* (rt/a64.h A64_MARK) */
+uint8_t a64_dirty[A64_PAGES];   /* (rt/a64.h A64_MARK) */
 #endif
 
 static int cas_n(uint64_t a, uint32_t size, uint64_t expect, uint64_t value) {

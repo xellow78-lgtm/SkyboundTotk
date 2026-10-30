@@ -62,7 +62,26 @@ typedef GuestContext Ctx;
 #endif
 #define A64_MEM ((uint8_t *)A64_HOST_BASE)
 #endif
+/* Natively the window is 8 GB (A64_SPACE_BITS 33): the low 4 GB as before (image, heap, the system's memory), and
+   above it the game's address regions (hos/hos_mem.c). On the Switch those come from a 64 GB alias range of their
+   own; in a 4 GB window they took what the 2 GB heap left (~1.7 GB), and loading a place after a teleport ran it out
+   (6,028 regions holding 1,672 MB). A guest address is masked to the window: an address past it wraps, as it wrapped
+   at 4 GB before. Web builds keep 4 GB (A64_MEM_ZERO: wasm memory). -DA64_SPACE_BITS=32: the 4 GB window. */
+#if defined(A64_MEM_ZERO)
+#undef A64_SPACE_BITS
+#define A64_SPACE_BITS 32
+#elif !defined(A64_SPACE_BITS)
+#define A64_SPACE_BITS 33
+#endif
+#if A64_SPACE_BITS == 32
 #define A64_PTR(a) (A64_MEM + (uint32_t)(a))
+#define A64_PAGE(a) ((uint32_t)(a) >> 12)
+#else
+#define A64_SPACE_MASK ((1ull << A64_SPACE_BITS) - 1)
+#define A64_PTR(a) (A64_MEM + ((uint64_t)(a) & A64_SPACE_MASK))
+#define A64_PAGE(a) (((uint64_t)(a) & A64_SPACE_MASK) >> 12)
+#endif
+#define A64_PAGES (1u << (A64_SPACE_BITS - 12))   /* 4 KB pages in the window (a64_dirty) */
 
 /* Browser builds (A64_WRITE_TRACK): wasm has no page write watch, so every guest store marks its 4 KB page (first
    and last byte's: an unaligned store may cross a page); hos/web/win32.c's GetWriteWatch reads and clears the marks
@@ -75,14 +94,14 @@ typedef GuestContext Ctx;
    release store (a plain store on x86): the compiler may not move it above the data store, so a scan that clears a
    mark has seen the data it marks. (The marks are ~1 ms of the castle's game-thread CPU a frame. Marking the last
    byte's page only when a store crosses into it saved ~0.3 ms but made the code 20 MB bigger: not kept.) */
-extern uint8_t a64_dirty[1u << 20];
+extern uint8_t a64_dirty[A64_PAGES];
 /* (Tried 2026-10-21: reading a mark first and writing it only when clear, against cache lines moving between cores:
    game threads +1.1 ms a frame, the code 18 MB bigger. Not kept.) */
-#define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[(uint32_t)(a) >> 12], 1, __ATOMIC_RELEASE), \
-                        __atomic_store_n(&a64_dirty[(uint32_t)((a) + (n) - 1) >> 12], 1, __ATOMIC_RELEASE))
+#define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[A64_PAGE(a)], 1, __ATOMIC_RELEASE), \
+                        __atomic_store_n(&a64_dirty[A64_PAGE((a) + (n) - 1)], 1, __ATOMIC_RELEASE))
 #elif defined(A64_WRITE_TRACK)
-extern uint8_t a64_dirty[1u << 20];
-#define A64_MARK(a, n) (a64_dirty[(uint32_t)(a) >> 12] = 1, a64_dirty[(uint32_t)((a) + (n) - 1) >> 12] = 1)
+extern uint8_t a64_dirty[A64_PAGES];
+#define A64_MARK(a, n) (a64_dirty[A64_PAGE(a)] = 1, a64_dirty[A64_PAGE((a) + (n) - 1)] = 1)
 #else
 #define A64_MARK(a, n) ((void)0)
 #endif

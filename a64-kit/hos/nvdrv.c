@@ -203,7 +203,7 @@ uint8_t *hos_gpu_ptr(uint64_t va, uint64_t *avail) {
     if (native) {
         const uint64_t g = nvn_gpu_guest(va);
         if (!g || g >= hos_guest_size()) return NULL;
-        *avail = va < (1ull << 32) ? hos_guest_size() - g : nvn_gpu_contiguous(va, 1ull << 30);
+        *avail = va < hos_guest_size() ? hos_guest_size() - g : nvn_gpu_contiguous(va, 1ull << 30);
         return (uint8_t *)GP(g);
     }
     /* direct-mapped by 64 KB page (a draw touches more mappings than a short list holds: constant buffers in several

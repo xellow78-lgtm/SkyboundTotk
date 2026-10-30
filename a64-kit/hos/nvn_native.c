@@ -83,8 +83,9 @@ static void vmap_runs(struct nvn_vmap *m) {   /* (vmap_lock held exclusively) */
                   : i + 1 < n && m->page[i + 1] && m->page[i + 1] == m->page[i] + VPAGE ? m->run[i + 1] + 1 : 1;
 }
 
+uint64_t hos_guest_size(void);
 uint64_t nvn_gpu_guest(uint64_t gpu) {
-    if (gpu < (1ull << 32)) return gpu;
+    if (gpu < hos_guest_size()) return gpu;   /* (a physical pool's GPU address is its guest address) */
     const struct nvn_vmap *m = vmap_find(gpu);
     if (!m) return 0;
     const uint64_t p = m->page[(gpu - m->gpu) / VPAGE];
@@ -95,7 +96,7 @@ uint8_t *nvn_gpu_host(uint64_t gpu) {
     return g ? (uint8_t *)GP(g) : NULL;
 }
 uint64_t nvn_gpu_contiguous(uint64_t gpu, uint64_t n) {
-    if (gpu < (1ull << 32)) return n;
+    if (gpu < hos_guest_size()) return n;
     const struct nvn_vmap *m = vmap_find(gpu);
     if (!m) return 0;
     const uint64_t i = (gpu - m->gpu) / VPAGE;

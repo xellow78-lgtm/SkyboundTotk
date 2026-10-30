@@ -57,7 +57,12 @@ void web_mark_written(const void *p, size_t n);   /* (hos/web/win32.c: guest mem
 extern uint64_t hos_space_end;   /* web: the guest window ends where the host's own data starts (hos_main.c) */
 #define HOS_SPACE_END hos_space_end
 #else
-#define HOS_SPACE_END 0xFFFF0000ULL
+#define HOS_SPACE_END 0xFFFF0000ULL   /* (the low 4 GB's top: what svcGetInfo reports, the system's own regions) */
+#endif
+/* the game's address regions above 4 GB (A64_SPACE_BITS 33, natively): hos_mem.c, from the window's top down */
+#if A64_SPACE_BITS > 32
+#define HOS_HIGH_BASE 0x100000000ULL
+#define HOS_HIGH_END ((1ULL << A64_SPACE_BITS) - 0x10000ULL)
 #endif
 #define HOS_TICK_HZ 19200000ULL
 

@@ -26,8 +26,9 @@ extern char __global_base;
 uint64_t hos_space_end;
 #define GUEST_SPACE (hos_space_end)
 #else
-#define GUEST_SPACE (1ULL << 32)
+#define GUEST_SPACE (1ULL << A64_SPACE_BITS)   /* (rt/a64.h: 8 GB; the part above 4 GB holds address regions) */
 #endif
+#define LOW_SPACE (1ULL << 32)
 #define IMAGE_BASE 0x08000000ULL   /* nx_image.MAIN_BASE */
 
 #ifdef _WIN32
@@ -113,15 +114,23 @@ static int reserve_guest(void) {
        pages changed (GetWriteWatch) so that it uploads only those (soft write watch builds mark pages themselves). */
 #if defined(A64_WRITE_TRACK)
     const DWORD watch = 0;
-    if (getenv("HOS_LARGE_PAGES") && reserve_large(GUEST_SPACE) == (void *)A64_HOST_BASE) {
-        hos_large_pages = 1;
-        hos_log("mem: the guest window is in large pages (%llu MB)", (unsigned long long)(GUEST_SPACE >> 20));
-        return 1;
-    }
 #else
     const DWORD watch = MEM_WRITE_WATCH;
 #endif
-    return VirtualAlloc((void *)A64_HOST_BASE, GUEST_SPACE, MEM_RESERVE | MEM_COMMIT | watch,
+    /* above 4 GB (address regions): reserved only; hos_mem.c commits each region as it is made (and decommits it when
+       freed), so the window costs Windows' commit only what the game holds there */
+    if (GUEST_SPACE > LOW_SPACE &&
+        VirtualAlloc((void *)(A64_HOST_BASE + LOW_SPACE), GUEST_SPACE - LOW_SPACE, MEM_RESERVE | watch,
+                     PAGE_READWRITE) != (void *)(A64_HOST_BASE + LOW_SPACE))
+        return 0;
+#if defined(A64_WRITE_TRACK)
+    if (getenv("HOS_LARGE_PAGES") && reserve_large(LOW_SPACE) == (void *)A64_HOST_BASE) {
+        hos_large_pages = 1;
+        hos_log("mem: the guest window's low 4 GB are in large pages");
+        return 1;
+    }
+#endif
+    return VirtualAlloc((void *)A64_HOST_BASE, LOW_SPACE, MEM_RESERVE | MEM_COMMIT | watch,
                         PAGE_READWRITE) == (void *)A64_HOST_BASE;
 #else
     return mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,

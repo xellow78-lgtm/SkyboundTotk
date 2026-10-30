@@ -69,14 +69,47 @@ uint64_t hos_sys_alloc(uint64_t size, uint64_t align) {
    address regions below, to tell sparse reservations from memory really in use */
 static volatile LONG64 pages_bytes, region_allocs, region_frees;
 
-uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
+/* The game's regions go above 4 GB first (HOS_HIGH_BASE..HOS_HIGH_END, natively: rt/a64.h A64_SPACE_BITS), each
+   committed as it is made: the low 4 GB keep only what does not fit there. HOS_HIGH_REGIONS=0: the low 4 GB only, as
+   before. The system's own regions (high = 0) stay low. */
+static uint64_t region_alloc(uint64_t size, uint64_t align, int high) {
     if (align < 0x1000) align = 0x1000;
     size = (size + 0xFFF) & ~0xFFFULL;
+    uint64_t found = 0;
     LOCK();
-    /* first fit, top-down, between existing regions (kept sorted by address, descending) */
-    uint64_t top = HOS_SPACE_END, found = 0;
     int at = nregions;
-    for (int i = 0; i <= nregions; i++) {
+#ifdef HOS_HIGH_BASE
+    static int high_on = -1;
+    if (high_on < 0) high_on = !getenv("HOS_HIGH_REGIONS") || atoi(getenv("HOS_HIGH_REGIONS")) != 0;
+    if (high && high_on) {
+        uint64_t top = HOS_HIGH_END;
+        for (int i = 0;; i++) {
+            const int in_high = i < nregions && regions[i].addr >= HOS_HIGH_BASE;
+            const uint64_t bottom = in_high ? regions[i].addr + regions[i].size : HOS_HIGH_BASE;
+            if (top >= bottom + size) {
+                const uint64_t a = (top - size) & ~(align - 1);
+                if (a >= bottom) { found = a; at = i; break; }
+            }
+            if (!in_high) break;
+            top = regions[i].addr;
+        }
+#if defined(_WIN32)
+        if (found && !VirtualAlloc(GP(found), size, MEM_COMMIT, PAGE_READWRITE)) {
+            static int told;
+            if (!told++)
+                hos_log("mem: %llu MB above 4 GB not committed (error %lu: Windows' commit limit?): the low 4 GB instead",
+                        (unsigned long long)(size >> 20), GetLastError());
+            found = 0;
+            at = nregions;
+        }
+#endif
+    }
+#endif
+    /* first fit, top-down, between existing regions (kept sorted by address, descending), below HOS_SPACE_END */
+    uint64_t top = HOS_SPACE_END;
+    int i0 = 0;
+    while (i0 < nregions && regions[i0].addr >= HOS_SPACE_END) i0++;   /* (past the regions above 4 GB) */
+    for (int i = i0; i <= nregions && !found; i++) {
         uint64_t bottom = i < nregions ? regions[i].addr + regions[i].size : HOS_HEAP_BASE + hos_heap_size;
         if (top >= size) {
             uint64_t a = (top - size) & ~(align - 1);
@@ -111,8 +144,8 @@ uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
         nregions++;
         if (found < region_floor && found >= HOS_HEAP_BASE) region_floor = found;   /* (not the holes below) */
     }
-    /* how much the game holds in regions, logged at each new 128 MB step (the guest space here is 4 GB: heap and
-       regions share it; on the Switch regions take addresses from a 64 GB alias range of their own) */
+    /* how much the game holds in regions, logged at each new 128 MB step (on the Switch regions take addresses from a
+       64 GB alias range of their own; here 4 GB above the low 4 GB, and the low 4 GB's ~1.7 GB above the heap) */
     uint64_t held = 0, largest = 0;
     for (int i = 0; i < nregions; i++) {
         held += regions[i].size;
@@ -137,10 +170,12 @@ uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
     return found;
 }
 
-static uint64_t pages_used[(1ULL << 32) / 0x1000 / 64];
+uint64_t hos_region_alloc(uint64_t size, uint64_t align) { return region_alloc(size, align, 0); }
+
+static uint64_t pages_used[(1ULL << A64_SPACE_BITS) / 0x1000 / 64];
 
 static void pages_mark_used_locked(uint64_t addr, uint64_t size) {
-    for (uint64_t p = addr >> 12; p < (addr + size + 0xFFF) >> 12 && p < (1ULL << 20); p++) pages_used[p >> 6] |= 1ULL << (p & 63);
+    for (uint64_t p = addr >> 12; p < (addr + size + 0xFFF) >> 12 && p < A64_PAGES; p++) pages_used[p >> 6] |= 1ULL << (p & 63);
 }
 
 static void discard_pages(uint64_t addr, uint64_t size) {
@@ -179,6 +214,12 @@ void hos_region_free(uint64_t addr) {
         }
     }
     UNLOCK();
+#if defined(HOS_HIGH_BASE) && defined(_WIN32)
+    if (freed_size && freed >= HOS_HIGH_BASE) {   /* (committed when made: back to Windows) */
+        VirtualFree(GP(freed), freed_size, MEM_DECOMMIT);
+        return;
+    }
+#endif
     if (freed_size) discard_pages(freed, freed_size);
 }
 
@@ -188,8 +229,8 @@ void hos_region_free(uint64_t addr) {
 /* HOS_WRITTEN natively (the soft write watch, rt/a64.h A64_MARK): host code wrote [p, p + n) of guest memory */
 void hos_mark_written(const void *p, size_t n) {
     const uintptr_t a = (uintptr_t)p - (uintptr_t)A64_MEM;
-    if (!n || (uintptr_t)p < (uintptr_t)A64_MEM || a >= (1ull << 32)) return;
-    for (uintptr_t q = a >> 12; q <= (a + n - 1) >> 12 && q < (1u << 20); q++)
+    if (!n || (uintptr_t)p < (uintptr_t)A64_MEM || a >= (1ull << A64_SPACE_BITS)) return;
+    for (uintptr_t q = a >> 12; q <= (a + n - 1) >> 12 && q < A64_PAGES; q++)
         __atomic_store_n(&a64_dirty[q], 1, __ATOMIC_RELEASE);
 }
 #endif
@@ -242,7 +283,7 @@ HLE(_ZN2nn2os19AllocateMemoryBlockEPmm) {
 HLE(_ZN2nn2os21AllocateAddressRegionEPmm) {
     HOS_TRACE_CALL("AllocateAddressRegion");
     InterlockedIncrement64(&region_allocs);
-    G64(ARG(0)) = hos_region_alloc(ARG(1), 0x10000);
+    G64(ARG(0)) = region_alloc(ARG(1), 0x10000, 1);
     RET(0);
 }
 
@@ -263,7 +304,7 @@ HLE(_ZN2nn2os19AllocateMemoryPagesEmm) {
     InterlockedAdd64(&pages_bytes, (LONG64)n);
     static int zero_all = -1;
     if (zero_all < 0) zero_all = getenv("HOS_ZERO_ALL_PAGES") != NULL;
-    if (zero_all || end > (1ULL << 32) || end < a) {
+    if (zero_all || end > (1ULL << A64_SPACE_BITS) || end < a) {
         memset(GP(a), 0, n);
     } else {
         uint64_t runs[64][2];

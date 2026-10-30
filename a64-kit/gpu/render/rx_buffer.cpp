@@ -53,7 +53,7 @@ std::vector<Segment*> segments;   // by base / kStep
 int64_t batch_id;
 bool watch_ok = true;
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
-extern "C" uint8_t a64_dirty[1u << 20];   // (rt/a64_rt.c)
+extern "C" uint8_t a64_dirty[];   // (rt/a64_rt.c: a mark a 4 KB page of the guest window, hos_guest_size() / 4096)
 #endif
 // when each guest page was last written, in memory_seq() ticks (one per scan and per command-processor write)
 std::vector<uint64_t> page_seq;
@@ -353,7 +353,7 @@ bool collect_written_pages(std::vector<uint32_t>& out) {
         const int nranges = hos_gpu_guest_ranges(ranges, 4096);
         for (int r = 0; r < nranges; r++) {
             const uint64_t lo = ranges[r][0], hi = std::min<uint64_t>(ranges[r][1], hos_guest_size());
-            const uint64_t p1 = std::min<uint64_t>((hi + kPage - 1) / kPage, 1u << 20);
+            const uint64_t p1 = std::min<uint64_t>((hi + kPage - 1) / kPage, hos_guest_size() >> 12);
             for (uint64_t p = lo / kPage; p < p1;) {
                 if (!(p & 7) && p + 8 <= p1) {   // (eight pages a load while none is marked)
                     uint64_t w;
