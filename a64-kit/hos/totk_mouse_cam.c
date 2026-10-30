@@ -11,7 +11,8 @@
 
    Here f_08874c1c runs as it is, then the mouse's motion in this frame is added to what it stored, linear and not
    clamped: no top speed and no curve, so a frame's turn is the mouse's motion in it (in degrees: 0.066 x the
-   sensitivity per count, as a 0.022-degree game at 3x), at the frame's step (nn_vi: 1/60 or 1/30 s). A full input
+   sensitivity per count, as a 0.022-degree game at 3x), over the frame's step (nn_vi: 1/60 or 1/30 s, or the real
+   frame time with real-time steps). A full input
    (1) turns the camera CAM_DEG_PER_SEC a second horizontally: Savage Wind's measurement of BotW's CameraChase
    (2.848 degrees a 30th of a second; github.com/Tempus3214/SavageWindRecomp, branch mouse-camera, MIT), which TOTK's
    camera, with the same 1.78, is taken to share until measured. The vertical part: at first 1.78 times the mouse's
@@ -52,7 +53,7 @@ static void setf(uint64_t a, float f) { memcpy(GP(a), &f, 4); }
 
 void f_08874c1c(Ctx *);
 int hos_mouse_take_cam(int32_t *dx, int32_t *dy);   /* display.c */
-int hos_vi_interval(void);                           /* nn_vi.c */
+double hos_vi_frame_seconds(void);                  /* nn_vi.c */
 extern volatile LONG64 hos_present_count;            /* nn_vi.c */
 
 static _Thread_local int inside;
@@ -82,7 +83,7 @@ ENTRY_HOOK(0x08874c1c) {
         if (held && b.mouse_camera && (dx || dy)) {
             const char *e = getenv("HOS_MOUSE_SENS");
             const double sens = e && atof(e) > 0 ? atof(e) : b.mouse_sens;
-            const double step = hos_vi_interval() / 60.0;   /* the frame's simulated time */
+            const double step = hos_vi_frame_seconds();   /* the frame's simulated time (real-time steps: varies) */
             const double k = DEG_PER_COUNT * sens / (CAM_DEG_PER_SEC * step);
             vx = (float)(dx * k);
             vy = (float)(-dy * k * b.mouse_pitch * (b.mouse_invert_y ? -1 : 1));
@@ -91,9 +92,9 @@ ENTRY_HOOK(0x08874c1c) {
         if (logs < 0) logs = getenv("HOS_MOUSE_CAM_LOG") ? atoi(getenv("HOS_MOUSE_CAM_LOG")) : 0;
         if (logs > 0 && (dx || dy || getf(in) != 0 || getf(in + 4) != 0)) {
             logs--;
-            hos_log("mouse cam: stick %.3f %.3f -> %.3f %.3f, mouse %d %d -> %.3f %.3f, flags %#llx, interval %d",
+            hos_log("mouse cam: stick %.3f %.3f -> %.3f %.3f, mouse %d %d -> %.3f %.3f, flags %#llx, step %d ms",
                     getf(in), getf(in + 4), getf(state + 0x420), getf(state + 0x424), dx, dy, vx, vy,
-                    (unsigned long long)flags, hos_vi_interval());
+                    (unsigned long long)flags, (int)(hos_vi_frame_seconds() * 1000 + 0.5));
         }
         static int told;
         if (!told++) hos_log("mouse cam: native (the camera's input, f_08874c1c); HOS_MOUSE_NATIVE=0 for the stick");

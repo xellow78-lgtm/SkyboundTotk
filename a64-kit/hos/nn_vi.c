@@ -50,6 +50,7 @@ static int display_timing(int64_t *vblank_ns, int64_t *period_ns) {
 #endif
 
 static int realtime_on(void);
+int hos_vi_interval(void);
 
 /* The emulated vsync (the display's vsync event, and with the game's own frame step the frame pacing): 60 Hz,
    locked to a whole number of display refreshes when it can be. */
@@ -304,6 +305,15 @@ static uint64_t frame_step(void) {
         InterlockedCompareExchange64(&frame_step_bits, (LONG64)v, 0);
     }
     return v;
+}
+/* The game's step for this frame in seconds (totk_mouse_cam.c: the mouse's motion over it): the real-time step, or
+   the interval's. */
+double hos_vi_frame_seconds(void) {
+    if (!realtime_on()) return hos_vi_interval() / 60.0;
+    const uint32_t hi = (uint32_t)(frame_step() >> 32);
+    float seconds;
+    memcpy(&seconds, &hi, 4);
+    return seconds > 0 ? seconds : 1.0 / 60.0;
 }
 static void frame_step_present(int64_t now) {
     static int64_t last;
