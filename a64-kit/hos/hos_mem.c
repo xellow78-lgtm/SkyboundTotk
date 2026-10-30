@@ -183,8 +183,12 @@ static uint64_t pages_used[(1ULL << A64_SPACE_BITS) / 0x1000 / 64];
 static uint64_t pages_backed[(1ULL << A64_SPACE_BITS) / 0x1000 / 64];
 static void backed_set_locked(uint64_t addr, uint64_t size, int on) {
     const uint64_t p0 = addr >> 12, p1 = (addr + size + 0xFFF) >> 12;
+    /* (pages in the heap are not counted: the heap is counted whole; the game backs pages there too, 1,255 MB of
+       "pages" in 1,024 MB of regions) */
+    const uint64_t h0 = HOS_HEAP_BASE >> 12, h1 = (HOS_HEAP_BASE + hos_heap_size) >> 12;
     int64_t changed = 0;
     for (uint64_t p = p0; p < p1 && p < A64_PAGES; p++) {
+        if (p >= h0 && p < h1) continue;
         uint64_t *w = &pages_backed[p >> 6];
         const uint64_t bit = 1ULL << (p & 63);
         if (!!(*w & bit) != on) {

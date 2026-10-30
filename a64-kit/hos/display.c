@@ -225,6 +225,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
         if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
+        if (wp == VK_F5 && !(lp & (1 << 30))) {   /* (debugging: 15 s of the sampling profiler, from now) */
+            void hos_profile_start(int seconds);   /* hos_prof.c */
+            hos_profile_start(15);
+        }
         if (wp == VK_F12 && !(lp & (1 << 30)) && renderer) {   /* (debugging: the next frame's passes and targets) */
             void rx_request_frame_dump(void);   /* gpu/render/rx_debug.cpp */
             rx_request_frame_dump();

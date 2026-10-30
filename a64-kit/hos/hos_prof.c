@@ -578,6 +578,19 @@ static DWORD WINAPI prof_main(void *p) {
     return 0;
 }
 
+/* F5 in the game (display.c): the sampling profiler for that many seconds from now, once at a time (what HOS_PROFILE
+   does from the start, aimed at a place: a slow shrine). The report goes to the log as HOS_PROFILE's does. */
+void hos_profile_start(int seconds) {
+    static volatile LONG running;
+    if (InterlockedCompareExchange(&running, 1, 0)) {
+        hos_log("profile: one is already running");
+        return;
+    }
+    hos_log("profile: sampling every thread for %d s (F5)", seconds);
+    HANDLE h = CreateThread(NULL, 0, prof_main, (void *)(intptr_t)seconds, 0, NULL);
+    if (h) CloseHandle(h);
+}
+
 /* The guest call stack, from the host one: lifted code makes one C call per guest call, so every f_XXXXXXXX frame on
    the host stack is a guest function at XXXXXXXX. Printed by hos_fatal. */
 void hos_backtrace(void) {
