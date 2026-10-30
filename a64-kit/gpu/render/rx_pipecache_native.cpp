@@ -7,11 +7,11 @@
 // Compute programs ('C' records: their WGSL) get their shader modules made by the reading thread: the render thread
 // made them in place at their first dispatch (WGSL parsing: ~270 ms of the boot's first frame).
 // The file holds the game's shaders (made from its data): it stays on this machine, never in the repository.
-// RX_NO_PIPELINE_CACHE=1: neither read nor written. RX_PIPELINE_CACHE_MAX=<n>: how many are made at a start (6000).
-// Only pipelines some draw used in the last 4 sessions are made ('U' records: the keys each session used): each made
-// pipeline holds ~390 KB of host memory (wgpu keeps its shader modules' IR, the driver its code), and the file holds
-// every pipeline of every place ever played: all 3783 of them were 1.2 GB of the working set where a session at the
-// title save used 690. RX_PIPELINE_CACHE_SESSIONS=<n> (4): how many sessions back; RX_PIPELINE_CACHE_ALL=1: all.
+// RX_NO_PIPELINE_CACHE=1: neither read nor written. Every pipeline in the file is made at a start, the most recently
+// used first, until Windows' commit to spare falls to RX_PIPELINE_CACHE_FREE_MB (10240): each made pipeline holds
+// ~300-400 KB of host memory (wgpu keeps its shader modules' IR, the driver its code; 3783 of them were 1.2 GB of the
+// working set). RX_PIPELINE_CACHE_MAX=<n>: at most n; RX_PIPELINE_CACHE_SESSIONS=<n>: only what the last n sessions
+// drew with ('U' records: the keys each session used); RX_PIPELINE_CACHE_ALL=1: no memory check.
 #if !RX_WEB
 #include <algorithm>
 #include <atomic>
@@ -293,39 +293,31 @@ void load() {
                 }
             }
         }
-        // (pipelines no recent session used are not made: their host memory is the cost, see the top)
-        static const int window = getenv("RX_PIPELINE_CACHE_SESSIONS") ? atoi(getenv("RX_PIPELINE_CACHE_SESSIONS")) : 4;
-        // ... unless the machine has the memory for all of them (24 GB or more; each ~390 KB, at most
-        // RX_PIPELINE_CACHE_MAX): then every pipeline ever made is made again at the start, in the background, so
-        // places played longer ago do not compile their pipelines again (drawn late) when they come back.
-        // RX_PIPELINE_CACHE_SESSIONS=<n> keeps the window regardless; RX_PIPELINE_CACHE_ALL=0 too.
-        bool all = getenv("RX_PIPELINE_CACHE_ALL") != nullptr && std::strcmp(getenv("RX_PIPELINE_CACHE_ALL"), "0") != 0;
-        if (!getenv("RX_PIPELINE_CACHE_ALL") && !getenv("RX_PIPELINE_CACHE_SESSIONS")) {
-            MEMORYSTATUSEX ms{};
-            ms.dwLength = sizeof ms;
-            // (and Windows' commit to spare for them, with 12 GB left for the rest of the game: RAM alone was not
-            // enough: a 32 GB machine whose page file could not grow ran out of commit at a modded start, in wgpu)
-            const uint64_t need = (uint64_t)list.size() * (400ull << 10) + (12ull << 30);
-            if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= (24ull << 30)) {
-                if (ms.ullAvailPageFile >= need) {
-                    all = true;
-                    hos_log("rx: pipeline cache: %llu GB of memory: all cached pipelines are made, not only recent ones",
-                            (unsigned long long)(ms.ullTotalPhys >> 30));
-                } else {
-                    hos_log("rx: pipeline cache: only recent pipelines: Windows has %llu MB of commit free, all %zu would "
-                            "want %llu MB (a bigger page file: RX_PIPELINE_CACHE_ALL=1 makes them all anyway)",
-                            (unsigned long long)(ms.ullAvailPageFile >> 20), list.size(),
-                            (unsigned long long)(need >> 20));
-                }
-            }
-        }
+        // Which are made, and in what order: the most recently used first (the session that last drew with each,
+        // then the newest in the file), and as many as Windows' commit allows (see native_cache_step): each made
+        // pipeline holds ~300-400 KB of host memory (wgpu keeps its shader modules' IR, the driver its code). Before,
+        // all-or-nothing by the machine's memory and at most the newest 6000 of them: on a 32 GB machine with a small
+        // page file only the last 4 sessions' 3,988 of 17,869 were made, and places played before compiled their
+        // pipelines again when they came back (drawn late: things blinking in). RX_PIPELINE_CACHE_SESSIONS=<n>: only
+        // what the last n sessions used, as before.
+        static const int window = getenv("RX_PIPELINE_CACHE_SESSIONS") ? atoi(getenv("RX_PIPELINE_CACHE_SESSIONS")) : 0;
+        std::vector<std::pair<uint32_t, size_t>> order;   // (last session, file index)
+        order.reserve(list.size());
         size_t stale = 0;
-        for (PipelineDesc& d : list) {
-            auto it = last_session.find(d.key);
+        for (size_t i = 0; i < list.size(); i++) {
+            auto it = last_session.find(list[i].key);
             const uint32_t last = it == last_session.end() ? 0 : it->second;   // (0: recorded before 'U' records)
-            if (all || (int64_t)last >= (int64_t)sessions + 1 - window) nc_records.push_back(std::move(d));
-            else stale++;
+            if (window > 0 && (int64_t)last < (int64_t)sessions + 1 - window) {
+                stale++;
+                continue;
+            }
+            order.push_back({last, i});
         }
+        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
+            return a.first != b.first ? a.first > b.first : a.second > b.second;
+        });
+        nc_records.reserve(order.size());
+        for (const auto& [last, i] : order) nc_records.push_back(std::move(list[i]));
         nc_session = sessions + 1;
         if (stale)
             hos_log("rx: pipeline cache: %zu pipelines no draw used in the last %d sessions are not made", stale, window);
@@ -464,8 +456,10 @@ void native_cache_step() {
     if (!nc_loaded.load(std::memory_order_acquire) || nc_next_record >= nc_records.size()) {
         if (nc_loaded && !nc_reported && nc_next_record && nc_next_record >= nc_records.size() && prewarm_in_flight() == 0) {
             nc_reported = true;
-            hos_log("rx: pipeline cache: %lld pipelines made in the background in %.1f s", (long long)nc_made,
-                    (hos_now_ns() - nc_t_start) / 1e9);
+            uint64_t priv = 0, ws = 0;
+            hos_process_memory(&priv, &ws);
+            hos_log("rx: pipeline cache: %lld pipelines made in the background in %.1f s (the process: %llu MB private "
+                    "now)", (long long)nc_made, (hos_now_ns() - nc_t_start) / 1e9, (unsigned long long)(priv >> 20));
             nc_records.clear();
             nc_records.shrink_to_fit();
             std::lock_guard lk(nc_mu);
@@ -473,8 +467,39 @@ void native_cache_step() {
         }
         return;
     }
-    static const size_t cap = getenv("RX_PIPELINE_CACHE_MAX") ? (size_t)atoi(getenv("RX_PIPELINE_CACHE_MAX")) : 6000;
-    if (nc_next_record == 0 && nc_records.size() > cap) nc_next_record = nc_records.size() - cap;   // (the newest)
+    // RX_PIPELINE_CACHE_MAX=<n>: at most n (the most recently used first); otherwise until Windows' commit to spare
+    // falls to RX_PIPELINE_CACHE_FREE_MB (10240: the game grows by several GB as it plays, and running out of commit
+    // crashes it, see take_stream_memory), checked every 32. RX_PIPELINE_CACHE_ALL=1: no memory check.
+    static const size_t cap = getenv("RX_PIPELINE_CACHE_MAX") ? (size_t)atoi(getenv("RX_PIPELINE_CACHE_MAX")) : SIZE_MAX;
+    static const uint64_t keep_free = (getenv("RX_PIPELINE_CACHE_FREE_MB") ? (uint64_t)atoll(getenv("RX_PIPELINE_CACHE_FREE_MB"))
+                                                                            : 10240ull) << 20;
+    static const bool no_check = getenv("RX_PIPELINE_CACHE_ALL") && std::strcmp(getenv("RX_PIPELINE_CACHE_ALL"), "0") != 0;
+    static uint64_t private_at_start;
+    if (nc_next_record == 0) {
+        uint64_t ws = 0;
+        hos_process_memory(&private_at_start, &ws);
+    }
+    if (nc_next_record >= cap && nc_next_record < nc_records.size()) {
+        hos_log("rx: pipeline cache: stopped at %zu of %zu (RX_PIPELINE_CACHE_MAX)", nc_next_record, nc_records.size());
+        nc_next_record = nc_records.size();
+        return;
+    }
+    static size_t next_check = 32;
+    if (!no_check && nc_next_record >= next_check) {
+        next_check = nc_next_record + 32;
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof ms;
+        if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPageFile < keep_free) {
+            uint64_t priv = 0, ws = 0;
+            hos_process_memory(&priv, &ws);
+            hos_log("rx: pipeline cache: stopped at %zu of %zu: Windows has %llu MB of commit free (keeps %llu MB; a "
+                    "bigger page file makes more); the game grew %lld MB meanwhile", nc_next_record, nc_records.size(),
+                    (unsigned long long)(ms.ullAvailPageFile >> 20), (unsigned long long)(keep_free >> 20),
+                    (long long)((int64_t)(priv - private_at_start) >> 20));
+            nc_next_record = nc_records.size();
+            return;
+        }
+    }
     // a few at a time, while the compilers keep up: the game's own new pipelines go first
     for (int budget = 4; budget > 0 && nc_next_record < nc_records.size() && prewarm_in_flight() < 4; budget--) {
         const PipelineDesc& d = nc_records[nc_next_record++];
