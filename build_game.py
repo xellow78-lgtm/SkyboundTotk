@@ -20,7 +20,8 @@ DIST = ROOT / "dist" / "SkyboundTOTK"
 GAME_BUILDS = {
     "1.0.0": {"main": "082ce09b06e33a123cb1e2770f5f9147709033db", "sdk": "b9046c31eb5d31271be970fe732d38df49c6aa21",
               "experimental": False},
-    # 1.4.3: no frame-pacing, native frustum-cull, ultrawide-HUD or title-credit hooks yet; RomFS = the base's with
+    # 1.4.3: 30/60 fps pacing by its frame-rate controller, but no real-time frame steps, native frustum-cull,
+    # ultrawide-HUD or title-credit hooks yet; RomFS = the base's with
     # the update applied (a64-kit/tools/nx.py romfs <base.nsp> <out> --update <update.nsp>)
     "1.4.3": {"main": "277178b7dba1b6d4949a84778d4abc58b31b34f5", "sdk": "574284b40c06cf1821a44857939083bee5716820",
               "experimental": True},

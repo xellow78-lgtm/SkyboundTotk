@@ -99,7 +99,7 @@ static DWORD WINAPI vsync_main(void *p) {
 #if defined(_WIN32) && !defined(__EMSCRIPTEN__)
     const int free_run = getenv("HOS_VSYNC_FREE") != NULL;
     int64_t check_at = 0;
-    int locked = 0;
+    int locked = 0, own_clock_logged = 0;
 #endif
     for (;;) {
         hos_sleep_ns(next - hos_now_ns());
@@ -133,7 +133,12 @@ static DWORD WINAPI vsync_main(void *p) {
         int64_t k = (target * 95 / 100 + rp - 1) / rp;
         if (k < 1) k = 1;
         const int64_t tick = rp * k;
-        if (k <= 8 && tick >= target * 95 / 100 && tick <= target * 2) {
+        /* With the game's own fixed step (no real-time steps: HOS_REALTIME=0, or a build without the step hooks)
+           its speed is the tick rate: lock only to a tick within 2% of 60 Hz (60, 120, 240 Hz displays). Otherwise
+           165 Hz / 3 = 55 Hz ran the game 8% slow and 144 Hz / 3 = 48 Hz 20% slow: those keep our own 60 Hz clock. */
+        const int fixed_step = !realtime_on();
+        if (k <= 8 && tick >= target * 95 / 100 &&
+            (fixed_step ? tick >= target * 98 / 100 && tick <= target * 102 / 100 : tick <= target * 2)) {
             if (!locked) hos_log("vi: vsync follows the display (%.3f Hz, every %lld refresh%s): at most %.1f fps",
                                  1e9 / rp, (long long)k, k > 1 ? "es" : "", 1e9 / tick);
             locked = 1;
@@ -145,6 +150,10 @@ static DWORD WINAPI vsync_main(void *p) {
             locked = 0;
             period = target;
             hos_log("vi: the display runs at %.3f Hz: vsync on its own %.0f Hz clock", 1e9 / rp, 1e9 / target);
+        } else if (!locked && !own_clock_logged) {
+            own_clock_logged = 1;
+            hos_log("vi: the display runs at %.3f Hz, no whole number of refreshes is %.0f Hz: vsync on its own clock "
+                    "(the game steps by its own fixed frame time)", 1e9 / rp, 1e9 / target);
         }
 #endif
     }
@@ -330,12 +339,30 @@ SPLICE_AFTER(0x088f689c, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") {
    interval at +0x50. The controller checks below (fw + 0x248, current at +0x14) do not match there, so they leave
    the interval as the game asks. */
 
+/* TOTK's frame-rate controller, per build: its place in the game framework and its current interval (min and max at
+   +0 / +4 in both). v1.4.3 (f_082db174, as v1.0.0's f_088f6bec: clamp(measured + 1, min, max)) moved the current
+   interval to +0x40 and keeps 60 / interval at +0x50 (the frame step's global reads it, f_082daa20); it calls
+   nvnWindowSetPresentInterval with the controller in x20 and the framework in x19, as v1.0.0 does. */
+#if GAME_VERSION == 100
+#define CTL_IN_FW 0x248
+#define CTL_CURRENT 0x14
+#elif GAME_VERSION == 143
+#define CTL_IN_FW 0x200
+#define CTL_CURRENT 0x40
+#define CTL_FPS 0x50
+#endif
+
 static void totk_set_interval(int n) {
     if (!totk_ctl) return;
-    G32(totk_ctl + 0) = (uint32_t)n;      /* min */
-    G32(totk_ctl + 4) = (uint32_t)n;      /* max */
-    G32(totk_ctl + 0x14) = (uint32_t)n;   /* current: the simulation step is current / 2 */
+#ifdef CTL_IN_FW
+    G32(totk_ctl + 0) = (uint32_t)n;             /* min */
+    G32(totk_ctl + 4) = (uint32_t)n;             /* max */
+    G32(totk_ctl + CTL_CURRENT) = (uint32_t)n;   /* current: the simulation step is current / 2 */
+#ifdef CTL_FPS
+    G32(totk_ctl + CTL_FPS) = (uint32_t)(60 / n);
+#endif
     G32(totk_fw + 0x88) = (uint32_t)n;
+#endif
     nw.interval = n;
 }
 
@@ -569,23 +596,38 @@ static void nw_cancel(Ctx *c, void *u) { (void)u; RET(0); }
 static int64_t native_next_vsync;
 /* the native NVN layer's nvnWindowSetPresentInterval: the game calls it with its frame-rate controller in x20 (the
    emulated path finds the controller in the frame of the window's perform call) */
-int hos_vi_native_interval(Ctx *c, int requested) {
+static int native_controller_interval(Ctx *c, int requested) {
     uint64_t hos_guest_size(void);
     read_interval_mode();
-    /* (the checks below are loose enough that other data could pass them on a build whose controller moved: v1.0.0's
-       layout only) */
-    if (interval_mode == 0 || GAME_VERSION != 100) return requested;
+#ifndef CTL_IN_FW
+    return requested;   /* (a build whose controller is not known: the game's own interval) */
+#else
+    if (interval_mode == 0) return requested;
     const uint64_t ctl = c->x[20];
     if (ctl != totk_ctl) {
         MEMORY_BASIC_INFORMATION mi;
-        if (ctl < 0x8000000 || ctl + 0x20 >= hos_guest_size() || !VirtualQuery(GP(ctl), &mi, sizeof mi) ||
-            mi.State != MEM_COMMIT || (int)G32(ctl + 0x14) != requested || G32(ctl) > G32(ctl + 4) || G32(ctl + 4) > 4) {
+        if (ctl < 0x8000000 || ctl + CTL_CURRENT + 4 >= hos_guest_size() || !VirtualQuery(GP(ctl), &mi, sizeof mi) ||
+            mi.State != MEM_COMMIT || (int)G32(ctl + CTL_CURRENT) != requested || G32(ctl) > G32(ctl + 4) ||
+            G32(ctl + 4) > 4
+#if GAME_VERSION != 100
+            || c->x[19] + CTL_IN_FW != ctl   /* (and the framework beside it, in x19) */
+#endif
+        ) {
             static int warned;
             if (!warned++) hos_log("vi: present interval %d: not TOTK's frame-rate controller, left as asked", requested);
             return requested;
         }
     }
-    return pin_interval(ctl, ctl - 0x248, requested);
+    return pin_interval(ctl, ctl - CTL_IN_FW, requested);
+#endif
+}
+int hos_vi_native_interval(Ctx *c, int requested) {
+    const int n = native_controller_interval(c, requested);
+    /* the pacing shows frames at the interval the game steps them for. (Only the pinned path set nw.interval: with
+       the controller left alone, frames went out every vsync while the game stepped for its own interval, e.g. 3:
+       TOTK 1.4.3 ran ~2.75x fast) */
+    nw.interval = n;
+    return n;
 }
 void hos_vi_native_acquire(void) {
     static int no_pacing = -1;
