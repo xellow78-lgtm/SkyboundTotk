@@ -65,6 +65,10 @@ uint64_t hos_sys_alloc(uint64_t size, uint64_t align) {
     return a;
 }
 
+/* what the game backs with pages (AllocateMemoryPages less FreeMemoryPages), and the region calls: logged with the
+   address regions below, to tell sparse reservations from memory really in use */
+static volatile LONG64 pages_bytes, region_allocs, region_frees;
+
 uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
     if (align < 0x1000) align = 0x1000;
     size = (size + 0xFFF) & ~0xFFFULL;
@@ -120,13 +124,16 @@ uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
     UNLOCK();
     if (found && step > logged_step) {
         logged_step = step;
-        hos_log("mem: address regions: %d holding %llu MB (largest %llu MB), heap %llu MB", n,
-                (unsigned long long)(held >> 20), (unsigned long long)(largest >> 20),
+        hos_log("mem: address regions: %d holding %llu MB (largest %llu MB; %lld made, %lld freed), pages %lld MB, heap "
+                "%llu MB", n, (unsigned long long)(held >> 20), (unsigned long long)(largest >> 20),
+                (long long)region_allocs, (long long)region_frees, (long long)(pages_bytes >> 20),
                 (unsigned long long)(hos_heap_size >> 20));
     }
     if (!found) hos_fatal(NULL, "address space exhausted (%#llx bytes asked, heap %#llx; %d regions holding %llu MB, "
-                          "largest %llu MB)", (unsigned long long)size, (unsigned long long)hos_heap_size, n,
-                          (unsigned long long)(held >> 20), (unsigned long long)(largest >> 20));
+                          "largest %llu MB; %lld made, %lld freed; pages %lld MB)", (unsigned long long)size,
+                          (unsigned long long)hos_heap_size, n, (unsigned long long)(held >> 20),
+                          (unsigned long long)(largest >> 20), (long long)region_allocs, (long long)region_frees,
+                          (long long)(pages_bytes >> 20));
     return found;
 }
 
@@ -234,6 +241,7 @@ HLE(_ZN2nn2os19AllocateMemoryBlockEPmm) {
 /* nn::os::AllocateAddressRegion(unsigned long*, unsigned long) -> Result */
 HLE(_ZN2nn2os21AllocateAddressRegionEPmm) {
     HOS_TRACE_CALL("AllocateAddressRegion");
+    InterlockedIncrement64(&region_allocs);
     G64(ARG(0)) = hos_region_alloc(ARG(1), 0x10000);
     RET(0);
 }
@@ -241,14 +249,18 @@ HLE(_ZN2nn2os21AllocateAddressRegionEPmm) {
 /* nn::os::FreeAddressRegion(unsigned long) -> Result */
 HLE(_ZN2nn2os17FreeAddressRegionEm) {
     HOS_TRACE_CALL("FreeAddressRegion");
+    InterlockedIncrement64(&region_frees);
     hos_region_free(ARG(0));
     RET(0);
 }
 
 /* nn::os::AllocateMemoryPages(unsigned long, unsigned long) -> Result: new pages read as zero */
+/* what the game backs with pages (AllocateMemoryPages less FreeMemoryPages), and the calls: logged with the address
+   regions (hos_region_alloc), to tell sparse reservations from memory really in use */
 HLE(_ZN2nn2os19AllocateMemoryPagesEmm) {
     HOS_TRACE_CALL("AllocateMemoryPages");
     const uint64_t a = ARG(0), n = ARG(1), end = a + n;
+    InterlockedAdd64(&pages_bytes, (LONG64)n);
     static int zero_all = -1;
     if (zero_all < 0) zero_all = getenv("HOS_ZERO_ALL_PAGES") != NULL;
     if (zero_all || end > (1ULL << 32) || end < a) {
@@ -283,6 +295,7 @@ HLE(_ZN2nn2os19AllocateMemoryPagesEmm) {
 /* nn::os::FreeMemoryPages(unsigned long, unsigned long) -> Result */
 HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
     HOS_TRACE_CALL("FreeMemoryPages");
+    InterlockedAdd64(&pages_bytes, -(LONG64)ARG(1));
     discard_pages(ARG(0), ARG(1));
     RET(0);
 }
