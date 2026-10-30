@@ -89,6 +89,9 @@ Stream stream_ro, stream_rw;
 namespace {
 bool started;
 WGPUSurface surface;
+#ifndef __EMSCRIPTEN__
+HWND surface_hwnd;   // the window the surface is on (made again from it: surface_present)
+#endif
 WGPUTextureFormat surface_format = WGPUTextureFormat_BGRA8Unorm;
 WGPUPresentMode present_mode = WGPUPresentMode_Fifo;
 uint32_t surface_w, surface_h;
@@ -354,6 +357,7 @@ bool init_device(HWND hwnd) {
         return false;
     }
     if (hwnd) {
+        surface_hwnd = hwnd;
         WGPUSurfaceSourceWindowsHWND src{};
         src.chain.sType = WGPUSType_SurfaceSourceWindowsHWND;
         src.hinstance = GetModuleHandleA(nullptr);
@@ -2133,14 +2137,50 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
         configure_surface((uint32_t)ww, (uint32_t)wh);
     WGPUSurfaceTexture st{};
     wgpuSurfaceGetCurrentTexture(surface, &st);
+    /* Outdated (4) when the window lost the foreground (another window, the Start menu, our bindings window: F1):
+       reconfigured alone, the presents that followed succeeded but the window kept showing the last frame from
+       before (NVIDIA, Vulkan, mailbox), then black after a resize. So the surface is made again from the window, at
+       the window's size now; RX_SURFACE_REMAKE=0: only reconfigured, as before. */
+    static int fails_in_row;
     if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
         st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
         static int logged;
-        if (logged++ < 8) hos_log("rx: no surface texture (status %d)", (int)st.status);
+        fails_in_row++;
+        if (logged++ < 8 || fails_in_row % 300 == 0)
+            hos_log("rx: no surface texture (status %d, %d in a row)", (int)st.status, fails_in_row);
         if (st.texture) wgpuTextureRelease(st.texture);
-        configure_surface(surface_w, surface_h);
         if (view) wgpuTextureViewRelease(view);
+#ifndef __EMSCRIPTEN__
+        static const bool remake = !getenv("RX_SURFACE_REMAKE") || atoi(getenv("RX_SURFACE_REMAKE")) != 0;
+        RECT rc{};
+        const bool sized = surface_hwnd && !IsIconic(surface_hwnd) && GetClientRect(surface_hwnd, &rc) &&
+                           rc.right > 0 && rc.bottom > 0;
+        if (!sized) return;   // (minimized: the next present tries again)
+        if (remake) {
+            WGPUSurfaceSourceWindowsHWND src{};
+            src.chain.sType = WGPUSType_SurfaceSourceWindowsHWND;
+            src.hinstance = GetModuleHandleA(nullptr);
+            src.hwnd = surface_hwnd;
+            WGPUSurfaceDescriptor sd{};
+            sd.nextInChain = &src.chain;
+            if (WGPUSurface fresh = wgpuInstanceCreateSurface(dev.instance, &sd)) {
+                wgpuSurfaceUnconfigure(surface);
+                wgpuSurfaceRelease(surface);
+                surface = fresh;
+                surface_w = surface_h = 0;
+            }
+        }
+        configure_surface((uint32_t)rc.right, (uint32_t)rc.bottom);
+        if (logged <= 8) hos_log("rx: surface %s at %ldx%ld", remake ? "made again" : "reconfigured", rc.right, rc.bottom);
+#else
+        configure_surface(surface_w, surface_h);
+#endif
         return;
+    }
+    if (fails_in_row) {
+        hos_log("rx: presenting again after %d failed present%s (%ux%u)", fails_in_row, fails_in_row == 1 ? "" : "s",
+                surface_w, surface_h);
+        fails_in_row = 0;
     }
     WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
     WGPUCommandEncoder e = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
