@@ -257,6 +257,26 @@ uint8_t* take_stream_memory(uint64_t size) {
             }
         }
     }
+    auto* m = static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (m) return m;
+    // Windows' commit limit reached (RAM + page file: a page file that cannot grow, a disk nearly full, other
+    // programs): the pool's blocks of other sizes go back to Windows, then once more. Still nothing: null, and the
+    // stream takes no draws until a block is free again (Stream::alloc; flush_batch waits for the queued batches' blocks)
+    // instead of writing through a null pointer (a crash in a flurry rush: 64 queued batches hold 128 MB each).
+    {
+        std::lock_guard lk(stream_pool_mu);
+        uint64_t freed = 0;
+        for (const PooledStream& e : stream_pool) {
+            VirtualFree(e.memory, 0, MEM_RELEASE);
+            freed += e.capacity;
+        }
+        stream_pool.clear();
+        static int told;
+        if (told++ < 10)
+            hos_log("rx: out of memory for a %llu MB stream block (error %lu; Windows' commit limit?): %llu MB of pooled "
+                    "blocks freed", (unsigned long long)(size >> 20), (unsigned long)GetLastError(),
+                    (unsigned long long)(freed >> 20));
+    }
     return static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 }
 void give_stream_memory(uint64_t size, uint8_t* m, uint64_t used) {
@@ -1469,6 +1489,7 @@ uint64_t hash_bytes(const void* p, size_t n, uint64_t h) {
 }
 
 uint64_t Stream::alloc(uint64_t n, uint64_t align) {
+    if (!cpu) return UINT64_MAX;   // (no memory for the block: take_stream_memory)
     const uint64_t off = (used + align - 1) & ~(align - 1);
     if (off + n > capacity) return UINT64_MAX;
     used = off + n;
@@ -1477,7 +1498,7 @@ uint64_t Stream::alloc(uint64_t n, uint64_t align) {
 
 uint64_t stream_alloc(Stream& s, uint64_t n, uint64_t align) {
     uint64_t off = s.alloc(n, align);
-    if (off == UINT64_MAX && n <= s.capacity) {
+    if (off == UINT64_MAX && n <= s.capacity && s.cpu) {
         flush_batch();
         off = s.alloc(n, align);
     }
@@ -1613,6 +1634,7 @@ struct Batch {
     std::vector<uint8_t> upload_bytes;
     uint8_t *ro = nullptr, *rw = nullptr;
     uint64_t ro_used = 0, rw_used = 0;
+    bool holds_streams = false;     // counted in stream_batches_queued until submitted (push_batch)
     std::function<void()> after;   // after the submit (a present)
     bool present = false;
     std::vector<WGPUBindGroup> group_releases;   // after the replay (release_bind_group_later)
@@ -1662,6 +1684,7 @@ std::condition_variable submit_cv, submitted_cv;
 std::deque<std::unique_ptr<Batch>> submit_queue;
 int submit_busy;          // batches popped and not done yet
 int presents_queued;      // presents in the queue (frames the GPU thread is ahead by)
+unsigned stream_batches_queued;   // queued batches holding stream blocks (push_batch)
 
 /// The words a batch's shaders changed in the ranges, written into guest memory (the map callback).
 void apply_readback(Readback* rb, WGPUMapAsyncStatus status) {
@@ -1977,6 +2000,7 @@ void submit_main() {
             std::lock_guard lk(submit_mu);
             submit_busy--;
             if (b->present) presents_queued--;
+            if (b->holds_streams) stream_batches_queued--;
             if (b->serial > batch_serial_run) batch_serial_run = b->serial;
         }
         submitted_cv.notify_all();
@@ -2003,6 +2027,7 @@ bool gpu_thread_batch() {
         std::lock_guard lk(submit_mu);
         submit_busy--;
         if (b->present) presents_queued--;
+        if (b->holds_streams) stream_batches_queued--;
         if (b->serial > batch_serial_run) batch_serial_run = b->serial;
     }
     submitted_cv.notify_all();
@@ -2027,9 +2052,20 @@ void push_batch(std::unique_ptr<Batch> b) {
     // the GPU thread stays at most 2 frames (and 64 batches) ahead of the queue
     // (the threaded web build: at most 8 batches, each holds a copy of the stream bytes it used (flush_batch); the heap is
     // ~570 MB)
-    submitted_cv.wait(lk, [] { return submit_queue.size() < (RX_WEB_MT ? 8u : 64u) && presents_queued < 2; });
+    // and at most RX_STREAM_QUEUE (16) of them holding stream blocks (128 MB each: 64 of them were 8 GB more, in a
+    // stall, enough to run out of memory)
+    static const unsigned stream_queue = [] {
+        const char* e = std::getenv("RX_STREAM_QUEUE");
+        return e && std::atoi(e) > 0 ? (unsigned)std::atoi(e) : 16u;
+    }();
+    const bool holds = b->holds_streams = !RX_WEB && (b->ro || b->rw);
+    submitted_cv.wait(lk, [&] {
+        return submit_queue.size() < (RX_WEB_MT ? 8u : 64u) && presents_queued < 2 &&
+               (!holds || stream_batches_queued < stream_queue);
+    });
     st_wait_ns += hos_now_ns() - t0;
     if (b->present) presents_queued++;
+    if (holds) stream_batches_queued++;
     submit_queue.push_back(std::move(b));
     lk.unlock();
     submit_cv.notify_one();
@@ -2149,6 +2185,15 @@ void flush_batch() {
     push_batch(std::move(b));
     if (!stream_ro.cpu) stream_ro.cpu = take_stream_memory(stream_ro.capacity);
     if (!stream_rw.cpu) stream_rw.cpu = take_stream_memory(stream_rw.capacity);
+    if (!RX_WEB && (!stream_ro.cpu || !stream_rw.cpu)) {
+        // out of memory: the queued batches give their blocks back as they are submitted
+        wait_submitted();
+        if (!stream_ro.cpu) stream_ro.cpu = take_stream_memory(stream_ro.capacity);
+        if (!stream_rw.cpu) stream_rw.cpu = take_stream_memory(stream_rw.capacity);
+        static int told;
+        if ((!stream_ro.cpu || !stream_rw.cpu) && told++ < 10)
+            hos_log("rx: still no memory for the streams after the queue drained: this batch's draws are skipped");
+    }
     buffer_cache_new_batch();
     count("t_flush", hos_now_ns() - t0);
 }
