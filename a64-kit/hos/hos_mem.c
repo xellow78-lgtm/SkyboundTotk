@@ -107,9 +107,26 @@ uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
         nregions++;
         if (found < region_floor && found >= HOS_HEAP_BASE) region_floor = found;   /* (not the holes below) */
     }
+    /* how much the game holds in regions, logged at each new 128 MB step (the guest space here is 4 GB: heap and
+       regions share it; on the Switch regions take addresses from a 64 GB alias range of their own) */
+    uint64_t held = 0, largest = 0;
+    for (int i = 0; i < nregions; i++) {
+        held += regions[i].size;
+        if (regions[i].size > largest) largest = regions[i].size;
+    }
+    static uint64_t logged_step;
+    const uint64_t step = held >> 27;
+    const int n = nregions;
     UNLOCK();
-    if (!found) hos_fatal(NULL, "address space exhausted (%#llx bytes asked, heap %#llx)", (unsigned long long)size,
-                          (unsigned long long)hos_heap_size);
+    if (found && step > logged_step) {
+        logged_step = step;
+        hos_log("mem: address regions: %d holding %llu MB (largest %llu MB), heap %llu MB", n,
+                (unsigned long long)(held >> 20), (unsigned long long)(largest >> 20),
+                (unsigned long long)(hos_heap_size >> 20));
+    }
+    if (!found) hos_fatal(NULL, "address space exhausted (%#llx bytes asked, heap %#llx; %d regions holding %llu MB, "
+                          "largest %llu MB)", (unsigned long long)size, (unsigned long long)hos_heap_size, n,
+                          (unsigned long long)(held >> 20), (unsigned long long)(largest >> 20));
     return found;
 }
 
