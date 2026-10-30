@@ -177,6 +177,24 @@ uint64_t hos_region_alloc(uint64_t size, uint64_t align) { return region_alloc(s
 
 static uint64_t pages_used[(1ULL << A64_SPACE_BITS) / 0x1000 / 64];
 
+/* The pages the game has backed (AllocateMemoryPages, until FreeMemoryPages or the region's FreeAddressRegion), one
+   bit a page: hos_pages_bytes counts them. (Adding and subtracting the calls' sizes counted pages backed twice and
+   never subtracted the ones a freed region still held: 2,071 MB of "pages" in 1,664 MB of regions.) */
+static uint64_t pages_backed[(1ULL << A64_SPACE_BITS) / 0x1000 / 64];
+static void backed_set_locked(uint64_t addr, uint64_t size, int on) {
+    const uint64_t p0 = addr >> 12, p1 = (addr + size + 0xFFF) >> 12;
+    int64_t changed = 0;
+    for (uint64_t p = p0; p < p1 && p < A64_PAGES; p++) {
+        uint64_t *w = &pages_backed[p >> 6];
+        const uint64_t bit = 1ULL << (p & 63);
+        if (!!(*w & bit) != on) {
+            *w ^= bit;
+            changed++;
+        }
+    }
+    hos_pages_bytes += (on ? changed : -changed) << 12;
+}
+
 static void pages_mark_used_locked(uint64_t addr, uint64_t size) {
     for (uint64_t p = addr >> 12; p < (addr + size + 0xFFF) >> 12 && p < A64_PAGES; p++) pages_used[p >> 6] |= 1ULL << (p & 63);
 }
@@ -209,6 +227,7 @@ void hos_region_free(uint64_t addr) {
     for (int i = 0; i < nregions; i++) {
         if (regions[i].addr == addr) {
             pages_mark_used_locked(regions[i].addr, regions[i].size);
+            backed_set_locked(regions[i].addr, regions[i].size, 0);
             freed = regions[i].addr;
             freed_size = regions[i].size;
             memmove(&regions[i], &regions[i + 1], (nregions - i - 1) * sizeof(Range));
@@ -304,7 +323,10 @@ HLE(_ZN2nn2os17FreeAddressRegionEm) {
 HLE(_ZN2nn2os19AllocateMemoryPagesEmm) {
     HOS_TRACE_CALL("AllocateMemoryPages");
     const uint64_t a = ARG(0), n = ARG(1), end = a + n;
-    InterlockedAdd64(&pages_bytes, (LONG64)n);
+    LOCK();
+    backed_set_locked(a, n, 1);
+    UNLOCK();
+
     static int zero_all = -1;
     if (zero_all < 0) zero_all = getenv("HOS_ZERO_ALL_PAGES") != NULL;
     if (zero_all || end > (1ULL << A64_SPACE_BITS) || end < a) {
@@ -339,7 +361,9 @@ HLE(_ZN2nn2os19AllocateMemoryPagesEmm) {
 /* nn::os::FreeMemoryPages(unsigned long, unsigned long) -> Result */
 HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
     HOS_TRACE_CALL("FreeMemoryPages");
-    InterlockedAdd64(&pages_bytes, -(LONG64)ARG(1));
+    LOCK();
+    backed_set_locked(ARG(0), ARG(1), 0);
+    UNLOCK();
     discard_pages(ARG(0), ARG(1));
     RET(0);
 }
@@ -353,7 +377,8 @@ uint64_t hos_used_memory(void) {
     static int uncounted = -1;
     if (uncounted < 0) uncounted = getenv("HOS_PAGES_UNCOUNTED") != NULL;
     const int64_t pages = uncounted ? 0 : hos_pages_bytes;
-    return hos_program_size + (16ULL << 20) + hos_heap_size + (uint64_t)(pages > 0 ? pages : 0);
+    const uint64_t used = hos_program_size + (16ULL << 20) + hos_heap_size + (uint64_t)(pages > 0 ? pages : 0);
+    return used < hos_total_memory ? used : hos_total_memory;   /* (never past the total: free memory would wrap) */
 }
 
 /* nn::os::QueryMemoryInfo(nn::os::MemoryInfo*). TOTK reads +0 (total available) and +8 (total used):
