@@ -223,6 +223,10 @@ int main(int argc, char **argv) {
     uint64_t sp = c->x[31];
     void hos_prof_start(void);
     hos_prof_start();   /* HOS_PROFILE=<seconds> */
+#ifndef __EMSCRIPTEN__
+    void hos_watch_start(void);
+    hos_watch_start();   /* HOS_WATCH=<guest address>: who reads / writes it (hos_watch.c) */
+#endif
 #ifdef _WIN32
     timeBeginPeriod(1);   /* 1 ms timer resolution: the 60 Hz vsync and the game's frame pacing sleep in short steps */
     no_power_throttling();
