@@ -295,7 +295,20 @@ void load() {
         }
         // (pipelines no recent session used are not made: their host memory is the cost, see the top)
         static const int window = getenv("RX_PIPELINE_CACHE_SESSIONS") ? atoi(getenv("RX_PIPELINE_CACHE_SESSIONS")) : 4;
-        const bool all = getenv("RX_PIPELINE_CACHE_ALL") != nullptr;
+        // ... unless the machine has the memory for all of them (24 GB or more; each ~390 KB, at most
+        // RX_PIPELINE_CACHE_MAX): then every pipeline ever made is made again at the start, in the background, so
+        // places played longer ago do not compile their pipelines again (drawn late) when they come back.
+        // RX_PIPELINE_CACHE_SESSIONS=<n> keeps the window regardless; RX_PIPELINE_CACHE_ALL=0 too.
+        bool all = getenv("RX_PIPELINE_CACHE_ALL") != nullptr && std::strcmp(getenv("RX_PIPELINE_CACHE_ALL"), "0") != 0;
+        if (!getenv("RX_PIPELINE_CACHE_ALL") && !getenv("RX_PIPELINE_CACHE_SESSIONS")) {
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof ms;
+            if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= (24ull << 30)) {
+                all = true;
+                hos_log("rx: pipeline cache: %llu GB of memory: all cached pipelines are made, not only recent ones",
+                        (unsigned long long)(ms.ullTotalPhys >> 30));
+            }
+        }
         size_t stale = 0;
         for (PipelineDesc& d : list) {
             auto it = last_session.find(d.key);
