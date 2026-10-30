@@ -7,7 +7,10 @@
      +0x178); a merged controller takes the first moving stick of its children (children at +0x188, count +0x180)
      into its own +0x128. Watched (the first run found only these two functions and the idle timer f_08d940d0 reading
      the Npad controller): the merged controllers that have Npad No.1's among their children, so the log names the
-     code that reads the stick the game plays with. HOS_WATCH_STICK=npad watches the Npad controller instead. */
+     code that reads the stick the game plays with. HOS_WATCH_STICK=npad watches the Npad controller instead.
+   - The second run: merged controller 8 (Npad No.1's alone) is read every frame by f_0837d330 (x0 = a controller,
+     x1 = the one it copies: buttons, sticks at +0x120 / +0x128, triggers): the copies of a watched merged controller
+     are watched too (up to the 4 breakpoints), the next step toward the camera. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +18,8 @@
 
 #if GAME_VERSION == 143
 static uint64_t npad_ctl;
+static uint64_t merged[3];
+static int nmerged, nwatched;
 static int watch_mode(void) {   /* 0 off, 1 merged controllers, 2 the Npad controller */
     static int m = -1;
     if (m < 0) {
@@ -64,11 +69,36 @@ ENTRY_HOOK(0x08479c20) {
 #ifndef __EMSCRIPTEN__
                 hos_watch_arm(ctl + 0x128, 8, why[armed]);
 #endif
+                if (nmerged < 3) merged[nmerged++] = ctl;
+                nwatched++;
                 armed++;
                 break;
             }
     }
     if (!armed) hos_log("watch: no controller of the %d at %#llx merges Npad No.1's", n, (unsigned long long)mgr);
+    return 0;
+}
+/* a controller copying another (x0 <- x1): a copy of a watched merged controller is watched too */
+ENTRY_HOOK(0x0837d330) {
+    if (watch_mode() != 1 || !nmerged || nwatched >= 4) return 0;
+    static uint64_t seen[4];
+    static int nseen;
+    for (int i = 0; i < nmerged; i++)
+        if (c->x[1] == merged[i]) {
+            for (int k = 0; k < nseen; k++)
+                if (seen[k] == c->x[0]) return 0;
+            if (nseen < 4) seen[nseen++] = c->x[0];
+            static char why[2][64];
+            const int w = nwatched - 2 < 0 ? 0 : nwatched - 2 > 1 ? 1 : nwatched - 2;
+            snprintf(why[w], sizeof why[w], "copy of merged controller (%#llx) right stick", (unsigned long long)merged[i]);
+            hos_log("watch: controller %#llx copies %#llx (lr %#llx)", (unsigned long long)c->x[0],
+                    (unsigned long long)merged[i], (unsigned long long)c->x[30]);
+#ifndef __EMSCRIPTEN__
+            hos_watch_arm(c->x[0] + 0x128, 8, why[w]);
+#endif
+            nwatched++;
+            return 0;
+        }
     return 0;
 }
 #endif
