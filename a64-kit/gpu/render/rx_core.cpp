@@ -481,8 +481,12 @@ bool init_device(HWND hwnd) {
         mailbox |= caps.presentModes[i] == WGPUPresentMode_Mailbox;
         immediate |= caps.presentModes[i] == WGPUPresentMode_Immediate;
     }
-    // the game paces itself (nn_vi's buffer queue): presenting must not wait for a vblank
-    present_mode = mailbox ? WGPUPresentMode_Mailbox : immediate ? WGPUPresentMode_Immediate : WGPUPresentMode_Fifo;
+    // FIFO (the display's vsync) by default. Mailbox was the default (the game paces itself, nn_vi's buffer queue, so
+    // presenting need not wait for a vblank), but with it on NVIDIA / Vulkan the window kept showing one old frame
+    // after the game window lost the foreground once (F1's bindings window, the Start menu) while the game ran on;
+    // FIFO did not (a player's test, TOTK 1.4.3). RX_PRESENT=mailbox / immediate: those.
+    (void)mailbox, (void)immediate;
+    present_mode = WGPUPresentMode_Fifo;
     if (const char* want = getenv("RX_PRESENT")) {
         if (!std::strcmp(want, "fifo")) present_mode = WGPUPresentMode_Fifo;
         else if (!std::strcmp(want, "mailbox") && mailbox) present_mode = WGPUPresentMode_Mailbox;
@@ -2156,6 +2160,9 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
         const bool sized = surface_hwnd && !IsIconic(surface_hwnd) && GetClientRect(surface_hwnd, &rc) &&
                            rc.right > 0 && rc.bottom > 0;
         if (!sized) return;   // (minimized: the next present tries again)
+        // (the window's size in pixels as the display thread has it: this thread is not DPI aware, and its
+        // GetClientRect gave 1706x996 for a 2560x1494 window at 150%)
+        if (ww > 0 && wh > 0) rc.right = ww, rc.bottom = wh;
         if (remake) {
             WGPUSurfaceSourceWindowsHWND src{};
             src.chain.sType = WGPUSType_SurfaceSourceWindowsHWND;
