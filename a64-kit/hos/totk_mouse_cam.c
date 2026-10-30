@@ -14,8 +14,10 @@
    sensitivity per count, as a 0.022-degree game at 3x), at the frame's step (nn_vi: 1/60 or 1/30 s). A full input
    (1) turns the camera CAM_DEG_PER_SEC a second horizontally: Savage Wind's measurement of BotW's CameraChase
    (2.848 degrees a 30th of a second; github.com/Tempus3214/SavageWindRecomp, branch mouse-camera, MIT), which TOTK's
-   camera, with the same 1.78, is taken to share until measured. The vertical part gets 1.78 times the mouse's motion,
-   so both axes turn alike for the same motion. The Inverted options still apply; so does mouse_invert_y.
+   camera, with the same 1.78, is taken to share until measured. The vertical part: at first 1.78 times the mouse's
+   motion (Savage Wind's way for BotW, whose cameras turn the vertical part 1.78 times slower), but in TOTK that made
+   up / down clearly faster than left / right (a player's test): the same motion now, times mouse_vertical_speed (F1,
+   25 .. 250%, default 100%) to even them out by feel. The Inverted options still apply; so does mouse_invert_y.
    While the game reads its camera input this way (the last 250 ms), the mouse stops moving the right stick
    (nn_hid.c, hos_mouse_cam_native); elsewhere (menus, the map) it moves the stick as before.
    HOS_MOUSE_NATIVE=0: the stick as before. HOS_MOUSE_CAM_LOG=<n>: n frames of input and mouse values logged. */
@@ -28,7 +30,6 @@
 #include <windows.h>
 
 #define CAM_DEG_PER_SEC (2.848 * 30.0)   /* a full input's turn a second, horizontally */
-#define CAM_YAW_PER_PITCH 1.78           /* the camera's horizontal speed over its vertical (StickSensitivityLat2LngRatio) */
 #define DEG_PER_COUNT 0.066              /* at sensitivity 1 */
 
 static volatile int64_t native_at;   /* when the camera last took its input this way */
@@ -84,7 +85,7 @@ ENTRY_HOOK(0x08874c1c) {
             const double step = hos_vi_interval() / 60.0;   /* the frame's simulated time */
             const double k = DEG_PER_COUNT * sens / (CAM_DEG_PER_SEC * step);
             vx = (float)(dx * k);
-            vy = (float)(-dy * k * CAM_YAW_PER_PITCH * (b.mouse_invert_y ? -1 : 1));
+            vy = (float)(-dy * k * b.mouse_pitch * (b.mouse_invert_y ? -1 : 1));
         }
         static int logs = -1;
         if (logs < 0) logs = getenv("HOS_MOUSE_CAM_LOG") ? atoi(getenv("HOS_MOUSE_CAM_LOG")) : 0;

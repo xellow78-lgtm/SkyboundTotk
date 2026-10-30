@@ -1,7 +1,7 @@
 /* Keyboard and mouse bindings: which keys and mouse buttons press which Pro Controller button or push which stick
    direction (input_bind.h). Kept in <user>/input.ini, one line per action, e.g. "Y = F, Mouse1"; F1 in the game
    opens an editor (input_bind_ui.c). A line left out keeps the default; "X =" unbinds. Unknown names are skipped
-   (logged). Also there: mouse_camera, mouse_sensitivity, mouse_invert_y, walk_speed. An older <user>/mouse_sens.txt
+   (logged). Also there: mouse_camera, mouse_sensitivity, mouse_invert_y, mouse_vertical_speed, walk_speed. An older <user>/mouse_sens.txt
    is read once as the sensitivity when there is no input.ini yet. */
 #include "hos.h"
 #include "input_bind.h"
@@ -138,6 +138,7 @@ void hos_bind_defaults(Bindings *b) {
     b->mouse_camera = 1;
     b->mouse_sens = 1.0;
     b->walk_scale = 0.4;
+    b->mouse_pitch = 1.0;
 }
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -180,6 +181,7 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "mouse_sensitivity")) { if (atof(v) > 0) b->mouse_sens = atof(v); continue; }
         if (!_stricmp(k, "mouse_invert_y")) { b->mouse_invert_y = atoi(v) != 0; continue; }
         if (!_stricmp(k, "walk_speed")) { b->walk_scale = atof(v); continue; }
+        if (!_stricmp(k, "mouse_vertical_speed")) { b->mouse_pitch = atof(v); continue; }
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -197,6 +199,7 @@ static void load(Bindings *b) {
     if (b->mouse_sens < 0.05) b->mouse_sens = 0.05;
     if (b->mouse_sens > 20) b->mouse_sens = 20;
     if (b->walk_scale < 0.1 || b->walk_scale > 1) b->walk_scale = 0.4;
+    if (!(b->mouse_pitch >= 0.25 && b->mouse_pitch <= 2.5)) b->mouse_pitch = 1.0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -208,8 +211,8 @@ static void save(const Bindings *b) {
     fprintf(f, "# SkyboundTOTK keyboard and mouse bindings. F1 in the game opens the editor; or edit this file (game\n"
                "# closed). Up to %d keys an action, separated by commas; nothing after = unbinds. Mouse buttons are\n"
                "# Mouse1 (left) .. Mouse5, the wheel WheelUp / WheelDown.\n\n", BIND_SLOTS);
-    fprintf(f, "mouse_camera = %d\nmouse_sensitivity = %.3f\nmouse_invert_y = %d\nwalk_speed = %.2f\n\n",
-            b->mouse_camera, b->mouse_sens, b->mouse_invert_y, b->walk_scale);
+    fprintf(f, "mouse_camera = %d\nmouse_sensitivity = %.3f\nmouse_vertical_speed = %.2f\nmouse_invert_y = %d\n"
+               "walk_speed = %.2f\n\n", b->mouse_camera, b->mouse_sens, b->mouse_pitch, b->mouse_invert_y, b->walk_scale);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)

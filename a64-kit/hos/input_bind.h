@@ -22,6 +22,7 @@ typedef struct {
     double mouse_sens;                     /* 1 = the default speed */
     int mouse_invert_y;
     double walk_scale;                     /* the left stick while walk is held, 0.1 .. 1 */
+    double mouse_pitch;                    /* the mouse camera's up / down speed over its left / right, 0.25 .. 2.5 */
 } Bindings;
 
 /* A copy of the current bindings (loaded from <user>/input.ini on first use). */
