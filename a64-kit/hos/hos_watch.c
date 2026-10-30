@@ -112,11 +112,9 @@ static LONG CALLBACK handler(EXCEPTION_POINTERS *e) {
     if (InterlockedIncrement(&site->reported) <= 2) {
         char name[300];
         HosThread *t = hos_self();
-        const uint64_t g = slot[s].guest;
-        uint64_t v = 0;
-        memcpy(&v, hos_guest_base() + g, slot[s].len);
-        hos_log("watch: %s (%#llx) touched by %s on thread %s, now %#llx", slot[s].why, (unsigned long long)g,
-                symbolize(rip, name, sizeof name), t ? hos_thread_name(t) : "?", (unsigned long long)v);
+        /* (no read of the watched bytes here: that is a hit of its own, in this handler) */
+        hos_log("watch: %s (%#llx) touched by %s on thread %s", slot[s].why, (unsigned long long)slot[s].guest,
+                symbolize(rip, name, sizeof name), t ? hos_thread_name(t) : "?");
         hos_log_flush();
         hos_backtrace();
     }

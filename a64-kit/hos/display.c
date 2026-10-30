@@ -214,6 +214,11 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
         if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
+        if (wp == VK_F12 && !(lp & (1 << 30)) && renderer) {   /* (debugging: the next frame's passes and targets) */
+            void rx_request_frame_dump(void);   /* gpu/render/rx_debug.cpp */
+            rx_request_frame_dump();
+            hos_log("display: F12: frame dump of the next frame (RX_DUMP_DIR, default rx_frame)");
+        }
         if (renderer && wp >= VK_F6 && wp <= VK_F10 && !(lp & (1 << 30))) {   /* the present settings (F6-F10) */
             hos_log("present: %s", rx_present_hotkey((int)(wp - VK_F6) + 6));
             if (wp == VK_F6) {   /* (ultrawide: the aspect from the window's size again) */
