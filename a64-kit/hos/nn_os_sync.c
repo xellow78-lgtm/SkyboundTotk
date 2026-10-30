@@ -658,7 +658,9 @@ HLE(_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE) {
     if (gate) __atomic_sub_fetch(&hos_prof_gate, 1, __ATOMIC_SEQ_CST);
 }
 HLE(_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE) {
-    RET(event_wait(obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0));
+    const int r = event_wait(obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0);
+    if (!r) hos_note_timeout(c->x[30], "light event", (int64_t)ARG(1));
+    RET(r);
 }
 
 /* System events are created by other HLE APIs (vsync, audio device changes ...) with hos_system_event_init. */
@@ -820,6 +822,7 @@ HLE(_ZN2nn2os26TimedPeekLightMessageQueueEPmPKNS0_21LightMessageQueueTypeENS_8Ti
     int64_t t = (int64_t)ARG(2);
     int ok = queue_get(obj(ARG(1), K_QUEUE), &v, 0, t > 0 ? t : 0);
     if (ok) G64(ARG(0)) = v;
+    else hos_note_timeout(c->x[30], "light message queue peek", t);
     RET(ok);
 }
 
@@ -955,7 +958,11 @@ static uint64_t wait_any(uint64_t multiwait, int64_t timeout_ns) {
     return found;
 }
 HLE(_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE) { RET(wait_any(ARG(0), -1)); }
-HLE(_ZN2nn2os12TimedWaitAnyEPNS0_13MultiWaitTypeENS_8TimeSpanE) { RET(wait_any(ARG(0), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 0)); }
+HLE(_ZN2nn2os12TimedWaitAnyEPNS0_13MultiWaitTypeENS_8TimeSpanE) {
+    const uint64_t r = wait_any(ARG(0), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 0);
+    if (!r) hos_note_timeout(c->x[30], "multi wait", (int64_t)ARG(1));
+    RET(r);
+}
 HLE(_ZN2nn2os10TryWaitAnyEPNS0_13MultiWaitTypeE) { RET(wait_any(ARG(0), 0)); }
 HLE(_ZN2nn2os24UnlinkAllMultiWaitHolderEPNS0_13MultiWaitTypeE) {
     Obj *mw = obj(ARG(0), K_MULTIWAIT);
@@ -984,7 +991,10 @@ HLE(_ZN2nn2os22MoveAllMultiWaitHolderEPNS0_13MultiWaitTypeES2_) {
 HLE(_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb) { event_init(ARG(0), 0, (int)ARG(1)); RET(0); }
 HLE(_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE) { event_signal(obj(ARG(0), K_EVENT)); }
 HLE(_ZN2nn2os20TimedWaitSystemEventEPNS0_15SystemEventTypeENS_8TimeSpanE) {
-    RET(logged_wait(c, obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0, "system timed"));
+    const int r = logged_wait(c, obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0,
+                              "system timed");
+    if (!r) hos_note_timeout(c->x[30], "system event", (int64_t)ARG(1));
+    RET(r);
 }
 /* Attaching kernel handles: without a kernel nothing ever signals them, which is what an idle device would do. */
 HLE(_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE) { event_init(ARG(0), 0, (int)ARG(3)); }
@@ -1004,7 +1014,9 @@ HLE(_ZN2nn2os11SystemEventD2Ev) { drop(ARG(0)); }
 HLE(_ZN2nn2os9WaitEventEPNS0_9EventTypeE) { event_wait(obj(ARG(0), K_EVENT), 0, 0); }
 HLE(_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE) { RET(event_wait(obj(ARG(0), K_EVENT), 0, 1)); }
 HLE(_ZN2nn2os14TimedWaitEventEPNS0_9EventTypeENS_8TimeSpanE) {
-    RET(event_wait(obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0));
+    const int r = event_wait(obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0);
+    if (!r) hos_note_timeout(c->x[30], "event", (int64_t)ARG(1));
+    RET(r);
 }
 HLE(_ZN2nn2os17TryWaitLightEventEPNS0_14LightEventTypeE) { RET(event_wait(obj(ARG(0), K_EVENT), 0, 1)); }
 HLE(_ZN2nn2os17TryWaitTimerEventEPNS0_14TimerEventTypeE) {
@@ -1030,5 +1042,6 @@ HLE(_ZN2nn2os26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9Mut
     ReleaseSRWLockExclusive(&cv->lk);
     mutex_lock(m, 0, NULL);
     m->count = count;
+    if (!signaled) hos_note_timeout(c->x[30], "condition variable", (int64_t)ARG(2));
     RET(signaled);
 }

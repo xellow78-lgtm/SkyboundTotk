@@ -21,7 +21,7 @@ static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
     case 4: return HOS_HEAP_BASE;                          /* HeapRegionAddress */
     case 5: return HOS_SPACE_END - HOS_HEAP_BASE;          /* HeapRegionSize */
     case 6: return hos_total_memory;                       /* TotalMemorySize */
-    case 7: return hos_program_size + hos_heap_size;       /* UsedMemorySize */
+    case 7: InterlockedIncrement64(&hos_meminfo_queries); return hos_used_memory();   /* UsedMemorySize */
     case 8: return 0;                                      /* DebuggerAttached */
     case 11: return 0x5A3C9E1F0B7D2468ULL ^ (id1 * 0x9E3779B97F4A7C15ULL);   /* RandomEntropy */
     case 12: return 0x08000000ULL;                         /* AslrRegionAddress */
@@ -31,7 +31,7 @@ static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
     case 16: case 17: return 0;                            /* SystemResourceSize total / used */
     case 18: return 0x0100F2C0115B6000ULL;                 /* ProgramId: set per title by hos_main (TODO) */
     case 21: return hos_total_memory;                      /* TotalNonSystemMemorySize */
-    case 22: return hos_program_size + hos_heap_size;      /* UsedNonSystemMemorySize */
+    case 22: InterlockedIncrement64(&hos_meminfo_queries); return hos_used_memory();  /* UsedNonSystemMemorySize */
     case 23: return 1;                                     /* IsApplication */
     /* AliasRegionExtraSize (SDK 18+; TOTK 1.4.3's nnosInitialize asks): 0 unless the process was created for the
        address sanitizer (Atmosphere's KPageTableBase::InitializeForProcess), which a retail game is not */
@@ -310,6 +310,7 @@ void a64_svc(Ctx *c, uint32_t imm) {
         return;
     case 0x1C:   /* WaitProcessWideKeyAtomic(mutex, key, tag, timeout) */
         c->x[0] = wait_key(c->x[0], c->x[1], (uint32_t)c->x[2], (int64_t)c->x[3]);
+        if (c->x[0] == R_TIMED_OUT) hos_note_timeout(c->x[30], "svc condition variable", (int64_t)c->x[3]);
         return;
     case 0x1D:   /* SignalProcessWideKey(key, count) */
         signal_key(c->x[0], (int32_t)c->x[1]);

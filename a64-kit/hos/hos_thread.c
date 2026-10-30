@@ -594,6 +594,34 @@ HLE(_ZN2nn2os19GetCurrentStackInfoEPmS1_) {
 
 HLE(_ZN2nn2os11YieldThreadEv) { SwitchToThread(); }
 /* HOS_SLEEP_LOG=1 (diagnostic): guest sleeps by caller (LR) every 5 s: count, asked, slept */
+/* A timed wait of 50 ms or more that ran out (diagnostic, always on; HOS_TIMEOUT_LOG=0: off): the game waiting each
+   frame for something that never comes (a shrine at exactly 3 fps: 333 ms a frame). Each caller up to 3 times, 300 in
+   all, with the thread. */
+void hos_note_timeout(uint64_t lr, const char *what, int64_t timeout_ns) {
+    static int on = -1;
+    if (on < 0) on = !getenv("HOS_TIMEOUT_LOG") || atoi(getenv("HOS_TIMEOUT_LOG")) != 0;
+    if (!on || timeout_ns < 50000000) return;
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static struct { uint64_t lr; int n; } seen[128];
+    static int nseen, total;
+    int log = 0;
+    AcquireSRWLockExclusive(&lk);
+    int i = 0;
+    while (i < nseen && seen[i].lr != lr) i++;
+    if (i == nseen && nseen < 128) seen[nseen++].lr = lr;
+    if (i < 128 && seen[i].n < 3 && total < 300) {
+        seen[i].n++;
+        total++;
+        log = 1;
+    }
+    ReleaseSRWLockExclusive(&lk);
+    if (log) {
+        HosThread *t = hos_self();
+        hos_log("wait: %s of %lld ms timed out (thread %s, lr %#llx)", what, (long long)(timeout_ns / 1000000),
+                t ? t->name : "?", (unsigned long long)lr);
+    }
+}
+
 void hos_sleep_logged(int64_t ns, uint64_t lr) {
     /* HOS_POLL_SLEEP_NS=<ns> (experiment): a guest sleep of up to 100 us lasts at most that long. TOTK's job system
        waits for its workers by sleeping 20 us and looking again (~90 times a frame at the castle, on MainThread and
@@ -607,6 +635,7 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
     if (poll_cap && ns > poll_cap && ns <= 100000) ns = poll_cap;
     static int on = -1;
     if (on < 0) on = getenv("HOS_SLEEP_LOG") != NULL;
+    if (ns >= 100000000) hos_note_timeout(lr, "sleep", ns);   /* (a sleep that long, each frame: the same clue) */
     if (!on) { hos_sleep_ns(ns); return; }
     const int64_t t0 = hos_now_ns();
     hos_sleep_ns(ns);

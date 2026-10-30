@@ -85,6 +85,11 @@ extern uint64_t hos_heap_size, hos_heap_used, hos_total_memory, hos_program_size
 /* ---- threads (hos_thread.c) */
 typedef struct HosThread HosThread;
 HosThread *hos_self(void);
+void hos_note_timeout(uint64_t lr, const char *what, int64_t timeout_ns);   /* hos_thread.c (diagnostic) */
+/* hos_mem.c: what the game has backed with pages (AllocateMemoryPages less FreeMemoryPages), how often it asked how
+   much memory is used, and that amount as the Switch counts it (hos_used_memory) */
+extern volatile long long hos_pages_bytes, hos_meminfo_queries;
+uint64_t hos_used_memory(void);
 Ctx *hos_ctx(void);
 uint64_t hos_thread_guest(HosThread *t);                   /* its nn::os::ThreadType in guest memory */
 uint64_t hos_thread_id(HosThread *t);

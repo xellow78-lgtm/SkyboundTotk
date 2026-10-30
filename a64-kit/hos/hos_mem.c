@@ -67,7 +67,9 @@ uint64_t hos_sys_alloc(uint64_t size, uint64_t align) {
 
 /* what the game backs with pages (AllocateMemoryPages less FreeMemoryPages), and the region calls: logged with the
    address regions below, to tell sparse reservations from memory really in use */
-static volatile LONG64 pages_bytes, region_allocs, region_frees;
+volatile long long hos_pages_bytes, hos_meminfo_queries;   /* (hos.h) */
+static volatile LONG64 region_allocs, region_frees;
+#define pages_bytes hos_pages_bytes
 
 /* The game's regions go above 4 GB first (HOS_HIGH_BASE..HOS_HIGH_END, natively: rt/a64.h A64_SPACE_BITS), each
    committed as it is made: the low 4 GB keep only what does not fit there. HOS_HIGH_REGIONS=0: the low 4 GB only, as
@@ -158,9 +160,10 @@ static uint64_t region_alloc(uint64_t size, uint64_t align, int high) {
     if (found && step > logged_step) {
         logged_step = step;
         hos_log("mem: address regions: %d holding %llu MB (largest %llu MB; %lld made, %lld freed), pages %lld MB, heap "
-                "%llu MB", n, (unsigned long long)(held >> 20), (unsigned long long)(largest >> 20),
-                (long long)region_allocs, (long long)region_frees, (long long)(pages_bytes >> 20),
-                (unsigned long long)(hos_heap_size >> 20));
+                "%llu MB; the game asked how much memory is used %lld times", n, (unsigned long long)(held >> 20),
+                (unsigned long long)(largest >> 20), (long long)region_allocs, (long long)region_frees,
+                (long long)(pages_bytes >> 20), (unsigned long long)(hos_heap_size >> 20),
+                (long long)hos_meminfo_queries);
     }
     if (!found) hos_fatal(NULL, "address space exhausted (%#llx bytes asked, heap %#llx; %d regions holding %llu MB, "
                           "largest %llu MB; %lld made, %lld freed; pages %lld MB)", (unsigned long long)size,
@@ -341,13 +344,26 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
     RET(0);
 }
 
+/* Memory in use as the Switch counts it: the program and the system's share, the heap once it is set, and the pages
+   the game backed in its address regions. The pages were left out (and the heap from QueryMemoryInfo): TOTK then saw
+   its ~1 GB for regions as never filling, kept every place it had loaded (pages 2.2 GB after a few teleports, past the
+   1080 MB it sets aside for them) and the process ran Windows out of commit. At the start (no heap, no pages) this is
+   the program + 16 MB the game sizes its heap from. HOS_PAGES_UNCOUNTED=1: the pages left out, as before. */
+uint64_t hos_used_memory(void) {
+    static int uncounted = -1;
+    if (uncounted < 0) uncounted = getenv("HOS_PAGES_UNCOUNTED") != NULL;
+    const int64_t pages = uncounted ? 0 : hos_pages_bytes;
+    return hos_program_size + (16ULL << 20) + hos_heap_size + (uint64_t)(pages > 0 ? pages : 0);
+}
+
 /* nn::os::QueryMemoryInfo(nn::os::MemoryInfo*). TOTK reads +0 (total available) and +8 (total used):
    heap = align_down(total - used, 2 MB) - 0x43800000 (main+0x1131004). */
 HLE(_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE) {
     uint64_t info = ARG(0);
     HOS_TRACE_CALL("QueryMemoryInfo");
+    InterlockedIncrement64(&hos_meminfo_queries);
     G64(info + 0x00) = hos_total_memory;                       /* total available */
-    G64(info + 0x08) = hos_program_size + (16ULL << 20);       /* total used: program + system */
+    G64(info + 0x08) = hos_used_memory();                      /* total used (hos_used_memory) */
     G64(info + 0x10) = hos_heap_size;                          /* total heap */
     G64(info + 0x18) = hos_heap_used;                          /* allocated heap */
     G64(info + 0x20) = hos_program_size;                       /* program */
