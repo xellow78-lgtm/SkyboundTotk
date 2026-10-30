@@ -293,6 +293,7 @@ void rdoc_present();
 /// batch runs, the words the GPU changed there are written back into guest memory (the game reads what its shaders
 /// write: visibility flags from material shaders, ...).
 void writeback_after_batch(uint64_t rw_offset, uint64_t size, uint64_t gpu_va);
+void writeback_in_place(WGPUBuffer buffer, uint64_t offset, uint64_t size, uint64_t gpu_va);
 /// A pixel program of the open pass writes this stream_rw copy of guest memory: at the pass's end it is copied into
 /// the buffer cache (later passes read the results there).
 void storage_written_in_pass(uint64_t rw_offset, uint64_t size, uint64_t gpu_va);

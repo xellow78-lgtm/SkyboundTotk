@@ -10,6 +10,7 @@
 #include <deque>
 #include <set>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <cstdlib>
@@ -1590,6 +1591,10 @@ struct Upload {
 };
 struct Writeback {
     uint64_t rw_offset, size, gpu_va;
+    // (a dispatch's results in the buffer cache, read back in place: writeback_in_place. src null: in stream_rw)
+    WGPUBuffer src = nullptr;
+    uint64_t src_offset = 0;
+    std::shared_ptr<std::vector<uint8_t>> before;   // guest memory there when the dispatch was recorded
 };
 /// GPU results on their way back to guest memory: a staging copy of the written ranges, and what they held before.
 struct Readback {
@@ -1696,7 +1701,8 @@ void start_readback(Batch& b) {
     rb->ranges = std::move(b.writebacks);
     for (const Writeback& w : rb->ranges) {
         const uint64_t n = (w.size + 3) & ~3ull;
-        rb->before.insert(rb->before.end(), b.rw + w.rw_offset, b.rw + w.rw_offset + n);
+        if (w.src) rb->before.insert(rb->before.end(), w.before->begin(), w.before->begin() + n);
+        else rb->before.insert(rb->before.end(), b.rw + w.rw_offset, b.rw + w.rw_offset + n);
         rb->total += n;
     }
     WGPUBufferDescriptor d{};
@@ -1708,7 +1714,8 @@ void start_readback(Batch& b) {
     uint64_t pos = 0;
     for (const Writeback& w : rb->ranges) {
         const uint64_t n = (w.size + 3) & ~3ull;
-        wgpuCommandEncoderCopyBufferToBuffer(e, stream_rw.buffer, w.rw_offset, rb->staging, pos, n);
+        if (w.src) wgpuCommandEncoderCopyBufferToBuffer(e, w.src, w.src_offset, rb->staging, pos, n);
+        else wgpuCommandEncoderCopyBufferToBuffer(e, stream_rw.buffer, w.rw_offset, rb->staging, pos, n);
         pos += n;
     }
     WGPUCommandBuffer cb = wgpuCommandEncoderFinish(e, nullptr);
@@ -1719,6 +1726,12 @@ void start_readback(Batch& b) {
 #endif
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(e);
+    for (Writeback& w : rb->ranges)   // (the copies are recorded: the buffer cache's buffers are not needed here now)
+        if (w.src) {
+            wgpuBufferRelease(w.src);
+            w.src = nullptr;
+            w.before.reset();
+        }
     WGPUBufferMapCallbackInfo mc{};
     mc.mode = WGPUCallbackMode_AllowSpontaneous;
     mc.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
@@ -1860,7 +1873,9 @@ void run_batch(Batch& b) {
 #endif
             st_submit_ns += hos_now_ns() - t2;
             submitted = true;
-            if (!b.writebacks.empty() && b.rw) start_readback(b);
+            bool all_in_place = true;   // (in-place readbacks need no stream_rw contents)
+            for (const Writeback& w : b.writebacks) all_in_place &= w.src != nullptr;
+            if (!b.writebacks.empty() && (b.rw || all_in_place)) start_readback(b);
         } else {
             static int dropped;
             if (dropped++ < 20) hos_log("rx: batch dropped: %s", error.c_str());
@@ -1876,7 +1891,11 @@ void run_batch(Batch& b) {
     for (WGPUBindGroup g : b.group_releases) wgpuBindGroupRelease(g);
     for (WGPUBuffer x : b.buffer_releases) wgpuBufferRelease(x);
     for (WGPURenderPipeline x : b.pipeline_releases) wgpuRenderPipelineRelease(x);
-    if (!b.writebacks.empty()) retire_inflight(b.writebacks);   // (no readback started)
+    if (!b.writebacks.empty()) {   // (no readback started)
+        retire_inflight(b.writebacks);
+        for (const Writeback& w : b.writebacks)
+            if (w.src) wgpuBufferRelease(w.src);
+    }
     if (RX_WEB_MT) {   // (copies: flush_batch)
         std::free(b.ro);
         std::free(b.rw);
@@ -2039,6 +2058,32 @@ void queue_upload(WGPUBuffer buffer, uint64_t offset, const void* data, uint64_t
 
 void writeback_after_batch(uint64_t rw_offset, uint64_t size, uint64_t gpu_va) {
     open_writebacks.push_back({rw_offset, size, gpu_va});
+}
+
+/* A dispatch's results that stay in the buffer cache (bound in place) come back to guest memory too, after the batch
+   (asynchronously, as the stream copies do: no wait). Without it only the GPU had them, and the CPU, or what was taken
+   from guest memory later, kept reading what was there before: in TOTK 1.4.3 effects (the Master Sword's glow, torch
+   flames, a shrine door's sign) were drawn a second time in the wrong place. RX_SYNC_DISPATCH_WRITES=1 fixed that by
+   waiting for the GPU and reading back at every frame's end, which held the open world at 30 fps.
+   RX_DISPATCH_READBACK=0: off (the old behaviour). */
+void writeback_in_place(WGPUBuffer buffer, uint64_t offset, uint64_t size, uint64_t gpu_va) {
+    static const bool on = !getenv("RX_DISPATCH_READBACK") || atoi(getenv("RX_DISPATCH_READBACK")) != 0;
+    if (!on || !buffer || !size || offset % 4) return;
+    for (const Writeback& w : open_writebacks)   // (the same range again in this batch: one readback, the latest data)
+        if (w.src == buffer && w.src_offset == offset && w.size >= size) return;
+    uint64_t avail = 0;
+    const uint8_t* host = hos_gpu_ptr(gpu_va, &avail);
+    if (!host) return;
+    const uint64_t n = (size + 3) & ~3ull;
+    auto before = std::make_shared<std::vector<uint8_t>>(n, 0);
+    std::memcpy(before->data(), host, std::min(n, avail));
+    wgpuBufferAddRef(buffer);
+    Writeback w{0, size, gpu_va};
+    w.src = buffer;
+    w.src_offset = offset;
+    w.before = std::move(before);
+    open_writebacks.push_back(std::move(w));
+    count("dispatch_readbacks");
 }
 
 void wait_submitted() {

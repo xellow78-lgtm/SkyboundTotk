@@ -189,6 +189,7 @@ void dispatch(const ComputeLaunch& l) {
         } else if (d.is_written) {
             written.push_back(ref);
             note_dispatch_write(va, size);
+            writeback_in_place(ref.buffer, ref.offset, size, va);   // (back to guest memory too, after the batch)
         }
         // RX_CS_WATCH=<GPU VA hex> (debugging): dispatches that write storage covering it are logged
         if (static const uint64_t watch = getenv("RX_CS_WATCH") ? strtoull(getenv("RX_CS_WATCH"), nullptr, 16) : 0;
@@ -423,6 +424,7 @@ void nvn_dispatch(NvnState& s, uint32_t x, uint32_t y, uint32_t z) {
         } else if (d.is_written) {
             written.push_back(ref);
             note_dispatch_write(va, size);
+            writeback_in_place(ref.buffer, ref.offset, size, va);   // (back to guest memory too, after the batch)
         }
         storage.push_back({b, ref});
         b += d.count;
