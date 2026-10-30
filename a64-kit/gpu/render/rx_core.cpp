@@ -2211,12 +2211,48 @@ void flush_batch() {
 }
 
 /// The window's present (the submit thread): the frame's image blitted into the surface texture.
+#if !RX_WEB && defined(_WIN32)
+extern "C" volatile LONG64 hos_fs_read_ns, hos_fs_read_bytes;   // hos/nn_fs.c
+#endif
+
+/// A present that came long after the one before (RX_STALL_MS, default 100): what the renderer did in between, from
+/// the render thread's running totals (spike: translations and pipelines made in place, texture decoding, waits for
+/// the submit thread), the pipelines made meanwhile (in place or by the compilers), and the game's file reads. When
+/// none of it adds up to the gap, the time went to the game's own code (or the GPU). Racy reads: a diagnostic.
+static void log_stall(int64_t gap) {
+    static const int64_t threshold = (getenv("RX_STALL_MS") ? atoll(getenv("RX_STALL_MS")) : 100) * 1000000LL;
+    struct Snap {
+        FrameSpike s;
+        size_t pipelines;
+        int64_t fs_ns, fs_bytes;
+    };
+    static Snap prev{};
+    Snap cur{spike, pipeline_count(), 0, 0};
+#if !RX_WEB && defined(_WIN32)
+    cur.fs_ns = hos_fs_read_ns;
+    cur.fs_bytes = hos_fs_read_bytes;
+#endif
+    if (threshold > 0 && gap >= threshold && prev.pipelines) {
+        static int logged;
+        if (logged++ < 200)
+            hos_log("rx: stall %.0f ms: in place: %lld translations %.1f ms, pipelines %.1f ms; %lld pipelines made; "
+                    "texture decode %.1f ms; waits for submits %.1f ms; %lld draws; file reads %.1f ms, %lld KB",
+                    gap / 1e6, (long long)(cur.s.translations - prev.s.translations),
+                    (cur.s.translate_ns - prev.s.translate_ns) / 1e6, (cur.s.pipeline_ns - prev.s.pipeline_ns) / 1e6,
+                    (long long)(cur.pipelines - prev.pipelines), (cur.s.decode_ns - prev.s.decode_ns) / 1e6,
+                    (cur.s.wait_ns - prev.s.wait_ns) / 1e6, (long long)(cur.s.draws - prev.s.draws),
+                    (cur.fs_ns - prev.fs_ns) / 1e6, (long long)((cur.fs_bytes - prev.fs_bytes) >> 10));
+    }
+    prev = cur;
+}
+
 void present_pacing() {
     static int64_t first, last, window_start;
     static std::vector<int64_t> gaps;
     const int64_t now = hos_now_ns();
     if (!first) first = window_start = now;
     if (last) gaps.push_back(now - last);
+    log_stall(last ? now - last : 0);
     last = now;
     if (now - window_start < 5000000000LL || gaps.empty()) return;
     const double avg = (double)(now - window_start) / (double)gaps.size();

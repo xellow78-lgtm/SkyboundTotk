@@ -12,6 +12,8 @@
 #include <windows.h>
 
 const char *hos_romfs_dir, *hos_user_dir;
+/* the time every thread spent in file reads, and their bytes (rx's stall lines: a hitch while the disk was busy) */
+volatile LONG64 hos_fs_read_ns, hos_fs_read_bytes;
 
 #define R_PATH_NOT_FOUND 0x202          /* fs::ResultPathNotFound */
 #define R_PATH_EXISTS 0x402             /* fs::ResultPathAlreadyExists */
@@ -232,6 +234,7 @@ static uint64_t read_at(Ctx *c, uint64_t id, int64_t off, uint64_t buf, uint64_t
         if (fs_trace()) hos_log("fs: read %s at %lld, %llu bytes", fh->path, (long long)off, (unsigned long long)size);
         hos_sleep_ns(delay_ns);
     }
+    const int64_t t_read = hos_now_ns();
     while (done < size) {
         OVERLAPPED ov = {0};
         int64_t o = off + (int64_t)done;
@@ -242,6 +245,8 @@ static uint64_t read_at(Ctx *c, uint64_t id, int64_t off, uint64_t buf, uint64_t
         done += got;
     }
     HOS_WRITTEN(GP(buf), (size_t)done);   /* (into guest memory: the GPU may read it) */
+    InterlockedAdd64(&hos_fs_read_ns, hos_now_ns() - t_read);
+    InterlockedAdd64(&hos_fs_read_bytes, (LONG64)done);
     return done;
 }
 
