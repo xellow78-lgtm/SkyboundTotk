@@ -5,7 +5,8 @@
    HOS_HEADLESS=1: no window (scripted runs; the renderer draws offscreen). Closing the window ends the run.
    HOS_WINDOW_NOACTIVATE=1: the window opens behind the one in front (test runs do not take the keyboard).
    Mouse: a click in the window captures the mouse (hidden, kept in the window) and its motion turns the camera
-   (nn_hid.c reads it as the right stick); Esc or leaving the window releases it. */
+   (nn_hid.c reads it as the right stick); Esc or leaving the window releases it. While captured, its buttons and
+   wheel are what the bindings say (input_bind.c). F1: the keyboard and mouse bindings window (input_bind_ui.c). */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "../gpu/render/rx.h"
+#include "input_bind.h"
+void hos_bind_ui_toggle(HWND game_window);   /* input_bind_ui.c */
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
 #endif
@@ -163,7 +166,7 @@ static void update_title(void) {
         snprintf(m, sizeof m, "  |  mouse camera, sensitivity %.2f (- / = change, Esc releases)", hos_mouse_sens);
         strncat(title, m, sizeof title - strlen(title) - 1);
     }
-    else if (renderer) strncat(title, "  |  click for mouse camera", sizeof title - strlen(title) - 1);
+    else if (renderer) strncat(title, "  |  click for mouse camera, F1 keys", sizeof title - strlen(title) - 1);
     if (renderer && t < present_notice_until) {
         strncat(title, "  |  ", sizeof title - strlen(title) - 1);
         strncat(title, rx_present_hotkey(0), sizeof title - strlen(title) - 1);
@@ -194,8 +197,20 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcA(w, msg, wp, lp);
     }
     case WM_LBUTTONDOWN:
-        if (renderer && !mouse_captured) mouse_capture(w, 1);
+        if (renderer && !mouse_captured && !hos_bind_ui_active) mouse_capture(w, 1);
         return 0;
+    case WM_MOUSEWHEEL: {   /* (bindable: WheelUp / WheelDown, a short press a notch) */
+        static int rest;
+        if (!mouse_captured) return 0;
+        rest += (short)HIWORD(wp);
+        const int notches = rest / WHEEL_DELTA;
+        rest -= notches * WHEEL_DELTA;
+        if (notches) hos_bind_wheel(notches);
+        return 0;
+    }
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_KEYMENU) return 0;   /* (Alt is bound to walk: no menu loop; Alt+F4 still closes) */
+        break;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
         if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
@@ -323,6 +338,11 @@ static DWORD WINAPI display_main(void *p) {
     SetTimer(hwnd, 1, renderer ? 250 : 33, NULL);
     MSG m;
     while (GetMessageA(&m, NULL, 0, 0) > 0) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_F1 && !(m.lParam & (1 << 30))) {   /* (either window) */
+            mouse_capture(hwnd, 0);
+            hos_bind_ui_toggle(hwnd);
+            continue;
+        }
         TranslateMessage(&m);
         DispatchMessageA(&m);
     }

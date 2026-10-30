@@ -842,7 +842,7 @@ def cmd_web(a):
 
 
 # hos files with no place in the browser (hos/web/ has their stand-ins)
-WEB_SKIP = {"hos_prof.c", "movie_mf.c", "display.c", "pad_sdl.c"}
+WEB_SKIP = {"hos_prof.c", "movie_mf.c", "display.c", "pad_sdl.c", "input_bind_ui.c"}
 
 
 def cmd_stubs(a):

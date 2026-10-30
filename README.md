@@ -75,7 +75,7 @@ Focus the game window before using the keys. The renderer briefly reports displa
 
 **Ultrawide:** F6 attempts to adjust the camera and HUD and fill a wider window. It is off by default. A wider-than-16:9 window is needed, but a user reported that F6 stretches the image instead of providing a correctly proportioned wider view. Camera hooks are present, but their behavior in that report has not been resolved or independently verified. F10 stretching alone is not true ultrawide.
 
-Keyboard and mouse controls are experimental. WASD moves, IJKL controls the camera, Space jumps, E is action, Shift or Q is run/cancel, F attacks, Z/R are L/R, C/V are ZL/ZR, Ctrl crouches, Enter is Plus, Tab is Minus and the arrow keys are the D-pad. Click the window to capture the mouse, Esc to release it, and use `-` / `=` to adjust sensitivity. XInput and SDL-supported controllers are also handled; buttons map by physical position.
+Keyboard and mouse controls are experimental. Press **F1** in the game to rebind any key or mouse button (and the wheel), set mouse sensitivity, invert Y and walk speed; the bindings are saved to `user/input.ini`. Defaults: WASD moves, IJKL controls the camera, Space jumps, E is action, Shift or Q is run/cancel, F or left click attacks, Z/R are L/R, C or right click is ZL, V is ZR, Ctrl crouches, middle click is the right-stick click, Alt walks, Enter is Plus, Tab is Minus and the arrow keys are the D-pad. Click the window to capture the mouse, Esc to release it, and use `-` / `=` to adjust sensitivity. The mouse turns the camera as the right stick would (by its speed). XInput and SDL-supported controllers are also handled; buttons map by physical position.
 
 ### Why WebGPU?
 

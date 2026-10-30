@@ -1,12 +1,14 @@
 /* nn::hid: one Pro Controller (FullKey style) on Npad No.1, from every XInput gamepad and the keyboard and mouse at
    once. Buttons map by position (the Xbox bottom face button is the Switch's bottom one, B).
 
-   Keyboard: WASD left stick, IJKL right stick (camera), Space X (jump), E A (action), Shift/Q B (run/cancel),
-   F Y (attack), R R, Z L, C ZL, V ZR, Ctrl left-stick click (crouch), Enter Plus, Tab Minus, arrows d-pad. Only
-   while the game's window is in front (the key state is global).
+   Keyboard and mouse buttons: the bindings in <user>/input.ini (input_bind.c; F1 in the game edits them). By
+   default WASD left stick, IJKL right stick (camera), Space X (jump), E A (action), Shift/Q B (run/cancel),
+   F / left click Y (attack), R R, Z L, C / right click ZL, V ZR, Ctrl left-stick click (crouch), middle click
+   right-stick click, Enter Plus, Tab Minus, arrows d-pad, Alt walk. Only while the game's window is in front (the
+   key state is global) and the bindings window is closed.
    Mouse (after a click in the window, display.c; Esc releases): its motion is the right stick, deflection by speed.
-   - and = change its sensitivity (x0.8 / x1.25, shown in the title bar, kept in <user>/mouse_sens.txt);
-   HOS_MOUSE_SENS=<x> sets it, HOS_MOUSE_INVERT_Y=1 flips up/down.
+   - and = change its sensitivity (x0.8 / x1.25, shown in the title bar, saved with the bindings) unless bound;
+   HOS_MOUSE_SENS=<x> sets it for the run, HOS_MOUSE_INVERT_Y=1 flips up/down.
 
    HOS_INPUT_SCRIPT (test runs): timed presses added to the input, "<seconds>:<button>[+<button>...][/<ms held>],..."
    with buttons A B X Y L R ZL ZR PLUS MINUS LS RS LEFT UP RIGHT DOWN and the stick directions LUP LDOWN LLEFT
@@ -21,6 +23,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <xinput.h>
+#include "input_bind.h"
 
 enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN };
 #define STATE_SIZE 0x28
@@ -42,50 +45,49 @@ int hos_mouse_take(int32_t *dx, int32_t *dy);   /* display.c */
 double hos_mouse_sens = 0;   /* (display.c shows it in the title) */
 extern const char *hos_user_dir;
 
-static void mouse_sens_save(void) {
-    char path[512];
-    snprintf(path, sizeof path, "%s/mouse_sens.txt", hos_user_dir ? hos_user_dir : "user");
-    FILE *f = fopen(path, "w");
-    if (f) { fprintf(f, "%.3f\n", hos_mouse_sens); fclose(f); }
+static int key_bound(const Bindings *b, int vk) {
+    for (int a = 0; a < ACT_COUNT; a++)
+        for (int s = 0; s < BIND_SLOTS; s++)
+            if (b->key[a][s] == vk) return 1;
+    return 0;
 }
 
+/* - / = (and the keypad's): the sensitivity x0.8 / x1.25, saved with the bindings; a key bound to an action is not */
 static void mouse_sens_keys(void) {
     static int prev_minus, prev_plus;
-    const int minus = key(VK_OEM_MINUS) || key(VK_SUBTRACT), plus = key(VK_OEM_PLUS) || key(VK_ADD);
-    if (minus && !prev_minus) { hos_mouse_sens *= 0.8; mouse_sens_save(); }
-    if (plus && !prev_plus) { hos_mouse_sens *= 1.25; mouse_sens_save(); }
-    if (hos_mouse_sens < 0.05) hos_mouse_sens = 0.05;
-    if (hos_mouse_sens > 20) hos_mouse_sens = 20;
+    Bindings b;
+    hos_bind_get(&b);
+    const int minus = (key(VK_OEM_MINUS) && !key_bound(&b, VK_OEM_MINUS)) || (key(VK_SUBTRACT) && !key_bound(&b, VK_SUBTRACT));
+    const int plus = (key(VK_OEM_PLUS) && !key_bound(&b, VK_OEM_PLUS)) || (key(VK_ADD) && !key_bound(&b, VK_ADD));
+    if ((minus && !prev_minus) || (plus && !prev_plus)) {
+        b.mouse_sens *= minus && !prev_minus ? 0.8 : 1.25;
+        if (b.mouse_sens < 0.05) b.mouse_sens = 0.05;
+        if (b.mouse_sens > 20) b.mouse_sens = 20;
+        hos_bind_set(&b);
+    }
     prev_minus = minus;
     prev_plus = plus;
 }
 
+static int mouse_held;   /* the mouse is captured (as of the last take): its buttons count */
 static int mouse_stick(int32_t *rx, int32_t *ry) {
     static int64_t last;
     static double vx, vy;
     static int captured;
-    static int invert = -1;
-    if (invert < 0) {
-        invert = getenv("HOS_MOUSE_INVERT_Y") != NULL;
-        hos_mouse_sens = 1.0;
-        char path[512];
-        snprintf(path, sizeof path, "%s/mouse_sens.txt", hos_user_dir ? hos_user_dir : "user");
-        FILE *f = fopen(path, "r");
-        if (f) {
-            double v;
-            if (fscanf(f, "%lf", &v) == 1 && v > 0) hos_mouse_sens = v;
-            fclose(f);
-        }
-        const char *e = getenv("HOS_MOUSE_SENS");
-        if (e && atof(e) > 0) hos_mouse_sens = atof(e);
-    }
     mouse_sens_keys();
+    Bindings b;
+    hos_bind_get(&b);
+    const char *e = getenv("HOS_MOUSE_SENS");
+    hos_mouse_sens = e && atof(e) > 0 ? atof(e) : b.mouse_sens;
+    const int invert = b.mouse_invert_y || getenv("HOS_MOUSE_INVERT_Y");
     const double scale = hos_mouse_sens / 1000.0;
     const int64_t now = hos_now_ns();
     if (!last) last = now;
     if (now - last >= 8000000) {
         int32_t dx, dy;
         captured = hos_mouse_take(&dx, &dy);
+        mouse_held = captured;
+        if (!b.mouse_camera) dx = dy = 0;
         double dt = (now - last) / 1e9;
         if (dt > 0.1) dt = 0.1;
         last = now;
@@ -336,16 +338,11 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
        used to follow the player's pad (and pressed things in its own menus). */
     if ((npresses > 0 && (hos_now_ns() - script_t0) / 1000000 < script_end_ms + 5000) || !game_in_front()) return;
     pads_read(buttons, stick);
-    struct { int vk; int b; } kmap[] = {
-        {VK_SPACE, B_X}, {'E', B_A}, {VK_SHIFT, B_B}, {'Q', B_B}, {'F', B_Y}, {'R', B_R}, {'Z', B_L}, {'C', B_ZL},
-        {'V', B_ZR}, {VK_CONTROL, B_LS}, {VK_RETURN, B_PLUS}, {VK_TAB, B_MINUS}, {VK_LEFT, B_LEFT}, {VK_UP, B_UP},
-        {VK_RIGHT, B_RIGHT}, {VK_DOWN, B_DOWN}};
-    for (unsigned i = 0; i < sizeof kmap / sizeof *kmap; i++)
-        if (key(kmap[i].vk)) *buttons |= 1ULL << kmap[i].b;
+    if (hos_bind_ui_active) return;   /* (the bindings window has the keyboard and mouse) */
     int32_t mouse[4] = {0};
     if (mouse_stick(&mouse[2], &mouse[3])) stick_max(stick, mouse);
-    const int32_t keys[4] = {(key('D') - key('A')) * 32767, (key('W') - key('S')) * 32767,
-                             (key('L') - key('J')) * 32767, (key('I') - key('K')) * 32767};
+    int32_t keys[4] = {0};
+    hos_bind_poll(buttons, keys, mouse_held);
     stick_max(stick, keys);
 }
 
