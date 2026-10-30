@@ -303,10 +303,20 @@ void load() {
         if (!getenv("RX_PIPELINE_CACHE_ALL") && !getenv("RX_PIPELINE_CACHE_SESSIONS")) {
             MEMORYSTATUSEX ms{};
             ms.dwLength = sizeof ms;
+            // (and Windows' commit to spare for them, with 12 GB left for the rest of the game: RAM alone was not
+            // enough: a 32 GB machine whose page file could not grow ran out of commit at a modded start, in wgpu)
+            const uint64_t need = (uint64_t)list.size() * (400ull << 10) + (12ull << 30);
             if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= (24ull << 30)) {
-                all = true;
-                hos_log("rx: pipeline cache: %llu GB of memory: all cached pipelines are made, not only recent ones",
-                        (unsigned long long)(ms.ullTotalPhys >> 30));
+                if (ms.ullAvailPageFile >= need) {
+                    all = true;
+                    hos_log("rx: pipeline cache: %llu GB of memory: all cached pipelines are made, not only recent ones",
+                            (unsigned long long)(ms.ullTotalPhys >> 30));
+                } else {
+                    hos_log("rx: pipeline cache: only recent pipelines: Windows has %llu MB of commit free, all %zu would "
+                            "want %llu MB (a bigger page file: RX_PIPELINE_CACHE_ALL=1 makes them all anyway)",
+                            (unsigned long long)(ms.ullAvailPageFile >> 20), list.size(),
+                            (unsigned long long)(need >> 20));
+                }
             }
         }
         size_t stale = 0;

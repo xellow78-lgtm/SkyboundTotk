@@ -1255,6 +1255,17 @@ void memory_report() {
             ntex, (unsigned long long)(rt_bytes >> 20), images.size(), (unsigned long long)(spare_bytes >> 20),
             spare_images.size(), (unsigned long long)(copy_bytes >> 20), buffer_segments(), pipeline_count(), ntext,
             (unsigned long long)(text_bytes >> 20));
+#ifdef _WIN32
+    // Windows' commit (RAM + page file) for every program: when it runs out, allocations fail anywhere, in any
+    // thread (a crash in a flurry rush, and one in wgpu at a modded start)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms))
+        hos_log("mem: Windows commit %llu of %llu MB used (%llu MB free), RAM %llu of %llu MB free",
+                (unsigned long long)((ms.ullTotalPageFile - ms.ullAvailPageFile) >> 20),
+                (unsigned long long)(ms.ullTotalPageFile >> 20), (unsigned long long)(ms.ullAvailPageFile >> 20),
+                (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20));
+#endif
     hos_memory_map_log();
 }
 
