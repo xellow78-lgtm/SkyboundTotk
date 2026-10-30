@@ -34,8 +34,15 @@ static int renderer;   /* the renderer presents into the window */
 
 /* mouse capture: raw motion accumulated here, taken by nn_hid.c */
 static volatile LONG mouse_dx, mouse_dy;
+static volatile LONG cam_dx, cam_dy;   /* the same motion for the native mouse camera (totk_mouse_cam.c) */
 static volatile LONG mouse_captured;
 static int cursor_hidden;
+
+int hos_mouse_take_cam(int32_t *dx, int32_t *dy) {
+    *dx = InterlockedExchange(&cam_dx, 0);
+    *dy = InterlockedExchange(&cam_dy, 0);
+    return mouse_captured;
+}
 
 int hos_mouse_take(int32_t *dx, int32_t *dy) {
     *dx = InterlockedExchange(&mouse_dx, 0);
@@ -89,6 +96,8 @@ static void mouse_capture(HWND w, int on) {
     mouse_captured = on;
     InterlockedExchange(&mouse_dx, 0);
     InterlockedExchange(&mouse_dy, 0);
+    InterlockedExchange(&cam_dx, 0);
+    InterlockedExchange(&cam_dy, 0);
     if (on) {
         RECT rc;
         GetClientRect(w, &rc);
@@ -193,6 +202,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
             InterlockedExchangeAdd(&mouse_dx, ri.data.mouse.lLastX);
             InterlockedExchangeAdd(&mouse_dy, ri.data.mouse.lLastY);
+            InterlockedExchangeAdd(&cam_dx, ri.data.mouse.lLastX);
+            InterlockedExchangeAdd(&cam_dy, ri.data.mouse.lLastY);
         }
         return DefWindowProcA(w, msg, wp, lp);
     }

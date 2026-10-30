@@ -87,7 +87,8 @@ static int mouse_stick(int32_t *rx, int32_t *ry) {
         int32_t dx, dy;
         captured = hos_mouse_take(&dx, &dy);
         mouse_held = captured;
-        if (!b.mouse_camera) dx = dy = 0;
+        int hos_mouse_cam_native(void);   /* totk_mouse_cam.c: the camera takes the mouse itself */
+        if (!b.mouse_camera || hos_mouse_cam_native()) dx = dy = 0;
         double dt = (now - last) / 1e9;
         if (dt > 0.1) dt = 0.1;
         last = now;

@@ -20,6 +20,9 @@ EMSCRIPTEN_KEEPALIVE void web_resize(int width, int height) { rx_resize(width, h
 const char *rx_present_hotkey(int key);
 EMSCRIPTEN_KEEPALIVE void web_present_hotkey(int key) { hos_log("present: %s", rx_present_hotkey(key)); }
 
+/* (the native mouse camera, totk_mouse_cam.c: not on the page yet; the mouse moves the right stick there) */
+int hos_mouse_take_cam(int32_t *dx, int32_t *dy) { *dx = *dy = 0; return 0; }
+
 int hos_mouse_take(int32_t *dx, int32_t *dy) {
     *dx = __atomic_exchange_n(&web_mouse[0], 0, __ATOMIC_SEQ_CST);
     *dy = __atomic_exchange_n(&web_mouse[1], 0, __ATOMIC_SEQ_CST);

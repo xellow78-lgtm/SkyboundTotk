@@ -224,6 +224,9 @@ static struct {
 } nw = { .format = 1, .interval = 1, .front = -1 };
 static SRWLOCK nw_lock = SRWLOCK_INIT;
 volatile LONG64 hos_present_count;
+/* The presentation interval the game steps for (1: 1/60 s a frame, 2: 1/30 s, ...): totk_mouse_cam.c turns the
+   mouse's motion in a frame into that frame's camera input. */
+int hos_vi_interval(void) { return nw.interval > 0 ? nw.interval : 1; }
 volatile int hos_present_slot = -1;     /* slot of the frame on screen */
 /* The window buffer of a slot, for the display (hos/display.c): its nvgr handle describes the surface. */
 uint64_t hos_window_buffer_handle(int slot) {
