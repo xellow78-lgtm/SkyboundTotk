@@ -262,9 +262,9 @@ static int realtime_on(void) {
     if (on < 0) {
         const char *e = getenv("HOS_REALTIME");
         on = !(e && *e == '0');
-#if GAME_VERSION != 100
-        /* (the two step splices below are v1.0.0's: on another build the game keeps its own interval step, so the
-           pacing must not assume ours. v1.4.3: found but changed, see FINDINGS / the port notes) */
+#if GAME_VERSION != 100 && GAME_VERSION != 143
+        /* (the step hooks below are v1.0.0's and v1.4.3's: on another build the game keeps its own interval step, so
+           the pacing must not assume ours) */
         if (on && e) hos_log("vi: HOS_REALTIME: not for this game build yet (no step hooks): the game's own step");
         on = 0;
 #endif
@@ -335,12 +335,30 @@ SPLICE_AFTER(0x088f689c, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") {
     if (!realtime_on()) return;
     G32(c->x[8]) = (uint32_t)frame_step();
 }
+/* v1.4.3: the step is f_083e67f0(state, s0 = the interval as a float): it stores ratio = s0 * 0.5 at +0x10,
+   1 / ratio at +0x14, s0 / 60 at +0x18 and round(30 / ratio) at +0x1c, so the real frame time goes in as the
+   interval it stands for (seconds * 60) and the game derives the rest itself. The global ratio is stored in
+   f_082daa20 as (60 / the controller's fps, framework + 0x250) * 0.5, after the frame-rate controller: replaced as
+   v1.0.0's is. */
+#elif GAME_VERSION == 143
+ENTRY_HOOK(0x083e67f0) {
+    if (!realtime_on()) return 0;
+    const uint64_t v = frame_step();
+    float seconds, interval;
+    const uint32_t hi = (uint32_t)(v >> 32);
+    memcpy(&seconds, &hi, 4);
+    interval = seconds * 60.0f;
+    uint32_t bits;
+    memcpy(&bits, &interval, 4);
+    c->vreg[0][0] = bits;
+    c->vreg[0][1] = 0;
+    return 0;   /* (the game's own step, with the real interval) */
+}
+SPLICE_AFTER(0x082daa20, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") {
+    if (!realtime_on()) return;
+    G32(c->x[8]) = (uint32_t)frame_step();
+}
 #endif
-/* v1.4.3 (not hooked yet): the step is f_083e67f0, which now takes the interval as a float in s0 and stores ratio =
-   s0 * 0.5 at +0x10, 1 / ratio at +0x14, s0 / 60 at +0x18 and an integer at +0x1c; the global ratio is written in
-   f_082daa20 as (60 / interval) * 0.5, after the frame-rate controller, now at framework + 0x200 with its current
-   interval at +0x50. The controller checks below (fw + 0x248, current at +0x14) do not match there, so they leave
-   the interval as the game asks. */
 
 /* TOTK's frame-rate controller, per build: its place in the game framework and its current interval (min and max at
    +0 / +4 in both). v1.4.3 (f_082db174, as v1.0.0's f_088f6bec: clamp(measured + 1, min, max)) moved the current
