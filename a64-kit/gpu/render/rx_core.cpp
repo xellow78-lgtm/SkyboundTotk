@@ -14,6 +14,7 @@
 #include <mutex>
 #include <thread>
 #include <cstdlib>
+#include <cstring>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -2705,6 +2706,26 @@ Image* find_render_target(uint64_t gpu_va, uint32_t width, uint32_t height, Pixe
                 Image* raw = back.get();
                 images[guest] = std::move(back);
                 count("rt_spare_reused");
+                // A depth surface back at memory another surface used in between: on the console it holds what that
+                // one wrote (a reinterpreted mess), here what it held itself the last time, so values a pass relies
+                // on not finding can be there. TOTK's lighting classifies pixels by depth (a full-screen pass stamps
+                // each pixel's material class as its depth, then each class's lighting draws with depth EQUAL to its
+                // class): the sky, never stamped, kept an old class 0 at 1600x896 and the trees' lighting tiles lit
+                // it, a halo along every outline against the sky. Cleared to RX_ALIAS_DEPTH_CLEAR (0, which no class
+                // has; "off": as it was).
+                if (is_depth_format(raw->format)) {
+                    static const char* e = getenv("RX_ALIAS_DEPTH_CLEAR");
+                    static const bool off = e && !std::strcmp(e, "off");
+                    static const float value = e && !off ? (float)std::atof(e) : 0.0f;
+                    if (!off) {
+                        static int told;
+                        if (!told++)
+                            hos_log("rx: depth surfaces taken back after another surface used their memory are cleared to "
+                                    "%g (RX_ALIAS_DEPTH_CLEAR=off: as they were)", value);
+                        nvn_clear_depth_stencil(raw, true, value, false, 0, 0, nullptr);
+                        count("rt_alias_depth_cleared");
+                    }
+                }
                 return raw;
             }
         }

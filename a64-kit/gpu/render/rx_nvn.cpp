@@ -894,9 +894,20 @@ void cond_recheck_present() {
             break;
         }
         case NOP_CLEAR_DS: {
-            if (!s.render_enabled) break;
+            if (!s.render_enabled) {
+                if (frame_dump_active()) dump_draw("nvn clear z skipped (render off)");
+                break;
+            }
             const auto c = payload<nvn_p_clear_ds>(a, avail);
             const Attachments at = nvn_attachments(s);
+            if (frame_dump_active()) {
+                char b[160];
+                std::snprintf(b, sizeof b, "nvn clear z %llx %ux%u to depth %g (mask %d) stencil %d (mask %x)",
+                              at.depth ? (unsigned long long)at.depth->guest : 0ull, at.depth ? at.depth->width : 0,
+                              at.depth ? at.depth->height : 0, c.depth, (int)(c.depth_mask != 0), (int)c.stencil,
+                              (unsigned)c.stencil_mask);
+                dump_draw(b);
+            }
             nvn_clear_depth_stencil(at.depth, c.depth_mask != 0, c.depth, c.stencil_mask != 0, (uint32_t)c.stencil,
                                     (uint32_t)c.stencil_mask, s.scissor);
             break;
