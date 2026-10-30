@@ -170,8 +170,10 @@ static void load(Bindings *b) {
     char line[512];
     int n = 0;
     while (fgets(line, sizeof line, f)) {
+        char *hash = strchr(line, '#');   /* (a comment, also after a value: save() writes one on each line) */
+        if (hash) *hash = 0;
         char *s = trim(line), *eq = strchr(s, '=');
-        if (!*s || *s == '#' || *s == ';' || !eq) continue;
+        if (!*s || *s == ';' || !eq) continue;
         *eq = 0;
         char *k = trim(s), *v = trim(eq + 1);
         if (!_stricmp(k, "mouse_camera")) { b->mouse_camera = atoi(v) != 0; continue; }
