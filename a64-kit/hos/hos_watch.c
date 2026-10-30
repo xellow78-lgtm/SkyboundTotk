@@ -25,6 +25,11 @@ typedef struct { DWORD64 rip; int slot; volatile LONG hits, reported; } Site;
 static Site sites[256];
 static volatile LONG nsites, total_hits, new_hits;
 
+/* The registers every thread should have now: also put back into the context of each hit (handler), since a
+   thread stopped inside the handler while apply_all set its registers would otherwise get the old ones back from the
+   exception's context when it continues (the second run: a breakpoint added while the main thread kept hitting the
+   first one never fired on it). */
+static volatile DWORD64 want_dr[4], want_dr7;
 static void apply_all(void) {
     HANDLE th[256];
     const char *names[256];
@@ -40,6 +45,8 @@ static void apply_all(void) {
         dr7 |= (DWORD64)lenbits << (18 + i * 4);
     }
     ReleaseSRWLockShared(&lock);
+    for (int i = 0; i < 4; i++) want_dr[i] = dr[i];
+    want_dr7 = dr7;
     int done = 0;
     for (int i = 0; i < n; i++) {
         if (GetThreadId(th[i]) == GetCurrentThreadId()) continue;
@@ -87,6 +94,8 @@ static LONG CALLBACK handler(EXCEPTION_POINTERS *e) {
     const DWORD64 hit = c->Dr6 & 0xF;
     if (!hit) return EXCEPTION_CONTINUE_SEARCH;
     c->Dr6 = 0;
+    c->Dr0 = want_dr[0], c->Dr1 = want_dr[1], c->Dr2 = want_dr[2], c->Dr3 = want_dr[3];
+    c->Dr7 = want_dr7;
     int s = 0;
     while (s < 3 && !(hit >> s & 1)) s++;
     const DWORD64 rip = c->Rip;
