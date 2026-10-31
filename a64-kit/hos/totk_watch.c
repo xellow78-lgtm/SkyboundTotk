@@ -15,7 +15,8 @@
      +0x184 (1.78): whatever reads them while playing is the camera's own stick handling, the place to give it the
      mouse. Watched now: those two (one breakpoint over both), the main controller's right stick, and the first output
      of f_0a005070 and f_0a616bf4.
-   HOS_WATCH_STICK=npad watches the Npad controller itself. */
+   HOS_WATCH_STICK=npad watches the Npad controller itself; HOS_WATCH_STICK=cam the camera input's raw stick and
+   result (totk_mouse_cam.c). */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +29,7 @@ static int watch_mode(void) {   /* 0 off, 1 main controller and nodes, 2 the Npa
     static int m = -1;
     if (m < 0) {
         const char *e = getenv("HOS_WATCH_STICK");
-        m = !e || !*e || *e == '0' ? 0 : !strcmp(e, "npad") ? 2 : 1;
+        m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : 1;   /* (cam: totk_mouse_cam.c) */
     }
     return m;
 }

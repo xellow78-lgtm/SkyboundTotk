@@ -77,6 +77,19 @@ ENTRY_HOOK(0x08874c1c) {
     f_08874c1c(c);   /* (the game's own input first: the stick and keys keep working alongside the mouse) */
     inside = 0;
     if (swap) setf(in, saved[0]), setf(in + 4, saved[1]);
+    {   /* HOS_WATCH_STICK=cam (debugging): who else reads the camera's raw stick and what it made of it (hos_watch.c):
+           the cameras that turn by the stick themselves (Ultrahand holding something) */
+        static int armed;
+        const char *w = getenv("HOS_WATCH_STICK");
+        if (!armed && w && !strcmp(w, "cam")) {
+            armed = 1;
+            void hos_watch_arm(uint64_t guest, int len, const char *why);
+            hos_log("watch: the camera's raw stick at %#llx, its input state at %#llx", (unsigned long long)in,
+                    (unsigned long long)state);
+            hos_watch_arm(in, 8, "camera raw right stick");
+            hos_watch_arm(state + 0x420, 8, "camera input (processed stick)");
+        }
+    }
     const int64_t now = hos_now_ns(), before = native_at;
     /* (flag bit 0: the input is off; state+0x148 bit 1: a set input instead of the stick's. The mouse is added only
        when neither: otherwise it goes on moving the right stick (nn_hid.c), which is what Ultrahand's and Recall's
