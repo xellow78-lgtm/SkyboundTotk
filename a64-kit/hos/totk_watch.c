@@ -16,7 +16,8 @@
      mouse. Watched now: those two (one breakpoint over both), the main controller's right stick, and the first output
      of f_0a005070 and f_0a616bf4.
    HOS_WATCH_STICK=npad watches the Npad controller itself; HOS_WATCH_STICK=cam the camera input's raw stick and
-   result (totk_mouse_cam.c); HOS_WATCH_STICK=nodes the two other stick nodes' outputs, armed when they first run; HOS_WATCH_STICK=getctl who asks for a controller, by caller. */
+   result (totk_mouse_cam.c); HOS_WATCH_STICK=nodes the two other stick nodes' outputs, armed when they first run; HOS_WATCH_STICK=getctl who asks for a controller, by caller; HOS_WATCH_STICK=ctl who reads the game
+   controller's sticks. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +33,7 @@ static int watch_mode(void) {   /* 0 off, 1 main controller and nodes, 2 the Npa
     if (m < 0) {
         const char *e = getenv("HOS_WATCH_STICK");
         m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : !strcmp(e, "nodes") ? 3
-            : !strcmp(e, "getctl") ? 4 : 1;
+            : !strcmp(e, "getctl") ? 4 : !strcmp(e, "ctl") ? 5 : 1;
         /* (cam: totk_mouse_cam.c; nodes: the two stick nodes' outputs as soon as they run, nothing else) */
     }
     return m;
@@ -184,5 +185,16 @@ ENTRY_HOOK(0x0837ccc0) {
     if (!InterlockedExchange(&started, 1)) CreateThread(NULL, 0, getctl_summary, NULL, 0, NULL);
     census(getctl, &ngetctl, c->x[30], "get-controller", c->x[1]);
     return 0;
+}
+/* HOS_WATCH_STICK=ctl: the game controller f_0900d030 (the camera input's stick node) gets with get-controller: its
+   sticks at +288 / +296, which f_0900d030 copies into the camera input's raw stick. Who else reads them (the holding
+   camera's way to the stick: neither the camera input nor the other stick nodes run while Ultrahand holds). */
+SPLICE_AFTER(0x0900d030, "c->x[30] = 0x900d07cULL; f_0837ccc0(c);") {
+    static int armed;
+    if (watch_mode() != 5 || armed || !c->x[0]) return;
+    armed = 1;
+    hos_log("watch: the camera stick node's game controller at %#llx", (unsigned long long)c->x[0]);
+    watch(c->x[0] + 288, "game controller +288 (a stick)");
+    watch(c->x[0] + 296, "game controller +296 (a stick)");
 }
 #endif
