@@ -33,7 +33,7 @@ static int watch_mode(void) {   /* 0 off, 1 main controller and nodes, 2 the Npa
     if (m < 0) {
         const char *e = getenv("HOS_WATCH_STICK");
         m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : !strcmp(e, "nodes") ? 3
-            : !strcmp(e, "getctl") ? 4 : !strcmp(e, "ctl") ? 5 : 1;
+            : !strcmp(e, "getctl") ? 4 : !strcmp(e, "ctl") ? 5 : !strcmp(e, "rs") ? 6 : 1;
         /* (cam: totk_mouse_cam.c; nodes: the two stick nodes' outputs as soon as they run, nothing else) */
     }
     return m;
@@ -218,5 +218,37 @@ SPLICE_AFTER(0x0900d030, "c->x[30] = 0x900d07cULL; f_0837ccc0(c);") {
     at = c->x[0];
     watch(c->x[0] + 288, "game controller +288 (a stick)");
     watch(c->x[0] + 296, "game controller +296 (a stick)");
+}
+/* HOS_WATCH_STICK=rs: f_08f24ab0, the stick node that reads the game controller's right stick (+296) and publishes
+   it as AI properties: the right stick as a vector (*(this+216)), its length (*(this+152)) and its angle
+   (*(this+136)). The holding camera's logic reads one of them (nothing else reads the controller's right stick). */
+ENTRY_HOOK(0x08f24ab0) {
+    if (watch_mode() != 6) return 0;
+    static uint64_t at[3];
+    static const int offs[3] = {216, 152, 136};
+    static const char *names[3] = {"stick node: right stick vector", "stick node: right stick length",
+                                   "stick node: right stick angle"};
+    for (int i = 0; i < 3; i++) {
+        const uint64_t p = G64(c->x[0] + offs[i]);
+        if (!p || p == at[i]) continue;
+        if (!at[i]) {
+            hos_log("watch: %s property at %#llx (node %#llx)", names[i], (unsigned long long)p, (unsigned long long)c->x[0]);
+            watch(p, names[i]);
+        } else {
+#ifndef __EMSCRIPTEN__
+            void hos_watch_move(const char *why, uint64_t guest);
+            hos_watch_move(names[i], p);
+#endif
+        }
+        at[i] = p;
+    }
+    static long calls;
+    if (++calls % 1000 == 0) {   /* (onto new threads too) */
+#ifndef __EMSCRIPTEN__
+        void hos_watch_move(const char *why, uint64_t guest);
+        if (at[0]) hos_watch_move(names[0], at[0]);
+#endif
+    }
+    return 0;
 }
 #endif
