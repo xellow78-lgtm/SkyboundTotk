@@ -190,10 +190,30 @@ ENTRY_HOOK(0x0837ccc0) {
    sticks at +288 / +296, which f_0900d030 copies into the camera input's raw stick. Who else reads them (the holding
    camera's way to the stick: neither the camera input nor the other stick nodes run while Ultrahand holds). */
 SPLICE_AFTER(0x0900d030, "c->x[30] = 0x900d07cULL; f_0837ccc0(c);") {
-    static int armed;
-    if (watch_mode() != 5 || armed || !c->x[0]) return;
-    armed = 1;
+    static uint64_t at;   /* (made again on loading a save: the breakpoints follow it) */
+    static long calls;
+    if (watch_mode() != 5 || !c->x[0]) return;
+    /* (and every 1000 calls they are put on the threads again: a breakpoint only reaches threads that existed when
+       it was set, and loading a save may make the workers again) */
+    if (c->x[0] == at && ++calls % 1000) return;
+    if (c->x[0] == at) {
+#ifndef __EMSCRIPTEN__
+        void hos_watch_move(const char *why, uint64_t guest);
+        hos_watch_move("game controller +288 (a stick)", at + 288);
+#endif
+        return;
+    }
     hos_log("watch: the camera stick node's game controller at %#llx", (unsigned long long)c->x[0]);
+#ifndef __EMSCRIPTEN__
+    void hos_watch_move(const char *why, uint64_t guest);
+    if (at) {
+        hos_watch_move("game controller +288 (a stick)", c->x[0] + 288);
+        hos_watch_move("game controller +296 (a stick)", c->x[0] + 296);
+        at = c->x[0];
+        return;
+    }
+#endif
+    at = c->x[0];
     watch(c->x[0] + 288, "game controller +288 (a stick)");
     watch(c->x[0] + 296, "game controller +296 (a stick)");
 }

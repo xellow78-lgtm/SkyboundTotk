@@ -195,6 +195,24 @@ static DWORD WINAPI env_main(void *p) {
 }
 
 /* (called at start, hos_main.c) */
+/* A watched address moved (the object it is in was made again, e.g. on loading a save): the breakpoint follows */
+void hos_watch_move(const char *why, uint64_t guest) {
+    AcquireSRWLockExclusive(&lock);
+    int found = 0;
+    for (int i = 0; i < nslots && i < 4; i++)
+        if (!strcmp(slot[i].why, why)) {
+            slot[i].guest = guest & ~(uint64_t)(slot[i].len - 1);
+            found = 1;
+        }
+    ReleaseSRWLockExclusive(&lock);
+    if (!found) return;
+    static uint64_t last;
+    if (guest != last) hos_log("watch: %s moved to guest %#llx", why, (unsigned long long)guest);
+    last = guest;
+    HANDLE h = CreateThread(NULL, 0, arm_main, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+
 void hos_watch_start(void) {
     if (!getenv("HOS_WATCH")) return;
     HANDLE h = CreateThread(NULL, 0, env_main, NULL, 0, NULL);
