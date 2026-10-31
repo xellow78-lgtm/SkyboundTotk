@@ -251,8 +251,27 @@ ENTRY_HOOK(0x08479c20) {
             hos_log("mouse cam: stick boost on (x%.2f, curve exponent %.2f, dead zone %.3f; the game's %.3f)", scale,
                     expo, dz, game_dz);
         }
-        float bx = boost_x * scale, by = boost_y * scale;
-        const float m = sqrtf(bx * bx + by * by);
+        /* Each frame's mouse turn once (a manager update with no new frame of mouse gets none: the same one counted
+           twice was one of the jumps), and at most HOS_STICK_BOOST_CAP (default 1, a full tilt; 0: no cap) of it a
+           frame: past a full tilt the holding camera seems to speed up on its own (a quick flick spun it around
+           once or twice), so the rest waits for the next frames instead of being lost: the camera ends up as far
+           as the mouse went, at worst a full tilt's speed. */
+        static float cap = -1, carry_x, carry_y;
+        static int64_t applied = -1;
+        if (cap < 0) cap = getenv("HOS_STICK_BOOST_CAP") ? (float)atof(getenv("HOS_STICK_BOOST_CAP")) : 1.0f;
+        float bx = carry_x, by = carry_y;
+        if (boost_frame != applied) {
+            applied = boost_frame;
+            bx += boost_x * scale, by += boost_y * scale;
+        }
+        carry_x = carry_y = 0;
+        float m = sqrtf(bx * bx + by * by);
+        if (cap > 0 && m > cap) {
+            const float keep = cap / m;
+            carry_x = bx * (1 - keep), carry_y = by * (1 - keep);
+            bx *= keep, by *= keep, m = cap;
+            if (fabsf(carry_x) > 8 * cap || fabsf(carry_y) > 8 * cap) carry_x = carry_y = 0;   /* (a backlog past ~8 frames: dropped) */
+        }
         if (m > 0) {
             const float out = dz + (1 - dz) * powf(m, 1 / expo);
             bx *= out / m, by *= out / m;
