@@ -150,4 +150,28 @@ ENTRY_HOOK(0x08874c1c) {
     }
     return 1;
 }
+/* HOS_MOUSE_CAM_LOG (debugging): f_0a3d2d40, the other reader of the camera input's turn (state+0x420, found with
+   HOS_WATCH_STICK=cam: it runs while Ultrahand holds something). What it read and what it made of it, per frame:
+   this+472 / +476 are what it accumulates from the turn (times a speed and the step, clamped). */
+void f_0a3d2d40(Ctx *);
+static _Thread_local int inside_hold;
+ENTRY_HOOK(0x0a3d2d40) {
+    static int logs = -1;
+    if (logs < 0) logs = getenv("HOS_MOUSE_CAM_LOG") ? atoi(getenv("HOS_MOUSE_CAM_LOG")) : 0;
+    if (inside_hold || logs <= 0) return 0;
+    const uint64_t self = c->x[0], st = G64(self + 32), step = c->x[1];
+    const float in_x = getf(st + 0x420), in_y = getf(st + 0x424);
+    const float a0 = getf(self + 472), b0 = getf(self + 476);
+    inside_hold = 1;
+    f_0a3d2d40(c);
+    inside_hold = 0;
+    const float a1 = getf(self + 472), b1 = getf(self + 476);
+    if ((in_x != 0 || in_y != 0 || a0 != a1 || b0 != b1) && logs > 0) {
+        logs--;
+        hos_log("hold cam: turn %.3f %.3f (state %#llx +348 %#x) -> +472/476 %.3f %.3f -> %.3f %.3f, +480 %d, step %.4f",
+                in_x, in_y, (unsigned long long)st, G32(st + 348), a0, b0, a1, b1, *(uint8_t *)GP(self + 480),
+                getf(step + 8));
+    }
+    return 1;
+}
 #endif
