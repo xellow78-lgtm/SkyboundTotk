@@ -3081,6 +3081,9 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
                         (unsigned long long)raw_va, raw_size, d.cbuf_index, d.cbuf_offset);
         size = std::clamp<uint64_t>((size + 3) & ~3ull, 16, 16ull << 20);
         const bool writable = d.is_written && (stage == 1 || dev.vertex_storage_writes);
+        if (writable && stage == 0)
+            log_limited("vs_store", 8, "rx: a vertex program stores to %llx+%x (frame %lld)", (unsigned long long)raw_va,
+                        raw_size, (long long)frame_number);
         if (frame_dump_active()) {
             char line[160];
             std::snprintf(line, sizeof line, "  %s ssbo %llx+%x%s gpu-written %d", stage ? "fs" : "vs",

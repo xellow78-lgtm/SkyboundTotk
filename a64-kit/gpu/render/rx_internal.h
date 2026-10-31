@@ -369,7 +369,8 @@ struct Device {
     WGPUQueue queue = nullptr;
     WGPULimits limits{};
     bool bc = false, float32_filterable = false, depth32_stencil8 = false, norm16 = false, depth_clip_control = false,
-         early_depth_test = false, timestamps = false, vertex_storage_writes = false;
+         early_depth_test = false, timestamps = false, vertex_storage_writes = false, float32_blendable = false,
+         norm16_renderable = false, snorm8_renderable = false;
     std::string description;
 };
 extern Device dev;

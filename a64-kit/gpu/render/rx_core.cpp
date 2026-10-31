@@ -440,6 +440,11 @@ bool init_device(HWND hwnd) {
     dev.vertex_storage_writes = !env_flag("RX_NO_VERTEX_STORES") && wgpuAdapterHasFeature(dev.adapter, vertex_stores);
     if (dev.vertex_storage_writes) have.push_back(vertex_stores);
     set_vertex_storage_writes(dev.vertex_storage_writes);
+    // (the device's own format features: lets wgpu draw into 16-bit norm and 8-bit snorm targets where the driver
+    // can, which plain WebGPU never allows. RX_NO_ADAPTER_FORMATS=1: off)
+    const auto adapter_formats = (WGPUFeatureName)WGPUNativeFeature_TextureAdapterSpecificFormatFeatures;
+    if (!env_flag("RX_NO_ADAPTER_FORMATS") && wgpuAdapterHasFeature(dev.adapter, adapter_formats))
+        have.push_back(adapter_formats);
     hos_log("rx: vertex programs' storage writes: %s", dev.vertex_storage_writes ? "kept" : "left out (not available)");
 #endif
     dev.norm16 = wgpuAdapterHasFeature(dev.adapter, norm16) ||
@@ -448,6 +453,7 @@ bool init_device(HWND hwnd) {
     dev.bc = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_TextureCompressionBC);
     dev.depth_clip_control = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_DepthClipControl);
     dev.float32_filterable = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_Float32Filterable);
+    dev.float32_blendable = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_Float32Blendable);
     dev.depth32_stencil8 = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_Depth32FloatStencil8);
     dev.timestamps = env_flag("RX_GPU_TIMING") && wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_TimestampQuery);
     if (dev.timestamps) have.push_back(WGPUFeatureName_TimestampQuery);
@@ -477,6 +483,31 @@ bool init_device(HWND hwnd) {
     if (!dev.device) return false;
     dev.queue = wgpuDeviceGetQueue(dev.device);
     wgpuDeviceGetLimits(dev.device, &dev.limits);
+    // Which formats the device can draw into that plain WebGPU cannot (a 1x1 target of each, made and dropped)
+    auto renderable = [](WGPUTextureFormat f) {
+        WGPUTextureDescriptor d{};
+        d.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc |
+                  WGPUTextureUsage_CopyDst;
+        d.dimension = WGPUTextureDimension_2D;
+        d.size = {1, 1, 1};
+        d.format = f;
+        d.mipLevelCount = 1;
+        d.sampleCount = 1;
+        scope_push();
+        WGPUTexture t = wgpuDeviceCreateTexture(dev.device, &d);
+        const bool ok = scope_pop().empty();
+        if (t) wgpuTextureRelease(t);
+        return ok;
+    };
+    dev.norm16_renderable = dev.norm16 && !RX_WEB && renderable(WGPUTextureFormat_R16Unorm) &&
+                            renderable(WGPUTextureFormat_RG16Unorm) && renderable(WGPUTextureFormat_RGBA16Unorm) &&
+                            renderable(WGPUTextureFormat_R16Snorm) && renderable(WGPUTextureFormat_RG16Snorm) &&
+                            renderable(WGPUTextureFormat_RGBA16Snorm);
+    dev.snorm8_renderable = !RX_WEB && renderable(WGPUTextureFormat_R8Snorm) && renderable(WGPUTextureFormat_RG8Snorm) &&
+                            renderable(WGPUTextureFormat_RGBA8Snorm);
+    hos_log("rx: 16-bit norm targets: %s; 8-bit snorm targets: %s",
+            dev.norm16_renderable ? "drawn as such" : dev.float32_blendable ? "drawn as 32-bit floats" : "drawn as half floats",
+            dev.snorm8_renderable ? "drawn as such" : "drawn as half floats");
     hos_log("rx: limits: per stage %u storage, %u uniform buffers; dynamic %u storage, %u uniform; %u bindings a group; "
             "offset alignment storage %u uniform %u", dev.limits.maxStorageBuffersPerShaderStage,
             dev.limits.maxUniformBuffersPerShaderStage, dev.limits.maxDynamicStorageBuffersPerPipelineLayout,
@@ -2812,18 +2843,28 @@ Image* find_render_target(uint64_t gpu_va, uint32_t width, uint32_t height, Pixe
     }
     WGPUTextureFormat format = wgpu_format(pf);
     static const bool norm16_rt = env_flag("RX_NORM16_RT");
-    if (!norm16_rt || !dev.norm16) switch (pf) {
+    // 16-bit norm targets the device cannot draw into as they are are drawn as 32-bit floats, which hold
+    // every 16-bit norm value exactly. Half floats did not (11 bits): TOTK's ability target mask stores each object's
+    // 64-bit id as four 16-bit unorm values, which came back as other ids, so Ultrahand and Recall never found what
+    // they aimed at. RX_NORM16_HALF=1: half floats, as before (a device without blendable 32-bit floats keeps them).
+    static const bool half = env_flag("RX_NORM16_HALF") || !dev.float32_blendable;
+    // (the device draws into them as they are: the console's own values, the best of the three)
+    static const bool native16 = (norm16_rt || dev.norm16_renderable) && dev.norm16 && !env_flag("RX_NORM16_HALF");
+    if (!native16) switch (pf) {
     case PixelFormat::R16_UNORM:
-    case PixelFormat::R16_SNORM: format = WGPUTextureFormat_R16Float; break;
+    case PixelFormat::R16_SNORM: format = half ? WGPUTextureFormat_R16Float : WGPUTextureFormat_R32Float; break;
     case PixelFormat::R16G16_UNORM:
-    case PixelFormat::R16G16_SNORM: format = WGPUTextureFormat_RG16Float; break;
+    case PixelFormat::R16G16_SNORM: format = half ? WGPUTextureFormat_RG16Float : WGPUTextureFormat_RG32Float; break;
     case PixelFormat::R16G16B16A16_UNORM:
-    case PixelFormat::R16G16B16A16_SNORM: format = WGPUTextureFormat_RGBA16Float; break;
+    case PixelFormat::R16G16B16A16_SNORM:
+        format = half ? WGPUTextureFormat_RGBA16Float : WGPUTextureFormat_RGBA32Float;
+        break;
     default: break;
     }
-    // 8-bit snorm targets: WebGPU cannot draw into them at all (the texture was not made, and a pass naming it threw
-    // its whole batch away: 20 batches when Ultrahand came out). Drawn as half floats, which hold -1..1 as well.
-    switch (pf) {
+    // 8-bit snorm targets: plain WebGPU cannot draw into them at all (the texture was not made, and a pass naming it
+    // threw its whole batch away: 20 batches when Ultrahand came out). Where the device cannot either: half floats,
+    // which hold -1..1 as well.
+    if (!dev.snorm8_renderable) switch (pf) {
     case PixelFormat::R8_SNORM: format = WGPUTextureFormat_R16Float; break;
     case PixelFormat::R8G8_SNORM: format = WGPUTextureFormat_RG16Float; break;
     case PixelFormat::A8B8G8R8_SNORM: format = WGPUTextureFormat_RGBA16Float; break;
