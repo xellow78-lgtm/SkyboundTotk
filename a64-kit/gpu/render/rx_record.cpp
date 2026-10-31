@@ -629,7 +629,10 @@ void rp_set_stencil_reference(WGPURenderPassEncoder p, uint32_t ref) {
     put(ref);
 }
 
+uint64_t rp_draws = 0;   // draws recorded so far (snapshot_for_feedback: were all of a pass's draws feedback draws)
+
 void rp_draw(WGPURenderPassEncoder p, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t first_instance) {
+    rp_draws++;
     if (!encoding_deferred()) return wgpuRenderPassEncoderDraw(p, vertices, instances, first, first_instance);
     put_op(kDraw);
     put(uint64_t{vertices} | uint64_t{instances} << 32);
@@ -638,6 +641,7 @@ void rp_draw(WGPURenderPassEncoder p, uint32_t vertices, uint32_t instances, uin
 
 void rp_draw_indexed(WGPURenderPassEncoder p, uint32_t indices, uint32_t instances, uint32_t first_index,
                      int32_t base_vertex, uint32_t first_instance) {
+    rp_draws++;
     if (!encoding_deferred())
         return wgpuRenderPassEncoderDrawIndexed(p, indices, instances, first_index, base_vertex, first_instance);
     put_op(kDrawIndexed);

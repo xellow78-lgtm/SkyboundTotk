@@ -116,6 +116,10 @@ struct Image {
     uint64_t assembled_passes = ~0ull;       // ...pass_count() when last brought up to date
     std::unique_ptr<Image> sampled_copy;     // reusable pre-draw snapshot for attachment feedback
     uint64_t snapshot_epoch = 0;             // the texture barrier epoch it was taken in (snapshot_for_feedback)
+    uint64_t snapshot_pass = 0;              // ...the pass begun after it was taken
+    uint64_t snapshot_draws = 0;             // ...rp_draws then
+    uint64_t snapshot_request = ~0ull;       // ...rp_draws at the last draw that sampled it (one draw, several slots)
+    uint32_t snapshot_uses = 0;              // ...the draws that sampled it since it was taken
     /// A view of the image as a shader binds it (cached).
     WGPUTextureView view(WGPUTextureViewDimension dim, bool depth_aspect, uint32_t base_layer = 0,
                          uint32_t base_level = 0, uint32_t level_count = 0,
@@ -777,6 +781,7 @@ void rp_set_index_buffer(WGPURenderPassEncoder p, WGPUBuffer b, WGPUIndexFormat 
 void rp_set_scissor(WGPURenderPassEncoder p, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 void rp_set_blend_constant(WGPURenderPassEncoder p, const WGPUColor* c);
 void rp_set_stencil_reference(WGPURenderPassEncoder p, uint32_t ref);
+extern uint64_t rp_draws;   // draws recorded so far
 void rp_draw(WGPURenderPassEncoder p, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t first_instance);
 void rp_draw_indexed(WGPURenderPassEncoder p, uint32_t indices, uint32_t instances, uint32_t first_index,
                      int32_t base_vertex, uint32_t first_instance);
