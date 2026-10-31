@@ -235,10 +235,30 @@ ENTRY_HOOK(0x08479c20) {
     extern volatile int hos_mouse_wheel;
     const uint64_t ctl = hos_game_controller;
     if (ctl && hos_mouse_cam_native() && !hos_mouse_wheel && hos_present_count - boost_frame <= 1) {
-        setf(ctl + 296, hos_stick_nomouse[0] + boost_x * scale);
-        setf(ctl + 300, hos_stick_nomouse[1] + boost_y * scale);
-        static int told;
-        if (!told++) hos_log("mouse cam: stick boost on (x%.2f): the game controller's right stick gets the mouse unclamped", scale);
+        /* The stick cameras curve what they read (|v| past a dead zone, raised to an exponent: 2 for the player
+           camera's StickExponent), which made the mouse's linear turn a "very fast stick": a few centimetres a
+           360, small motions lost in the dead zone. The mouse's part goes in uncurved: the magnitude m becomes
+           dz + (1 - dz) * m^(1/exp), so after their curve the turn is again in step with the mouse.
+           HOS_STICK_BOOST_EXP=<exp> (default 2; 1: none), HOS_STICK_BOOST_DZ=<dz> (default the camera input's own
+           dead zone, read from the game). */
+        static float expo = -1, dz = -1;
+        if (expo < 0) {
+            expo = getenv("HOS_STICK_BOOST_EXP") ? (float)atof(getenv("HOS_STICK_BOOST_EXP")) : 2.0f;
+            if (expo < 0.1f) expo = 1;
+            const float game_dz = getf(0x0ad026a8);   /* (f_08874c1c's dead zone: a constant of the image) */
+            dz = getenv("HOS_STICK_BOOST_DZ") ? (float)atof(getenv("HOS_STICK_BOOST_DZ"))
+                 : game_dz > 0 && game_dz < 0.5f ? game_dz : 0.0f;
+            hos_log("mouse cam: stick boost on (x%.2f, curve exponent %.2f, dead zone %.3f; the game's %.3f)", scale,
+                    expo, dz, game_dz);
+        }
+        float bx = boost_x * scale, by = boost_y * scale;
+        const float m = sqrtf(bx * bx + by * by);
+        if (m > 0) {
+            const float out = dz + (1 - dz) * powf(m, 1 / expo);
+            bx *= out / m, by *= out / m;
+        }
+        setf(ctl + 296, hos_stick_nomouse[0] + bx);
+        setf(ctl + 300, hos_stick_nomouse[1] + by);
     }
     return 1;
 }
