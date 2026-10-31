@@ -122,8 +122,10 @@ static int mouse_stick(int32_t *rx, int32_t *ry, int wheel) {
             *rx = wheel_x, *ry = wheel_y;
             return 1;
         }
-        int hos_mouse_cam_native(void);   /* totk_mouse_cam.c: the camera takes the mouse itself */
-        if (!b.mouse_camera || hos_mouse_cam_native()) dx = dy = 0;
+        /* (the stick takes the mouse even while the camera takes it natively: the cameras that read the stick
+           themselves, Ultrahand holding something and Recall, turned only with the keys. The native camera's own
+           read of the stick leaves the mouse's part out: totk_mouse_cam.c, hos_stick_nomouse) */
+        if (!b.mouse_camera) dx = dy = 0;
         double dt = (now - last) / 1e9;
         if (dt > 0.1) dt = 0.1;
         last = now;
@@ -371,6 +373,8 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     stick_max(stick, s);
 }
 
+volatile float hos_stick_nomouse[2];   /* the right stick from the pads and keys alone */
+volatile int hos_stick_moused;          /* ...and the mouse changed it */
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
@@ -384,9 +388,14 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     if (hos_bind_ui_active) return;   /* (the bindings window has the keyboard and mouse) */
     int32_t keys[4] = {0};
     hos_bind_poll(buttons, keys, mouse_held);   /* (first: whether L, the ability wheel, is held) */
-    int32_t mouse[4] = {0};
-    if (mouse_stick(&mouse[2], &mouse[3], (int)(*buttons >> B_L & 1))) stick_max(stick, mouse);
     stick_max(stick, keys);
+    hos_stick_nomouse[0] = stick[2] / 32767.0f;   /* (the right stick without the mouse: totk_mouse_cam.c) */
+    hos_stick_nomouse[1] = stick[3] / 32767.0f;
+    int32_t mouse[4] = {0};
+    const int moused = mouse_stick(&mouse[2], &mouse[3], (int)(*buttons >> B_L & 1));
+    if (moused) stick_max(stick, mouse);
+    hos_stick_moused = moused && (stick[2] != (int32_t)(hos_stick_nomouse[0] * 32767.0f) ||
+                                  stick[3] != (int32_t)(hos_stick_nomouse[1] * 32767.0f));
 }
 
 static void vibration_send(uint64_t handle, uint64_t value);

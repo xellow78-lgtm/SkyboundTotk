@@ -61,9 +61,22 @@ static _Thread_local int inside;
 ENTRY_HOOK(0x08874c1c) {
     if (inside || !native_on()) return 0;
     const uint64_t state = c->x[0], in = c->x[1], flags = c->x[2], lr = c->x[30];
+    /* The mouse also moves the right stick now (nn_hid.c), for the cameras that read the stick themselves; this one
+       takes it natively below, so its read of the stick gets the pads' and keys' alone (put back after) */
+    extern volatile float hos_stick_nomouse[2];
+    extern volatile int hos_stick_moused;
+    const int pre_takes = !(flags & 1) && !(*(uint8_t *)GP(state + 0x148) & 2);
+    const int swap = pre_takes && hos_stick_moused;
+    float saved[2] = {0, 0};
+    if (swap) {
+        saved[0] = getf(in), saved[1] = getf(in + 4);
+        setf(in, hos_stick_nomouse[0]);
+        setf(in + 4, hos_stick_nomouse[1]);
+    }
     inside = 1;
     f_08874c1c(c);   /* (the game's own input first: the stick and keys keep working alongside the mouse) */
     inside = 0;
+    if (swap) setf(in, saved[0]), setf(in + 4, saved[1]);
     const int64_t now = hos_now_ns(), before = native_at;
     /* (flag bit 0: the input is off; state+0x148 bit 1: a set input instead of the stick's. The mouse is added only
        when neither: otherwise it goes on moving the right stick (nn_hid.c), which is what Ultrahand's and Recall's
