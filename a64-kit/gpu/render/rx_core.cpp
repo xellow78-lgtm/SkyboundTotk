@@ -2654,6 +2654,8 @@ void texture_barrier(uint32_t method, uint32_t arg) {
     }
 }
 
+uint64_t feedback_program = 0;
+
 Image* snapshot_for_feedback(Image& image) {
     if (!image.sampled_copy) {
         auto copy = std::make_unique<Image>();
@@ -2696,9 +2698,11 @@ Image* snapshot_for_feedback(Image& image) {
     // shrine, each reading the G-buffer's c1/c3/c7 at its own pixels (a projected screen position) and writing them
     // back, blending by hand. A snapshot each was ~1900 copies of 1600x896 targets a frame: the GPU busy ~33 ms a
     // frame copying, 15-20 fps. The snapshot is kept for up to RX_FEEDBACK_WINDOW of them (default 16; 1: one each,
-    // exact) while every draw of the pass since it was taken sampled it (any other draw into the pass, or a pass
-    // break: taken again). What it gives up: where two decals of one window overlap, the later one reads the G-buffer
-    // from before the earlier one (one draw's own overlapping triangles always did).
+    // exact) while every draw of the pass since it was taken sampled it with the same program pair (another program,
+    // another draw into the pass, or a pass break: taken again. With any program, the open world's characters, whose
+    // G-buffer draws read it too, a barrier before each, drew dark: Link nearly black at Lookout Landing). What it
+    // gives up: where two draws of one window overlap, the later one reads the G-buffer from before the earlier one
+    // (one draw's own overlapping triangles always did).
     static const uint32_t window = [] {
         const char* e = getenv("RX_FEEDBACK_WINDOW");
         const int v = e ? std::atoi(e) : 16;
@@ -2708,8 +2712,9 @@ Image* snapshot_for_feedback(Image& image) {
         image.snapshot_epoch = barrier_epoch;
         return image.sampled_copy.get();
     }
-    if (!every_draw && window > 1 && pass && passes_begun == image.snapshot_pass &&
-        rp_draws - image.snapshot_draws == image.snapshot_uses && image.snapshot_uses < window) {
+    if (!every_draw && window > 1 && pass && passes_begun == image.snapshot_pass && feedback_program &&
+        feedback_program == image.snapshot_program && rp_draws - image.snapshot_draws == image.snapshot_uses &&
+        image.snapshot_uses < window) {
         image.snapshot_uses++;
         image.snapshot_request = rp_draws;
         image.snapshot_epoch = barrier_epoch;
@@ -2723,6 +2728,7 @@ Image* snapshot_for_feedback(Image& image) {
     image.snapshot_draws = rp_draws;
     image.snapshot_request = rp_draws;
     image.snapshot_uses = 1;
+    image.snapshot_program = feedback_program;
     for (uint32_t level = 0; level < image.levels; ++level) {
         WGPUTexelCopyTextureInfo source{}, destination{};
         source.texture = image.tex;

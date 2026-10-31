@@ -120,6 +120,7 @@ struct Image {
     uint64_t snapshot_draws = 0;             // ...rp_draws then
     uint64_t snapshot_request = ~0ull;       // ...rp_draws at the last draw that sampled it (one draw, several slots)
     uint32_t snapshot_uses = 0;              // ...the draws that sampled it since it was taken
+    uint64_t snapshot_program = 0;           // ...the program pair of the draw it was taken for
     /// A view of the image as a shader binds it (cached).
     WGPUTextureView view(WGPUTextureViewDimension dim, bool depth_aspect, uint32_t base_layer = 0,
                          uint32_t base_level = 0, uint32_t level_count = 0,
@@ -155,6 +156,7 @@ uint64_t images_generation();
 bool images_changed_in(uint64_t since, uint64_t lo, uint64_t hi);
 /// Ends the current pass and snapshots an attachment before a draw samples and writes it.
 Image* snapshot_for_feedback(Image& image);
+extern uint64_t feedback_program;   // the program pair of the draw being prepared (0: none known)
 /// A texture barrier (texture data cache invalidation, tiled cache barrier) in the command stream.
 void texture_barrier(uint32_t method, uint32_t arg);
 

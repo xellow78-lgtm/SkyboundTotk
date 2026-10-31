@@ -3531,6 +3531,8 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     nvn_dump_vs_ub = frame_dump_active() &&
                      std::find(dump_attrs_vs.begin(), dump_attrs_vs.end(), prog->vs.key) != dump_attrs_vs.end();
     if (nvn_dump_vs_ub) hos_log("rx-frame:   (uniforms of the next draw, vs %016llx)", (unsigned long long)prog->vs.key);
+    // (the program pair, for snapshot_for_feedback: a snapshot is kept across a run of draws of one program only)
+    feedback_program = prog->vs.key * 0x9E3779B97F4A7C15ull ^ (prog->has_fs ? prog->fs.key : 0) ^ 1;
     nvn_stage_resources(vs_res, s, 0, prog->vs.info, WGPUShaderStage_Vertex, rescale, at, dynamic_storage);
     nvn_dump_vs_ub = false;
     if (!vs_res.ok) return skip("vertex resources");
@@ -3817,6 +3819,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     } else {
         rp_draw(pass, d.count, d.instances, 0, 0);
     }
+    feedback_program = 0;
     // RX_END_PASS_AFTER_FS=<pixel program key>[,...] (debugging): a draw of those ends its render pass, as RX_DUMP_AFTER's
     // snapshots do (what found the GPU particle rule below)
     static const std::vector<uint64_t> end_pass_after = [] {
