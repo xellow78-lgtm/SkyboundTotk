@@ -16,7 +16,7 @@
      mouse. Watched now: those two (one breakpoint over both), the main controller's right stick, and the first output
      of f_0a005070 and f_0a616bf4.
    HOS_WATCH_STICK=npad watches the Npad controller itself; HOS_WATCH_STICK=cam the camera input's raw stick and
-   result (totk_mouse_cam.c); HOS_WATCH_STICK=nodes the two other stick nodes' outputs, armed when they first run. */
+   result (totk_mouse_cam.c); HOS_WATCH_STICK=nodes the two other stick nodes' outputs, armed when they first run; HOS_WATCH_STICK=getctl who asks for a controller, by caller. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +31,8 @@ static int watch_mode(void) {   /* 0 off, 1 main controller and nodes, 2 the Npa
     static int m = -1;
     if (m < 0) {
         const char *e = getenv("HOS_WATCH_STICK");
-        m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : !strcmp(e, "nodes") ? 3 : 1;
+        m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : !strcmp(e, "nodes") ? 3
+            : !strcmp(e, "getctl") ? 4 : 1;
         /* (cam: totk_mouse_cam.c; nodes: the two stick nodes' outputs as soon as they run, nothing else) */
     }
     return m;
@@ -76,9 +77,43 @@ ENTRY_HOOK(0x08479c20) {
     return 0;
 }
 
+typedef struct { uint64_t lr; volatile LONG n, shown; } Caller;
+static Caller getctl[128], copies[128];   /* get-controller's callers; the controller copy's (f_0837d330) */
+static volatile LONG ngetctl, ncopies;
+static void census(Caller *t, volatile LONG *count, uint64_t lr, const char *what, uint64_t arg) {
+    LONG n = *count;
+    for (LONG i = 0; i < n; i++)
+        if (t[i].lr == lr) {
+            InterlockedIncrement(&t[i].n);
+            return;
+        }
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    n = *count;
+    LONG i = 0;
+    while (i < n && t[i].lr != lr) i++;
+    if (i == n && n < 128) {
+        t[n].lr = lr;
+        InterlockedExchange(count, n + 1);
+        hos_log("watch: %s called from %#llx (%#llx)", what, (unsigned long long)lr, (unsigned long long)arg);
+    }
+    if (i < 128) InterlockedIncrement(&t[i].n);
+    ReleaseSRWLockExclusive(&lock);
+}
+static int summarize(char *line, int len, int cap, Caller *t, LONG count) {
+    int any = 0;
+    for (LONG i = 0; i < count && len < cap - 60; i++) {
+        const LONG n = t[i].n, d = n - t[i].shown;
+        t[i].shown = n;
+        if (d) any = 1, len += snprintf(line + len, cap - len, " %#llx +%ld", (unsigned long long)t[i].lr, (long)d);
+    }
+    return any ? len : -len;
+}
+
 /* a controller copying another (x0 <- x1): the game's main controller, the copy of that merged controller */
 ENTRY_HOOK(0x0837d330) {
     static int done;
+    if (watch_mode() == 4) census(copies, &ncopies, c->x[30], "controller copy", c->x[0]);   /* (getctl: below) */
     if (watch_mode() != 1 || merged8 < 2 || done || c->x[1] != merged8) return 0;
     done = 1;
     hos_log("watch: main controller %#llx copies %#llx (lr %#llx)", (unsigned long long)c->x[0],
@@ -126,4 +161,28 @@ static void node(Ctx *c, int which, const char *name) {
 }
 ENTRY_HOOK(0x0a005070) { node(c, 1, "node f_0a005070 right stick"); return 0; }
 ENTRY_HOOK(0x0a616bf4) { node(c, 2, "node f_0a616bf4 right stick"); return 0; }
+/* HOS_WATCH_STICK=getctl: who asks for a controller (f_0837ccc0, the game's get-controller(manager, index, name):
+   every stick reader starts there), by caller, with how many times in each 5 s that saw a change. The callers that
+   show up only while Ultrahand holds something are the holding camera's way to the stick. */
+static DWORD WINAPI getctl_summary(void *p) {
+    (void)p;
+    for (int tick = 1;; tick++) {
+        Sleep(5000);
+        char line[3000];
+        int len = snprintf(line, sizeof line, "watch: get-controller callers at %d s:", tick * 5);
+        int r = summarize(line, len, (int)sizeof line, getctl, ngetctl);
+        if (r > 0) hos_log("%s", line);
+        len = snprintf(line, sizeof line, "watch: controller copy callers at %d s:", tick * 5);
+        r = summarize(line, len, (int)sizeof line, copies, ncopies);
+        if (r > 0) hos_log("%s", line);
+    }
+    return 0;
+}
+ENTRY_HOOK(0x0837ccc0) {
+    if (watch_mode() != 4) return 0;
+    static volatile LONG started;
+    if (!InterlockedExchange(&started, 1)) CreateThread(NULL, 0, getctl_summary, NULL, 0, NULL);
+    census(getctl, &ngetctl, c->x[30], "get-controller", c->x[1]);
+    return 0;
+}
 #endif
