@@ -214,7 +214,7 @@ ENTRY_HOOK(0x0818e414) {
     last_mode = mode1;
     return 1;
 }
-/* HOS_STICK_BOOST=<scale> (experiment): the cameras that turn by the stick themselves (Ultrahand holding something:
+/* HOS_STICK_BOOST=<scale> (default 1; 0: off): the cameras that turn by the stick themselves (Ultrahand holding something:
    neither the camera input above nor the player camera runs then) get the mouse unclamped: after the controller
    manager's update (f_08479c20) the game controller's right stick (+296 / +300, what the stick nodes read) is the
    pads' and keys' plus the mouse's turn this frame times <scale>, not the stick the mouse moved (at most a full tilt,
@@ -226,7 +226,7 @@ static _Thread_local int inside_mgr;
 ENTRY_HOOK(0x08479c20) {
     hos_watch_manager_update(c);
     static float scale = -1;
-    if (scale < 0) scale = getenv("HOS_STICK_BOOST") ? (float)atof(getenv("HOS_STICK_BOOST")) : 0;
+    if (scale < 0) scale = getenv("HOS_STICK_BOOST") ? (float)atof(getenv("HOS_STICK_BOOST")) : 1.0f;   /* (on by default: 0 off) */
     if (inside_mgr || scale <= 0) return 0;
     inside_mgr = 1;
     f_08479c20(c);
@@ -252,13 +252,13 @@ ENTRY_HOOK(0x08479c20) {
                     expo, dz, game_dz);
         }
         /* Each frame's mouse turn once (a manager update with no new frame of mouse gets none: the same one counted
-           twice was one of the jumps), and at most HOS_STICK_BOOST_CAP (default 1, a full tilt; 0: no cap) of it a
+           twice was one of the jumps), and at most HOS_STICK_BOOST_CAP (default 0: no cap; 1: a full tilt) of it a
            frame: past a full tilt the holding camera seems to speed up on its own (a quick flick spun it around
            once or twice), so the rest waits for the next frames instead of being lost: the camera ends up as far
            as the mouse went, at worst a full tilt's speed. */
         static float cap = -1, carry_x, carry_y;
         static int64_t applied = -1;
-        if (cap < 0) cap = getenv("HOS_STICK_BOOST_CAP") ? (float)atof(getenv("HOS_STICK_BOOST_CAP")) : 1.0f;
+        if (cap < 0) cap = getenv("HOS_STICK_BOOST_CAP") ? (float)atof(getenv("HOS_STICK_BOOST_CAP")) : 0.0f;
         float bx = carry_x, by = carry_y;
         if (boost_frame != applied) {
             applied = boost_frame;
