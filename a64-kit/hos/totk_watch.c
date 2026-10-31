@@ -16,11 +16,13 @@
      mouse. Watched now: those two (one breakpoint over both), the main controller's right stick, and the first output
      of f_0a005070 and f_0a616bf4.
    HOS_WATCH_STICK=npad watches the Npad controller itself; HOS_WATCH_STICK=cam the camera input's raw stick and
-   result (totk_mouse_cam.c). */
+   result (totk_mouse_cam.c); HOS_WATCH_STICK=nodes the two other stick nodes' outputs, armed when they first run. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 #if GAME_VERSION == 143
 static uint64_t npad_ctl, merged8;
@@ -29,7 +31,8 @@ static int watch_mode(void) {   /* 0 off, 1 main controller and nodes, 2 the Npa
     static int m = -1;
     if (m < 0) {
         const char *e = getenv("HOS_WATCH_STICK");
-        m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : 1;   /* (cam: totk_mouse_cam.c) */
+        m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : !strcmp(e, "nodes") ? 3 : 1;
+        /* (cam: totk_mouse_cam.c; nodes: the two stick nodes' outputs as soon as they run, nothing else) */
     }
     return m;
 }
@@ -99,6 +102,21 @@ ENTRY_HOOK(0x09ac7484) {
 /* two of the nodes copying a controller's sticks into their output: the first output of each */
 static void node(Ctx *c, int which, const char *name) {
     static int done[3];
+    static volatile LONG calls[3];
+    if (watch_mode() == 3) {   /* (when each starts running: the one that runs only while Ultrahand holds) */
+        const long n = InterlockedIncrement(&calls[which]);
+        if (n == 1 || n == 100 || n == 1000 || n % 10000 == 0)
+            hos_log("watch: %s called %ld times (output %#llx, lr %#llx)", name, n, (unsigned long long)c->x[0] + 0x20,
+                    (unsigned long long)c->x[30]);
+    }
+    if (watch_mode() == 3 && !done[which] && nodes_armed < 2) {
+        done[which] = 1;
+        hos_log("watch: %s output at %#llx (lr %#llx)", name, (unsigned long long)c->x[0] + 0x20,
+                (unsigned long long)c->x[30]);
+        watch(c->x[0] + 0x20, name);
+        nodes_armed++;
+        return;
+    }
     if (watch_mode() != 1 || done[which] || !main_armed || nodes_armed >= 2) return;
     done[which] = 1;
     hos_log("watch: %s output at %#llx (lr %#llx)", name, (unsigned long long)c->x[0] + 0x20,
