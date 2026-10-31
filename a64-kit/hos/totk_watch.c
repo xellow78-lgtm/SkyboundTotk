@@ -58,7 +58,7 @@ ENTRY_HOOK(0x0ab28348) {
 }
 
 /* the controller manager's update: which merged controller holds Npad No.1's alone */
-ENTRY_HOOK(0x08479c20) {
+int hos_watch_manager_update(Ctx *c) {   /* (ENTRY_HOOK(0x08479c20) in totk_mouse_cam.c calls it first) */
     if (watch_mode() != 1 || !npad_ctl || merged8) return 0;
     uint64_t hos_guest_size(void);
     const uint64_t mgr = c->x[0], size = hos_guest_size();
@@ -190,6 +190,8 @@ ENTRY_HOOK(0x0837ccc0) {
    sticks at +288 / +296, which f_0900d030 copies into the camera input's raw stick. Who else reads them (the holding
    camera's way to the stick: neither the camera input nor the other stick nodes run while Ultrahand holds). */
 SPLICE_AFTER(0x0900d030, "c->x[30] = 0x900d07cULL; f_0837ccc0(c);") {
+    extern volatile uint64_t hos_game_controller;   /* totk_mouse_cam.c: the stick boost writes its right stick */
+    hos_game_controller = c->x[0];
     static uint64_t at;   /* (made again on loading a save: the breakpoints follow it) */
     static long calls;
     if (watch_mode() != 5 || !c->x[0]) return;

@@ -58,6 +58,9 @@ double hos_vi_frame_seconds(void);                  /* nn_vi.c */
 extern volatile LONG64 hos_present_count;            /* nn_vi.c */
 
 static _Thread_local int inside;
+static volatile float boost_x, boost_y;   /* the mouse's turn this frame, as the native camera adds it */
+static volatile int64_t boost_frame = -1;
+volatile uint64_t hos_game_controller;     /* totk_watch.c: the game controller the camera's stick node reads */
 
 ENTRY_HOOK(0x08874c1c) {
     if (inside || !native_on()) return 0;
@@ -131,6 +134,7 @@ ENTRY_HOOK(0x08874c1c) {
             vx = (float)(dx * k);
             vy = (float)(-dy * k * b.mouse_pitch * (b.mouse_invert_y ? -1 : 1));
         }
+        boost_x = vx, boost_y = vy, boost_frame = hos_present_count;
         static int logs = -1;
         if (logs < 0) logs = getenv("HOS_MOUSE_CAM_LOG") ? atoi(getenv("HOS_MOUSE_CAM_LOG")) : 0;
         if (logs > 0 && (dx || dy || getf(in) != 0 || getf(in + 4) != 0)) {
@@ -208,6 +212,34 @@ ENTRY_HOOK(0x0818e414) {
         hos_log("%s", b);
     }
     last_mode = mode1;
+    return 1;
+}
+/* HOS_STICK_BOOST=<scale> (experiment): the cameras that turn by the stick themselves (Ultrahand holding something:
+   neither the camera input above nor the player camera runs then) get the mouse unclamped: after the controller
+   manager's update (f_08479c20) the game controller's right stick (+296 / +300, what the stick nodes read) is the
+   pads' and keys' plus the mouse's turn this frame times <scale>, not the stick the mouse moved (at most a full tilt,
+   with a floor and a decay: "dragging the mouse through mud"). The camera input above still leaves the mouse's
+   stick out and adds it its own way. Only while the camera takes the mouse natively and the wheel is shut. */
+void f_08479c20(Ctx *);
+int hos_watch_manager_update(Ctx *c);   /* totk_watch.c */
+static _Thread_local int inside_mgr;
+ENTRY_HOOK(0x08479c20) {
+    hos_watch_manager_update(c);
+    static float scale = -1;
+    if (scale < 0) scale = getenv("HOS_STICK_BOOST") ? (float)atof(getenv("HOS_STICK_BOOST")) : 0;
+    if (inside_mgr || scale <= 0) return 0;
+    inside_mgr = 1;
+    f_08479c20(c);
+    inside_mgr = 0;
+    extern volatile float hos_stick_nomouse[2];
+    extern volatile int hos_mouse_wheel;
+    const uint64_t ctl = hos_game_controller;
+    if (ctl && hos_mouse_cam_native() && !hos_mouse_wheel && hos_present_count - boost_frame <= 1) {
+        setf(ctl + 296, hos_stick_nomouse[0] + boost_x * scale);
+        setf(ctl + 300, hos_stick_nomouse[1] + boost_y * scale);
+        static int told;
+        if (!told++) hos_log("mouse cam: stick boost on (x%.2f): the game controller's right stick gets the mouse unclamped", scale);
+    }
     return 1;
 }
 #endif
