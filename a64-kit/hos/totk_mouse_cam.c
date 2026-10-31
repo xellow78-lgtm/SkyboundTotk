@@ -60,12 +60,26 @@ static _Thread_local int inside;
 
 ENTRY_HOOK(0x08874c1c) {
     if (inside || !native_on()) return 0;
-    const uint64_t state = c->x[0], in = c->x[1], flags = c->x[2];
+    const uint64_t state = c->x[0], in = c->x[1], flags = c->x[2], lr = c->x[30];
     inside = 1;
     f_08874c1c(c);   /* (the game's own input first: the stick and keys keep working alongside the mouse) */
     inside = 0;
     const int64_t now = hos_now_ns(), before = native_at;
-    native_at = now;
+    /* (flag bit 0: the input is off; state+0x148 bit 1: a set input instead of the stick's. The mouse is added only
+       when neither: otherwise it goes on moving the right stick (nn_hid.c), which is what Ultrahand's and Recall's
+       aiming read: the mouse did nothing there, the stick-only camera keys still worked) */
+    const int takes = !(flags & 1) && !(*(uint8_t *)GP(state + 0x148) & 2);
+    if (takes) native_at = now;
+    {
+        static int last_takes = -1, told;
+        if (takes != last_takes && told < 40) {
+            told++;
+            hos_log("mouse cam: the camera input %s (flags %#llx, state+0x148 %#x, caller %#llx)",
+                    takes ? "takes the mouse" : "is set or off: the mouse moves the stick", (unsigned long long)flags,
+                    *(uint8_t *)GP(state + 0x148), (unsigned long long)lr);
+        }
+        last_takes = takes;
+    }
 
     /* the mouse's motion since the last frame, once a frame (a second call in the same frame gets the same) */
     static SRWLOCK lock = SRWLOCK_INIT;
@@ -77,6 +91,8 @@ ENTRY_HOOK(0x08874c1c) {
         int32_t dx, dy;
         const int held = hos_mouse_take_cam(&dx, &dy);
         if (!before || now - before > 250000000) dx = dy = 0;   /* (motion from a menu or the map: not the camera's) */
+        extern volatile int hos_mouse_wheel;   /* nn_hid.c: the ability wheel has the mouse */
+        if (hos_mouse_wheel) dx = dy = 0;
         Bindings b;
         hos_bind_get(&b);
         vx = vy = 0;
@@ -92,17 +108,17 @@ ENTRY_HOOK(0x08874c1c) {
         if (logs < 0) logs = getenv("HOS_MOUSE_CAM_LOG") ? atoi(getenv("HOS_MOUSE_CAM_LOG")) : 0;
         if (logs > 0 && (dx || dy || getf(in) != 0 || getf(in + 4) != 0)) {
             logs--;
-            hos_log("mouse cam: stick %.3f %.3f -> %.3f %.3f, mouse %d %d -> %.3f %.3f, flags %#llx, step %d ms",
-                    getf(in), getf(in + 4), getf(state + 0x420), getf(state + 0x424), dx, dy, vx, vy,
-                    (unsigned long long)flags, (int)(hos_vi_frame_seconds() * 1000 + 0.5));
+            hos_log("mouse cam: stick %.3f %.3f -> %.3f %.3f, mouse %d %d -> %.3f %.3f, flags %#llx, +0x148 %#x, "
+                    "caller %#llx, step %d ms", getf(in), getf(in + 4), getf(state + 0x420), getf(state + 0x424), dx,
+                    dy, vx, vy, (unsigned long long)flags, *(uint8_t *)GP(state + 0x148),
+                    (unsigned long long)lr, (int)(hos_vi_frame_seconds() * 1000 + 0.5));
         }
         static int told;
         if (!told++) hos_log("mouse cam: native (the camera's input, f_08874c1c); HOS_MOUSE_NATIVE=0 for the stick");
     }
     const float ax = flags & 2 ? -vx : vx, ay = flags & 4 ? -vy : vy;
     ReleaseSRWLockExclusive(&lock);
-    /* (flag bit 0: the input is off; state+0x148 bit 1: a set input instead of the stick's. The game's, then) */
-    if ((ax != 0 || ay != 0) && !(flags & 1) && !(*(uint8_t *)GP(state + 0x148) & 2)) {
+    if ((ax != 0 || ay != 0) && takes) {
         setf(state + 0x420, getf(state + 0x420) + ax);
         setf(state + 0x424, getf(state + 0x424) + ay);
     }

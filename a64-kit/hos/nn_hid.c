@@ -17,6 +17,7 @@
    Npad states share one layout (NpadCommonState): { s64 sampling; u64 buttons; s32 lx, ly; s32 rx, ry; u32 attributes;
    pad } = 0x28 bytes. */
 #include "hos.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,7 +71,34 @@ static void mouse_sens_keys(void) {
 }
 
 static int mouse_held;   /* the mouse is captured (as of the last take): its buttons count */
-static int mouse_stick(int32_t *rx, int32_t *ry) {
+/* The ability wheel (TOTK: L held) is picked by pointing the stick, not by turning: while L is held the mouse sets
+   where the stick points and it stays there (no settling back), so the ability under it stays picked until L is let
+   go; the stick is centred when L goes down and again when it comes up, and meanwhile the mouse turns no camera
+   (totk_mouse_cam.c reads hos_mouse_wheel). As the Mac port does (github.com/ly05010419/MacNativeGames,
+   docs/controls.md, "the ability wheel"); written anew here. As a turning stick it acted like a stick: the pick
+   drifted back to the centre as soon as the mouse stopped. HOS_MOUSE_WHEEL=0: as before. */
+volatile int hos_mouse_wheel;
+static int wheel_stick(int wheel, int captured, int32_t dx, int32_t dy, int32_t *rx, int32_t *ry) {
+    static double wx, wy;
+    static int was;
+    static int on = -1;
+    if (on < 0) on = !getenv("HOS_MOUSE_WHEEL") || atoi(getenv("HOS_MOUSE_WHEEL")) != 0;
+    wheel = wheel && on && captured;
+    if (wheel != was) wx = wy = 0;   /* (centred as the wheel opens and as it closes) */
+    was = wheel;
+    hos_mouse_wheel = wheel;
+    if (!wheel) return 0;
+    const double k = 1.0 / 60.0;   /* mouse counts to a full tilt: 60 */
+    wx += dx * k;
+    wy -= dy * k;
+    const double r = sqrt(wx * wx + wy * wy);
+    if (r > 1) wx /= r, wy /= r;
+    *rx = (int32_t)(wx * 32767);
+    *ry = (int32_t)(wy * 32767);
+    return 1;
+}
+
+static int mouse_stick(int32_t *rx, int32_t *ry, int wheel) {
     static int64_t last;
     static double vx, vy;
     static int captured;
@@ -87,6 +115,13 @@ static int mouse_stick(int32_t *rx, int32_t *ry) {
         int32_t dx, dy;
         captured = hos_mouse_take(&dx, &dy);
         mouse_held = captured;
+        int32_t wheel_x, wheel_y;
+        if (wheel_stick(wheel, captured, dx, dy, &wheel_x, &wheel_y)) {
+            last = now;
+            vx = vy = 0;
+            *rx = wheel_x, *ry = wheel_y;
+            return 1;
+        }
         int hos_mouse_cam_native(void);   /* totk_mouse_cam.c: the camera takes the mouse itself */
         if (!b.mouse_camera || hos_mouse_cam_native()) dx = dy = 0;
         double dt = (now - last) / 1e9;
@@ -97,6 +132,13 @@ static int mouse_stick(int32_t *rx, int32_t *ry) {
         vy = captured ? vy * 0.2 + ty * 0.8 : 0;
     }
     if (!captured) return 0;
+    if (hos_mouse_wheel) {   /* (between takes: where the wheel's stick was left) */
+        int32_t wheel_x, wheel_y;
+        if (wheel_stick(wheel, captured, 0, 0, &wheel_x, &wheel_y)) {
+            *rx = wheel_x, *ry = wheel_y;
+            return 1;
+        }
+    }
     const double v[2] = {vx, vy};
     int32_t *out[2] = {rx, ry};
     for (int i = 0; i < 2; i++) {
@@ -340,10 +382,10 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     if ((npresses > 0 && (hos_now_ns() - script_t0) / 1000000 < script_end_ms + 5000) || !game_in_front()) return;
     pads_read(buttons, stick);
     if (hos_bind_ui_active) return;   /* (the bindings window has the keyboard and mouse) */
-    int32_t mouse[4] = {0};
-    if (mouse_stick(&mouse[2], &mouse[3])) stick_max(stick, mouse);
     int32_t keys[4] = {0};
-    hos_bind_poll(buttons, keys, mouse_held);
+    hos_bind_poll(buttons, keys, mouse_held);   /* (first: whether L, the ability wheel, is held) */
+    int32_t mouse[4] = {0};
+    if (mouse_stick(&mouse[2], &mouse[3], (int)(*buttons >> B_L & 1))) stick_max(stick, mouse);
     stick_max(stick, keys);
 }
 
