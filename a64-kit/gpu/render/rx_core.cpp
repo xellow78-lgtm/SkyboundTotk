@@ -434,6 +434,13 @@ bool init_device(HWND hwnd) {
     const auto early_z = (WGPUFeatureName)WGPUNativeFeature_ShaderEarlyDepthTest;
     dev.early_depth_test = wgpuAdapterHasFeature(dev.adapter, early_z);
     if (dev.early_depth_test) have.push_back(early_z);
+    // (vertex programs that store to storage buffers: TOTK's ability targeting, a one-point draw that stores what
+    // is under the reticle for the CPU; without it Ultrahand and Recall found nothing. RX_NO_VERTEX_STORES=1: off)
+    const auto vertex_stores = (WGPUFeatureName)WGPUNativeFeature_VertexWritableStorage;
+    dev.vertex_storage_writes = !env_flag("RX_NO_VERTEX_STORES") && wgpuAdapterHasFeature(dev.adapter, vertex_stores);
+    if (dev.vertex_storage_writes) have.push_back(vertex_stores);
+    set_vertex_storage_writes(dev.vertex_storage_writes);
+    hos_log("rx: vertex programs' storage writes: %s", dev.vertex_storage_writes ? "kept" : "left out (not available)");
 #endif
     dev.norm16 = wgpuAdapterHasFeature(dev.adapter, norm16) ||
                  // (the web: r16unorm, rg16unorm, rgba16unorm and the snorm ones come with texture-formats-tier1)
@@ -2812,6 +2819,14 @@ Image* find_render_target(uint64_t gpu_va, uint32_t width, uint32_t height, Pixe
     case PixelFormat::R16G16_SNORM: format = WGPUTextureFormat_RG16Float; break;
     case PixelFormat::R16G16B16A16_UNORM:
     case PixelFormat::R16G16B16A16_SNORM: format = WGPUTextureFormat_RGBA16Float; break;
+    default: break;
+    }
+    // 8-bit snorm targets: WebGPU cannot draw into them at all (the texture was not made, and a pass naming it threw
+    // its whole batch away: 20 batches when Ultrahand came out). Drawn as half floats, which hold -1..1 as well.
+    switch (pf) {
+    case PixelFormat::R8_SNORM: format = WGPUTextureFormat_R16Float; break;
+    case PixelFormat::R8G8_SNORM: format = WGPUTextureFormat_RG16Float; break;
+    case PixelFormat::A8B8G8R8_SNORM: format = WGPUTextureFormat_RGBA16Float; break;
     default: break;
     }
     if (format == WGPUTextureFormat_Undefined) {

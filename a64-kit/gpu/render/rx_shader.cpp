@@ -18,6 +18,7 @@
 
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/wgsl/emit_wgsl.h"
+#include "shader_recompiler/backend/wgsl/wgsl_emit_context.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
@@ -33,6 +34,12 @@
 #include "rx_internal.h"
 
 namespace rx {
+
+/// The WGSL backend keeps vertex programs' storage stores (the device has VERTEX_WRITABLE_STORAGE; set before any
+/// translation).
+void set_vertex_storage_writes(bool on) {
+    Shader::Backend::WGSL::VertexStorageWritesFlag() = on;
+}
 namespace {
 
 Shader::TextureType convert_texture_type(const Tegra::Texture::TICEntry& entry) {

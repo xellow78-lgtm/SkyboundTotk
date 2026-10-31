@@ -39,6 +39,19 @@ inline bool CbufClamp() {
     return clamp;
 }
 
+/// Vertex programs may write storage buffers (wgpu's VERTEX_WRITABLE_STORAGE, native only: set by the renderer when
+/// the device has it, before anything is translated). Without it their stores are left out: WebGPU has no writable
+/// storage in vertex shaders. TOTK's ability targeting (Ultrahand, Recall...) is a one-point draw whose vertex
+/// program reads the target mask under the reticle and stores what it found for the CPU: left out, nothing was ever
+/// targeted.
+inline bool& VertexStorageWritesFlag() {
+    static bool on = false;
+    return on;
+}
+inline bool VertexStorageWrites() {
+    return VertexStorageWritesFlag();
+}
+
 struct GenericElementInfo {
     std::string name;
     u32 first_element{};

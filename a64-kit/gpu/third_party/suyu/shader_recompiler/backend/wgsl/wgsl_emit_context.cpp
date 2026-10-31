@@ -269,11 +269,11 @@ void EmitContext::DefineStorageBuffers(Bindings& bindings) {
             index += desc.count;
             continue;
         }
-        // WebGPU forbids writable storage buffers in vertex shaders
+        // WebGPU forbids writable storage buffers in vertex shaders (wgpu allows them with VERTEX_WRITABLE_STORAGE)
         // compute: every storage buffer read_write (they may share one GPU buffer, and WebGPU forbids a buffer in
         // one dispatch as both read-only and writable storage)
-        const bool writable{stage == Stage::Compute ||
-                            (desc.is_written && stage != Stage::VertexA && stage != Stage::VertexB)};
+        const bool vertex{stage == Stage::VertexA || stage == Stage::VertexB};
+        const bool writable{stage == Stage::Compute || (desc.is_written && (!vertex || VertexStorageWrites()))};
         const bool atomic{index < 64 && atomic_ssbo[index]};
         header += fmt::format("@group({}) @binding({}) var<storage, {}> {}_ssbo{}: array<{}>;\n", group,
                               bindings.unified, writable || atomic ? "read_write" : "read", stage_name, index,

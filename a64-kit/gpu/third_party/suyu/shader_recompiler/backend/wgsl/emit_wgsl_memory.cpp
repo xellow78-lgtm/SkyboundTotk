@@ -152,8 +152,8 @@ void EmitLoadStorage128(EmitContext& ctx, IR::Inst& inst, const IR::Value& bindi
 
 void EmitWriteStorageU8(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
-        return;   // WebGPU has no writable storage in vertex shaders
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !VertexStorageWrites()) {
+        return;   // WebGPU has no writable storage in vertex shaders (wgpu's VERTEX_WRITABLE_STORAGE: they are kept)
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
     const auto bit_offset{fmt::format("i32({}%4)*8", offset_var)};
@@ -162,8 +162,8 @@ void EmitWriteStorageU8(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorageS8(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
-        return;   // WebGPU has no writable storage in vertex shaders
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !VertexStorageWrites()) {
+        return;   // WebGPU has no writable storage in vertex shaders (wgpu's VERTEX_WRITABLE_STORAGE: they are kept)
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
     const auto bit_offset{fmt::format("i32({}%4)*8", offset_var)};
@@ -172,8 +172,8 @@ void EmitWriteStorageS8(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorageU16(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                          std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
-        return;   // WebGPU has no writable storage in vertex shaders
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !VertexStorageWrites()) {
+        return;   // WebGPU has no writable storage in vertex shaders (wgpu's VERTEX_WRITABLE_STORAGE: they are kept)
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
     const auto bit_offset{fmt::format("i32(({}>>1)%2)*16", offset_var)};
@@ -182,8 +182,8 @@ void EmitWriteStorageU16(EmitContext& ctx, const IR::Value& binding, const IR::V
 
 void EmitWriteStorageS16(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                          std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
-        return;   // WebGPU has no writable storage in vertex shaders
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !VertexStorageWrites()) {
+        return;   // WebGPU has no writable storage in vertex shaders (wgpu's VERTEX_WRITABLE_STORAGE: they are kept)
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
     const auto bit_offset{fmt::format("i32(({}>>1)%2)*16", offset_var)};
@@ -192,8 +192,8 @@ void EmitWriteStorageS16(EmitContext& ctx, const IR::Value& binding, const IR::V
 
 void EmitWriteStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
-        return;   // WebGPU has no writable storage in vertex shaders
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !VertexStorageWrites()) {
+        return;   // WebGPU has no writable storage in vertex shaders (wgpu's VERTEX_WRITABLE_STORAGE: they are kept)
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
     ctx.Add("{}", ctx.SsboStore(binding.U32(), Word(offset_var), value));
@@ -201,8 +201,8 @@ void EmitWriteStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
-        return;   // WebGPU has no writable storage in vertex shaders
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !VertexStorageWrites()) {
+        return;   // WebGPU has no writable storage in vertex shaders (wgpu's VERTEX_WRITABLE_STORAGE: they are kept)
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
     ctx.Add("{}", ctx.SsboStore(binding.U32(), Word(offset_var), fmt::format("{}.x", value)));
@@ -211,8 +211,8 @@ void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorage128(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                          std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
-        return;   // WebGPU has no writable storage in vertex shaders
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !VertexStorageWrites()) {
+        return;   // WebGPU has no writable storage in vertex shaders (wgpu's VERTEX_WRITABLE_STORAGE: they are kept)
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
     ctx.Add("{}", ctx.SsboStore(binding.U32(), Word(offset_var), fmt::format("{}.x", value)));

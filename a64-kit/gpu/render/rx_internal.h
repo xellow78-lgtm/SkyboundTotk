@@ -369,10 +369,11 @@ struct Device {
     WGPUQueue queue = nullptr;
     WGPULimits limits{};
     bool bc = false, float32_filterable = false, depth32_stencil8 = false, norm16 = false, depth_clip_control = false,
-         early_depth_test = false, timestamps = false;
+         early_depth_test = false, timestamps = false, vertex_storage_writes = false;
     std::string description;
 };
 extern Device dev;
+void set_vertex_storage_writes(bool on);   // (rx_shader.cpp: the WGSL backend's switch)
 /// The renderer's lock: recursive, over a Windows SRW lock (std::recursive_mutex was ~3.5% of the GPU thread: it is
 /// taken for every renderer method, several a draw, nearly always by the GPU thread itself).
 class RecursiveLock {
