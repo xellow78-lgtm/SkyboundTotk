@@ -25,6 +25,7 @@
 #include "hos.h"
 #include "input_bind.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
@@ -172,6 +173,41 @@ ENTRY_HOOK(0x0a3d2d40) {
                 in_x, in_y, (unsigned long long)st, G32(st + 348), a0, b0, a1, b1, *(uint8_t *)GP(self + 480),
                 getf(step + 8));
     }
+    return 1;
+}
+/* HOS_MOUSE_CAM_LOG (debugging): f_0818e414, the player camera's update (the main reader of the camera input's
+   turn, state+0x420): its mode (this+384, +388 the last, +392) and the floats it turns by, before and after, per
+   frame while there is a turn or the mode changes: to find the mode Ultrahand's holding uses and its turn ramp. */
+void f_0818e414(Ctx *);
+static _Thread_local int inside_player;
+ENTRY_HOOK(0x0818e414) {
+    static int logs = -1;
+    if (logs < 0) logs = getenv("HOS_MOUSE_CAM_LOG") ? atoi(getenv("HOS_MOUSE_CAM_LOG")) : 0;
+    if (inside_player || logs <= 0) return 0;
+    const uint64_t self = c->x[0], st = G64(self + 32), step = c->x[1];
+    static const int offs[] = {88, 92, 96, 100, 120, 124, 128, 132, 136, 216, 220, 224, 228, 332, 340};
+    enum { N = sizeof offs / sizeof *offs };
+    float before[N], after[N];
+    for (int i = 0; i < N; i++) before[i] = getf(self + offs[i]);
+    const float tx = getf(st + 0x420), ty = getf(st + 0x424);
+    const uint32_t mode0 = G32(self + 384);
+    inside_player = 1;
+    f_0818e414(c);
+    inside_player = 0;
+    for (int i = 0; i < N; i++) after[i] = getf(self + offs[i]);
+    const uint32_t mode1 = G32(self + 384);
+    static uint32_t last_mode = ~0u;
+    if ((tx != 0 || ty != 0 || mode1 != last_mode) && logs > 0) {
+        logs--;
+        char b[900];
+        int n = snprintf(b, sizeof b, "player cam: turn %.3f %.3f mode %u->%u (+388 %u +392 %u +380 %#x) step %.4f |",
+                         tx, ty, mode0, mode1, G32(self + 388), G32(self + 392), *(uint8_t *)GP(self + 380),
+                         getf(step + 8));
+        for (int i = 0; i < N && n < (int)sizeof b - 40; i++)
+            n += snprintf(b + n, sizeof b - n, " %d:%.3f>%.3f", offs[i], before[i], after[i]);
+        hos_log("%s", b);
+    }
+    last_mode = mode1;
     return 1;
 }
 #endif
