@@ -506,7 +506,8 @@ bool init_device(HWND hwnd) {
     dev.snorm8_renderable = !RX_WEB && renderable(WGPUTextureFormat_R8Snorm) && renderable(WGPUTextureFormat_RG8Snorm) &&
                             renderable(WGPUTextureFormat_RGBA8Snorm);
     hos_log("rx: 16-bit norm targets: %s; 8-bit snorm targets: %s",
-            dev.norm16_renderable ? "drawn as such" : dev.float32_blendable ? "drawn as 32-bit floats" : "drawn as half floats",
+            env_flag("RX_NORM16_HALF") ? "drawn as half floats (RX_NORM16_HALF)"
+            : dev.norm16_renderable ? "drawn as such" : dev.float32_blendable ? "drawn as 32-bit floats" : "drawn as half floats",
             dev.snorm8_renderable ? "drawn as such" : "drawn as half floats");
     hos_log("rx: limits: per stage %u storage, %u uniform buffers; dynamic %u storage, %u uniform; %u bindings a group; "
             "offset alignment storage %u uniform %u", dev.limits.maxStorageBuffersPerShaderStage,

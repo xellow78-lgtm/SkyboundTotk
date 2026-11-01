@@ -241,8 +241,27 @@ void hos_region_free(uint64_t addr) {
     }
     UNLOCK();
 #if defined(HOS_HIGH_BASE) && defined(_WIN32)
-    if (freed_size && freed >= HOS_HIGH_BASE) {   /* (committed when made: back to Windows) */
-        VirtualFree(GP(freed), freed_size, MEM_DECOMMIT);
+    if (freed_size && freed >= HOS_HIGH_BASE) {
+        /* The pages stay mapped, their contents given up (DiscardVirtualMemory), as the low 4 GB's freed regions
+           are: decommitted, a read through a pointer the game still held after freeing (it gets away with it on
+           the Switch) was an access violation: Ultrahand's AI properties (f_080155ec from f_0a415844) crashed
+           there. Taken again by a later region (committed again: the same pages). HOS_DECOMMIT_FREED=1: as before
+           (back to Windows). */
+        static int decommit = -1;
+        if (decommit < 0) decommit = getenv("HOS_DECOMMIT_FREED") != NULL;
+        if (decommit) {
+            VirtualFree(GP(freed), freed_size, MEM_DECOMMIT);
+            return;
+        }
+        typedef DWORD(WINAPI * DiscardFn)(PVOID, SIZE_T);
+        static DiscardFn discard;
+        static int looked;
+        if (!looked) {
+            looked = 1;
+            discard = (DiscardFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "DiscardVirtualMemory");
+        }
+        if (!discard || discard(GP(freed), (SIZE_T)freed_size) != ERROR_SUCCESS)
+            VirtualAlloc(GP(freed), freed_size, MEM_RESET, PAGE_READWRITE);   /* (the same, older) */
         return;
     }
 #endif
