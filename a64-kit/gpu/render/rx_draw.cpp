@@ -3965,11 +3965,12 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
                      : std::snprintf(m + n, sizeof m - n, " %x", (unsigned)targets[i].writeMask);
         dump_draw(m);
         // RX_DUMP_UBO=1 (finding the camera for FSR 2 / DLSS): the vertex stage's constant buffers, as floats, for the
-        // first draws into a pass of 4 or more color targets (the G-buffer), so the view / projection matrices show.
+        // first 3 depth-tested geometry draws a frame into a pass of 4 or more color targets at least 640 wide (the
+        // G-buffer), so the view / projection matrices show.
         static const bool dump_ubo = getenv("RX_DUMP_UBO") && *getenv("RX_DUMP_UBO") != '0';
         static int ubo_dumped;
         static int64_t ubo_frame = -1;
-        if (dump_ubo && targets.size() >= 4) {
+        if (dump_ubo && targets.size() >= 4 && s.ds.dt && s.viewport[0][2] >= 640 && d.count > 6) {
             if (ubo_frame != frame_number) ubo_frame = frame_number, ubo_dumped = 0;
             if (ubo_dumped++ < 3) {
                 for (int i = 0; i < 14; i++) {
