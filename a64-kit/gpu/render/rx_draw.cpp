@@ -3869,6 +3869,25 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         if (u.addr && u.size == sizeof scene_camera.v) {
             scene_camera_prev = scene_camera;
             gpu_read(u.addr, scene_camera.v, sizeof scene_camera.v);
+            // (RX_MV_DEBUG: how often the camera changes between captures, each 5 s: same = no motion that frame)
+            static const bool mv_stats = getenv("RX_MV_DEBUG") && *getenv("RX_MV_DEBUG") != '0';
+            if (mv_stats) {
+                static int captures, same, skipped_frames;
+                static double moved;
+                static int64_t t0;
+                captures++;
+                if (!std::memcmp(scene_camera.v, scene_camera_prev.v, 28 * sizeof(float))) same++;
+                if (scene_camera_prev.frame >= 0) skipped_frames += (int)(frame_number - scene_camera_prev.frame - 1);
+                for (int i : {3, 7, 11}) moved += std::fabs(scene_camera.v[i] - scene_camera_prev.v[i]);
+                const int64_t now = hos_now_ns();
+                if (!t0) t0 = now;
+                if (now - t0 >= 5000000000ll) {
+                    hos_log("rx: scene camera: %d captures in %.1f s, %d unchanged from the last, %d frames without one; "
+                            "moved %.3f a capture (view translation), at %llx", captures, (now - t0) / 1e9, same,
+                            skipped_frames, captures ? moved / captures : 0.0, (unsigned long long)u.addr);
+                    captures = same = skipped_frames = 0, moved = 0, t0 = now;
+                }
+            }
             scene_camera.frame = frame_number;
             scene_camera.addr = u.addr;
             scene_camera.width = s.viewport[0][2], scene_camera.height = s.viewport[0][3];
