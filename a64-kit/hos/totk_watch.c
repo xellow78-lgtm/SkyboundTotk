@@ -302,6 +302,8 @@ static void uh_watch(uint64_t a, const char *why, uint64_t *at, long *calls) {
     *at = a;
 }
 ENTRY_HOOK(0x0a41648c) {
+    extern volatile uint64_t hos_uh_ctx;   /* totk_mouse_cam.c: Ultrahand holding's mouse */
+    hos_uh_ctx = c->x[1];
     if (watch_mode() != 8) return 0;
     static uint64_t at;
     static long calls;

@@ -60,6 +60,8 @@ extern volatile LONG64 hos_present_count;            /* nn_vi.c */
 static _Thread_local int inside;
 static volatile float boost_x, boost_y;   /* the mouse's turn this frame, as the native camera adds it */
 static volatile int64_t boost_frame = -1;
+static volatile float hold_ax, hold_ay;   /* ...with the game's Camera X / Y-axis Inverted options applied */
+static volatile int64_t hold_at;          /* when Ultrahand's holding last turned by the stick (below) */
 volatile uint64_t hos_game_controller;     /* totk_watch.c: the game controller the camera's stick node reads */
 
 ENTRY_HOOK(0x08874c1c) {
@@ -148,6 +150,7 @@ ENTRY_HOOK(0x08874c1c) {
         if (!told++) hos_log("mouse cam: native (the camera's input, f_08874c1c); HOS_MOUSE_NATIVE=0 for the stick");
     }
     const float ax = flags & 2 ? -vx : vx, ay = flags & 4 ? -vy : vy;
+    hold_ax = ax, hold_ay = ay;
     ReleaseSRWLockExclusive(&lock);
     if ((ax != 0 || ay != 0) && takes) {
         setf(state + 0x420, getf(state + 0x420) + ax);
@@ -260,7 +263,10 @@ ENTRY_HOOK(0x08479c20) {
         static int64_t applied = -1;
         if (cap < 0) cap = getenv("HOS_STICK_BOOST_CAP") ? (float)atof(getenv("HOS_STICK_BOOST_CAP")) : 0.0f;
         float bx = carry_x, by = carry_y;
-        if (boost_frame != applied) {
+        if (hos_now_ns() - hold_at < 200000000) {   /* (Ultrahand holding: it takes the mouse itself, below) */
+            applied = boost_frame;
+            bx = by = 0;
+        } else if (boost_frame != applied) {
             applied = boost_frame;
             bx += boost_x * scale, by += boost_y * scale;
         }
@@ -278,6 +284,80 @@ ENTRY_HOOK(0x08479c20) {
         }
         setf(ctl + 296, hos_stick_nomouse[0] + bx);
         setf(ctl + 300, hos_stick_nomouse[1] + by);
+    }
+    return 1;
+}
+
+/* Ultrahand holding something: its own camera turn. f_09d58e80 (a method of Ultrahand's context, the only reader
+   of the right stick Ultrahand stores at +284 / +288, found with HOS_WATCH_STICK=uh) clamps that stick to -1 .. 1
+   and turns the held direction by it, linear, no curve: the horizontal part (+324 / +332) rotated by x times a speed
+   times the step, the vertical one (+328) moved by y times a speed times the step, within limits. That clamp was the
+   "dragging the mouse through mud" / "a stick that moves like a mouse": a full tilt was the top speed, and the stick
+   boost's curve correction (for the curved cameras) made small motions too fast here.
+   Now: the stick boost leaves the mouse out while Ultrahand holds (the stick here is the pads' and keys' alone),
+   this frame's mouse turn (as the native camera adds it, in full tilts: 1 = CAM_DEG_PER_SEC a second, the Inverted
+   options applied) goes in on top, clamped as the game wants, and whatever the clamp cut off is added after the
+   game's own turn in the same proportion as what it turned (measured from the direction before and after), so the
+   turn stays linear past a full tilt with no speeds or signs guessed. HOS_HOLD_MOUSE=0: off (the stick boost as
+   before); HOS_HOLD_MOUSE_SCALE=<s> (default 1): the mouse's turn while holding, times s. */
+volatile uint64_t hos_uh_ctx;   /* totk_watch.c: Ultrahand's context, as f_0a41648c fills its input */
+void f_09d58e80(Ctx *);
+static _Thread_local int inside_uh;
+static float clamp1(float v) { return v > 1 ? 1 : v < -1 ? -1 : v; }
+ENTRY_HOOK(0x09d58e80) {
+    static int on = -1;
+    static float hscale = 1;
+    if (on < 0) {
+        on = !getenv("HOS_HOLD_MOUSE") || atoi(getenv("HOS_HOLD_MOUSE")) != 0;
+        if (getenv("HOS_HOLD_MOUSE_SCALE") && atof(getenv("HOS_HOLD_MOUSE_SCALE")) > 0)
+            hscale = (float)atof(getenv("HOS_HOLD_MOUSE_SCALE"));
+    }
+    const uint64_t ctx = c->x[0];
+    if (inside_uh || !on || !ctx || ctx != hos_uh_ctx || !native_on()) return 0;
+    extern volatile int hos_mouse_wheel;
+    static int64_t applied = -1;
+    float mx = 0, my = 0;
+    hold_at = hos_now_ns();
+    if (hos_present_count - boost_frame <= 1 && boost_frame != applied && !hos_mouse_wheel) {
+        applied = boost_frame;
+        mx = hold_ax * hscale, my = hold_ay * hscale;
+    }
+    const float sx = getf(ctx + 284), sy = getf(ctx + 288);
+    const float tx = sx + mx, ty = sy + my, cx = clamp1(tx), cy = clamp1(ty);
+    setf(ctx + 284, cx);
+    setf(ctx + 288, cy);
+    const float x0 = getf(ctx + 324), y0 = getf(ctx + 328), z0 = getf(ctx + 332);
+    inside_uh = 1;
+    f_09d58e80(c);
+    inside_uh = 0;
+    float x1 = getf(ctx + 324), y1 = getf(ctx + 328), z1 = getf(ctx + 332);
+    const double th = atan2((double)x0 * z1 - (double)z0 * x1, (double)x0 * x1 + (double)z0 * z1);
+    double phi = 0;
+    if (fabsf(cx) > 1e-3f && fabsf(tx) > fabsf(cx)) {
+        phi = th * (tx / cx - 1);
+        if (phi > 1.5) phi = 1.5;
+        if (phi < -1.5) phi = -1.5;   /* (at most ~86 degrees more a frame) */
+        const double cs = cos(phi), sn = sin(phi);
+        const float nx = (float)(x1 * cs - z1 * sn), nz = (float)(x1 * sn + z1 * cs);
+        setf(ctx + 324, nx);
+        setf(ctx + 332, nz);
+    }
+    if (fabsf(cy) > 1e-3f && fabsf(ty) > fabsf(cy)) setf(ctx + 328, y1 + (y1 - y0) * (ty / cy - 1));
+    static int logs = -1, told;
+    if (logs < 0) logs = getenv("HOS_MOUSE_CAM_LOG") ? atoi(getenv("HOS_MOUSE_CAM_LOG")) : 0;
+    if (!told++) hos_log("mouse cam: Ultrahand holding takes the mouse (f_09d58e80, context %#llx)", (unsigned long long)ctx);
+    /* (a few measurements of the holding turn's own speed, for tuning: degrees a second per full tilt) */
+    static int measured;
+    const double step = hos_vi_frame_seconds();
+    if (measured < 12 && fabsf(cx) > 0.3f && mx == 0 && step > 0) {
+        measured++;
+        hos_log("mouse cam: holding turns %.1f degrees a second at a full tilt (stick %.2f, %.2f degrees this frame)",
+                fabs(th) * 57.29578 / step / fabsf(cx), cx, th * 57.29578);
+    }
+    if (logs > 0 && (mx != 0 || my != 0)) {
+        logs--;
+        hos_log("hold cam: stick %.3f %.3f + mouse %.3f %.3f -> %.3f %.3f, turned %.3f deg + %.3f, up %.4f -> %.4f",
+                sx, sy, mx, my, cx, cy, th * 57.29578, phi * 57.29578, y0, getf(ctx + 328));
     }
     return 1;
 }
