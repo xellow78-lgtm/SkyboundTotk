@@ -291,28 +291,31 @@ ENTRY_HOOK(0x08479c20) {
 /* Ultrahand holding something: its own camera turn. f_09d58e80 (a method of Ultrahand's context, the only reader
    of the right stick Ultrahand stores at +284 / +288, found with HOS_WATCH_STICK=uh) turns the held direction by
    that stick (+324 / +332 rotated left / right, +328 moved up / down) and the camera follows it. Measured (a
-   player's test, run_hold2.log): a frame's left / right turn is 1.46 degrees x |stick|^4 (a full tilt the top
-   speed; 0.5 gives 1/16 of it), so a mouse fed in as stick units crawled at small motions and stuck at the top
-   speed. Turning the held direction further than the game did does not stay: it is pulled back the next frames
-   (that was the choppiness of the first try), so the top speed is the game's.
+   player's test, run_hold2.log): a frame's left / right turn is 1.46 degrees (at 60 fps: ~88 a second, about the
+   normal camera's full tilt) x |stick|^4, up / down ~0.21 x |stick|^3. The curve is a powf in f_09d58e80 and
+   nothing there clamps the stick: the top speed was this code's own clamp to a full tilt (run_hold3.log: the mouse
+   asked for up to 13 full tilts, 249 of 300 frames clamped). Turning the held direction outside the game's code
+   does not stay (pulled back the next frames: the first try's choppiness), so the turn goes in as the stick.
    Now: the stick boost leaves the mouse out while Ultrahand holds; here this frame's mouse turn (in full tilts: the
    native camera's units, the Inverted options applied) times the holding speed (F1: "Ultrahand holding: mouse
    speed", 25 .. 400%) is added to what the pads' and keys' stick gives, as a share of the top speed, and turned
-   back into a stick through the game's curve (|v|^(1/4)), so the turn is linear in the mouse up to the top speed.
+   back into a stick through the game's curve (|v|^(1/4)), unclamped: linear in the mouse, as fast as the mouse,
+   in step with the normal camera at 100%.
    HOS_HOLD_MOUSE=0: off (the stick boost as before). HOS_HOLD_EXP_X / _Y=<e>: the curve (default 4 / 3; the up /
-   down one is a rougher measurement). HOS_HOLD_CARRY=1: what goes past the top speed is kept for the next frames
-   (the camera ends up where the mouse went, at the top speed) instead of dropped. */
+   down one is a rougher measurement). HOS_HOLD_CARRY=1: past HOLD_MAX, kept for the next frames instead of dropped. */
+/* (a frame's turn at most HOLD_MAX full tilts: ~60 degrees at 60 fps; only a safety net against a wild mouse report) */
+#define HOLD_MAX 40.0f
 volatile uint64_t hos_uh_ctx;   /* totk_watch.c: Ultrahand's context, as f_0a41648c fills its input */
 void f_09d58e80(Ctx *);
 static _Thread_local int inside_uh;
 static float hold_axis(float stick, float mouse, float e, float *carry, int carry_on) {
     const float a = fabsf(stick);
-    float share = (stick < 0 ? -1 : 1) * powf(a > 1 ? 1 : a, e) + mouse + *carry;   /* (shares of the top speed) */
+    float share = (stick < 0 ? -1 : 1) * powf(a, e) + mouse + *carry;   /* (shares of a full tilt's turn) */
     *carry = 0;
-    if (share > 1 || share < -1) {
-        const float over = share - (share > 0 ? 1 : -1);
-        if (carry_on && fabsf(over) < 8) *carry = over;   /* (a backlog past ~8 frames: dropped) */
-        share = share > 0 ? 1 : -1;
+    if (share > HOLD_MAX || share < -HOLD_MAX) {
+        const float over = share - (share > 0 ? HOLD_MAX : -HOLD_MAX);
+        if (carry_on && fabsf(over) < 8 * HOLD_MAX) *carry = over;
+        share = share > 0 ? HOLD_MAX : -HOLD_MAX;
     }
     return (share < 0 ? -1 : 1) * powf(fabsf(share), 1 / e);
 }

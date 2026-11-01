@@ -61,7 +61,7 @@ static void refresh(void) {
     SetDlgItemTextA(win, ID_PITCH_LABEL, t);
     const int hold = (int)(b.mouse_hold * 100 + 0.5);
     SetScrollPos(GetDlgItem(win, ID_HOLD), SB_CTL, hold, TRUE);
-    snprintf(t, sizeof t, "Ultrahand holding: mouse speed: %d%%", hold);
+    snprintf(t, sizeof t, "Ultrahand holding: mouse speed: %d%% (100 = camera)", hold);
     SetDlgItemTextA(win, ID_HOLD_LABEL, t);
 }
 
