@@ -33,7 +33,7 @@ static int watch_mode(void) {   /* 0 off, 1 main controller and nodes, 2 the Npa
     if (m < 0) {
         const char *e = getenv("HOS_WATCH_STICK");
         m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : !strcmp(e, "nodes") ? 3
-            : !strcmp(e, "getctl") ? 4 : !strcmp(e, "ctl") ? 5 : !strcmp(e, "rs") ? 6 : !strcmp(e, "getters") ? 7 : 1;
+            : !strcmp(e, "getctl") ? 4 : !strcmp(e, "ctl") ? 5 : !strcmp(e, "rs") ? 6 : !strcmp(e, "getters") ? 7 : !strcmp(e, "uh") ? 8 : 1;
         /* (cam: totk_mouse_cam.c; nodes: the two stick nodes' outputs as soon as they run, nothing else) */
     }
     return m;
@@ -281,4 +281,38 @@ ENTRY_HOOK(0x09bcc2c8) { getter_hit(c, 0xc8); return 0; }   /* float [136] */
 ENTRY_HOOK(0x09bcc2ec) { getter_hit(c, 0xec); return 0; }   /* float [184] compared */
 ENTRY_HOOK(0x09bcc300) { getter_hit(c, 0x00); return 0; }   /* float [216] compared */
 ENTRY_HOOK(0x09bcc31c) { getter_hit(c, 0x1c); return 0; }   /* vec2 [280] */
+
+/* HOS_WATCH_STICK=uh: Ultrahand's own copy of the right stick. f_0a415844 (Ultrahand's update) has f_0a41648c read
+   the stick node's right stick vector (getter 0x1c: the only reader of the controller's right stick that runs just
+   while Ultrahand is out, besides Link's animation) and the left one, apply the Camera X / Y-axis Inverted options,
+   and store them in Ultrahand's context (x1 +284: right stick, +292: left); f_0a416910 then eases its own copy of
+   the right stick toward it (this +320 / +324) for Link's arm. Whoever reads those while something is held is the
+   holding camera's way to the stick. */
+static void uh_watch(uint64_t a, const char *why, uint64_t *at, long *calls) {
+    if (!a) return;
+    if (!*at) {
+        hos_log("watch: %s at %#llx", why, (unsigned long long)a);
+        watch(a, why);
+    } else if (a != *at || ++*calls % 1000 == 0) {   /* (moved, or onto new threads now and then) */
+#ifndef __EMSCRIPTEN__
+        void hos_watch_move(const char *why, uint64_t guest);
+        hos_watch_move(why, a);
+#endif
+    }
+    *at = a;
+}
+ENTRY_HOOK(0x0a41648c) {
+    if (watch_mode() != 8) return 0;
+    static uint64_t at;
+    static long calls;
+    uh_watch(c->x[1] + 284, "Ultrahand context: right stick", &at, &calls);
+    return 0;
+}
+ENTRY_HOOK(0x0a416910) {
+    if (watch_mode() != 8) return 0;
+    static uint64_t at;
+    static long calls;
+    uh_watch(c->x[0] + 320, "Ultrahand: eased right stick", &at, &calls);
+    return 0;
+}
 #endif
