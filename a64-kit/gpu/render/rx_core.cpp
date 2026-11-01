@@ -86,6 +86,7 @@ void RecursiveLock::unlock() {
 }
 int64_t frame_number;
 SceneCamera scene_camera, scene_camera_prev;
+WGPUTexture scene_depth;
 int64_t st_draws, st_skipped, st_pipelines, st_clears;
 Stream stream_ro, stream_rw;
 

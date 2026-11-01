@@ -393,8 +393,10 @@ struct SceneCamera {
     int64_t frame = -1;
     uint64_t addr = 0;
     float width = 0, height = 0;
+    float depth_a = 1, depth_b = 0;     // the depth buffer's value = depth_a * NDC z + depth_b
 };
 extern SceneCamera scene_camera, scene_camera_prev;
+extern WGPUTexture scene_depth;         // the G-buffer's depth (a reference held), for the motion vectors
 
 // statistics
 extern int64_t st_draws, st_skipped, st_pipelines, st_clears;

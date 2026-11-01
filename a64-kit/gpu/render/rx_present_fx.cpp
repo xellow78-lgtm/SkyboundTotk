@@ -334,6 +334,163 @@ void draw_pass(WGPUCommandEncoder e, WGPUTextureView target, const WGPUColor& cl
     wgpuRenderPassEncoderRelease(p);
     wgpuBindGroupRelease(bg);
 }
+
+// ---- RX_MV_DEBUG=1 (FSR 2 groundwork): the camera's motion vectors, from the G-buffer's depth and the game's scene
+// camera this frame and the last (rx_draw.cpp), shown instead of the frame: grey = still, red / green = moved right /
+// down (RX_MV_SCALE: colour per pixel of motion, default 0.05), sky darker. RX_MV_FLIPY=1 if up / down comes out
+// mirrored. ----
+const char* kMvWgsl = R"(
+struct M { inv_cur: mat4x4<f32>, vp_prev: mat4x4<f32>, size: vec4<f32>, rect: vec4<f32>, dz: vec4<f32> };
+@group(0) @binding(0) var dep: texture_depth_2d;
+@group(0) @binding(1) var<uniform> m: M;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+@fragment fn mv(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = (pos.xy - m.rect.xy) / m.rect.zw;
+  let q = vec2<i32>(clamp(uv * m.size.xy, vec2<f32>(0.0), m.size.xy - 1.0));
+  let d = textureLoad(dep, q, 0);
+  let fy = m.dz.w;
+  let ndc = vec4<f32>(uv.x * 2.0 - 1.0, fy * (1.0 - uv.y * 2.0), (d - m.dz.y) / m.dz.x, 1.0);
+  var w = m.inv_cur * ndc;
+  w = w / w.w;
+  let c = m.vp_prev * w;
+  let pn = c.xy / c.w;
+  let puv = vec2<f32>(pn.x * 0.5 + 0.5, 0.5 - fy * pn.y * 0.5);
+  let px = (puv - uv) * m.size.xy;
+  let k = m.dz.z;
+  let sky = select(1.0, 0.6, d >= 0.99999);
+  return vec4<f32>(clamp(vec3<f32>(0.5 + px.x * k, 0.5 + px.y * k, 0.5) * sky, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+)";
+struct MvParams {
+    float inv_cur[16], vp_prev[16], size[4], rect[4], dz[4];
+};
+struct MvState {
+    WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+    WGPUBindGroupLayout layout = nullptr;
+    WGPURenderPipeline pipe = nullptr;
+    WGPUBuffer params = nullptr;
+} mvs;
+bool invert4(const double m[16], double out[16]) {   // (row-major; Gauss-Jordan with partial pivoting)
+    double a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r);
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int r = c + 1; r < 4; r++)
+            if (std::fabs(a[r][c]) > std::fabs(a[p][c])) p = r;
+        if (std::fabs(a[p][c]) < 1e-12) return false;
+        if (p != c)
+            for (int k = 0; k < 8; k++) std::swap(a[p][k], a[c][k]);
+        const double inv = 1.0 / a[c][c];
+        for (int k = 0; k < 8; k++) a[c][k] *= inv;
+        for (int r = 0; r < 4; r++)
+            if (r != c) {
+                const double f = a[r][c];
+                for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+            }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) out[r * 4 + c] = a[r][c + 4];
+    return true;
+}
+/// The motion-vector view over `rect` of the target; false when there is no camera or depth yet
+bool mv_debug_draw(WGPUCommandEncoder e, WGPUTextureView target, WGPUTextureFormat format, const WGPUColor& clear,
+                   const float rect[4]) {
+    const SceneCamera cur = scene_camera, prev = scene_camera_prev;
+    if (!scene_depth || cur.frame < 0 || prev.frame < 0) return false;
+    if (!mvs.layout) {
+        WGPUBindGroupLayoutEntry be[2]{};
+        be[0].binding = 0;
+        be[0].visibility = WGPUShaderStage_Fragment;
+        be[0].texture.sampleType = WGPUTextureSampleType_Depth;
+        be[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+        be[1].binding = 1;
+        be[1].visibility = WGPUShaderStage_Fragment;
+        be[1].buffer.type = WGPUBufferBindingType_Uniform;
+        be[1].buffer.minBindingSize = sizeof(MvParams);
+        WGPUBindGroupLayoutDescriptor bd{};
+        bd.entryCount = 2;
+        bd.entries = be;
+        mvs.layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
+        WGPUBufferDescriptor d{};
+        d.size = sizeof(MvParams);
+        d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+        mvs.params = wgpuDeviceCreateBuffer(dev.device, &d);
+    }
+    if (!mvs.pipe || mvs.format != format) {
+        if (mvs.pipe) wgpuRenderPipelineRelease(mvs.pipe);
+        WGPUShaderSourceWGSL src{};
+        src.chain.sType = WGPUSType_ShaderSourceWGSL;
+        src.code = sv(kMvWgsl);
+        WGPUShaderModuleDescriptor md{};
+        md.nextInChain = &src.chain;
+        WGPUShaderModule mod = wgpuDeviceCreateShaderModule(dev.device, &md);
+        WGPUPipelineLayoutDescriptor pd{};
+        pd.bindGroupLayoutCount = 1;
+        pd.bindGroupLayouts = &mvs.layout;
+        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(dev.device, &pd);
+        mvs.pipe = make_pipeline(mod, pl, "mv", format);
+        mvs.format = format;
+        wgpuPipelineLayoutRelease(pl);
+        wgpuShaderModuleRelease(mod);
+        hos_log("rx: motion vector view on (RX_MV_DEBUG): depth and the scene camera, %gx%g", cur.width, cur.height);
+    }
+    // the view-projections (row-major, constants 12..27): this frame's inverted, the last one's as it is; both
+    // uploaded column-major (WGSL's matrices)
+    double vc[16], vp[16], ic[16];
+    for (int i = 0; i < 16; i++) vc[i] = cur.v[12 + i], vp[i] = prev.v[12 + i];
+    if (!invert4(vc, ic)) return false;
+    MvParams pm{};
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) pm.inv_cur[c * 4 + r] = (float)ic[r * 4 + c], pm.vp_prev[c * 4 + r] = (float)vp[r * 4 + c];
+    pm.size[0] = cur.width, pm.size[1] = cur.height;
+    std::memcpy(pm.rect, rect, sizeof pm.rect);
+    static const float scale = getenv("RX_MV_SCALE") ? (float)atof(getenv("RX_MV_SCALE")) : 0.05f;
+    static const bool flipy = getenv("RX_MV_FLIPY") && *getenv("RX_MV_FLIPY") != '0';
+    pm.dz[0] = cur.depth_a != 0 ? cur.depth_a : 1, pm.dz[1] = cur.depth_b, pm.dz[2] = scale, pm.dz[3] = flipy ? -1.0f : 1.0f;
+    wgpuQueueWriteBuffer(dev.queue, mvs.params, 0, &pm, sizeof pm);
+    WGPUTextureViewDescriptor vd{};
+    vd.format = wgpuTextureGetFormat(scene_depth);
+    vd.dimension = WGPUTextureViewDimension_2D;
+    vd.mipLevelCount = 1;
+    vd.arrayLayerCount = 1;
+    vd.aspect = WGPUTextureAspect_DepthOnly;
+    WGPUTextureView dv = wgpuTextureCreateView(scene_depth, &vd);
+    WGPURenderPassColorAttachment ca{};
+    ca.view = target;
+    ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+    ca.loadOp = WGPULoadOp_Clear;
+    ca.storeOp = WGPUStoreOp_Store;
+    ca.clearValue = clear;
+    WGPURenderPassDescriptor rp{};
+    rp.colorAttachmentCount = 1;
+    rp.colorAttachments = &ca;
+    WGPURenderPassEncoder p = wgpuCommandEncoderBeginRenderPass(e, &rp);
+    WGPUBindGroupEntry ge[2]{};
+    ge[0].binding = 0;
+    ge[0].textureView = dv;
+    ge[1].binding = 1;
+    ge[1].buffer = mvs.params;
+    ge[1].size = sizeof(MvParams);
+    WGPUBindGroupDescriptor gd{};
+    gd.layout = mvs.layout;
+    gd.entryCount = 2;
+    gd.entries = ge;
+    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.device, &gd);
+    wgpuRenderPassEncoderSetViewport(p, rect[0], rect[1], rect[2], rect[3], 0.0f, 1.0f);
+    wgpuRenderPassEncoderSetScissorRect(p, (uint32_t)rect[0], (uint32_t)rect[1], (uint32_t)rect[2], (uint32_t)rect[3]);
+    wgpuRenderPassEncoderSetPipeline(p, mvs.pipe);
+    wgpuRenderPassEncoderSetBindGroup(p, 0, bg, 0, nullptr);
+    wgpuRenderPassEncoderDraw(p, 3, 1, 0, 0);
+    wgpuRenderPassEncoderEnd(p);
+    wgpuRenderPassEncoderRelease(p);
+    wgpuBindGroupRelease(bg);
+    wgpuTextureViewRelease(dv);
+    return true;
+}
 }  // namespace
 
 PresentRect present_rect(uint32_t sw, uint32_t sh, uint32_t tw, uint32_t th) {
@@ -361,6 +518,8 @@ void present_fx_draw(WGPUCommandEncoder e, WGPUTextureView src, uint32_t sw, uin
     static std::string logged;
     const PresentRect r = present_rect(sw, sh, tw, th);
     const float rect[4] = {(float)r.x, (float)r.y, (float)r.w, (float)r.h};
+    static const bool mv_debug = getenv("RX_MV_DEBUG") && *getenv("RX_MV_DEBUG") != '0';
+    if (mv_debug && mv_debug_draw(e, target, target_format, clear, rect)) return;
     const bool upscale = set.fsr && (r.w > sw || r.h > sh);
     char what[96];
     std::snprintf(what, sizeof what, "%ux%u %ux%u %ux%u %d", sw, sh, r.w, r.h, tw, th, upscale);

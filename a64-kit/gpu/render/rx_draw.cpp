@@ -3872,6 +3872,14 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
             scene_camera.frame = frame_number;
             scene_camera.addr = u.addr;
             scene_camera.width = s.viewport[0][2], scene_camera.height = s.viewport[0][3];
+            const bool mw = nvn_depth_minus_w() != 0;
+            scene_camera.depth_a = mw ? (s.depth_far - s.depth_near) * 0.5f : s.depth_far - s.depth_near;
+            scene_camera.depth_b = mw ? (s.depth_far + s.depth_near) * 0.5f : s.depth_near;
+            if (at.depth && at.depth->tex && at.depth->tex != scene_depth) {
+                wgpuTextureAddRef(at.depth->tex);
+                if (scene_depth) wgpuTextureRelease(scene_depth);
+                scene_depth = at.depth->tex;
+            }
             if (frame_dump_active()) {
                 for (const SceneCamera* c : {&scene_camera, &scene_camera_prev}) {
                     char cb[160];
