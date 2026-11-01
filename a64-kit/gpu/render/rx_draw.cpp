@@ -3860,6 +3860,33 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
             end_render_pass("pe_gpu_particles");
         }
     }
+    // The scene camera (groundwork for FSR 2 / DLSS: motion vectors from depth and the camera): the game's view
+    // constants (2368 bytes: view 3x4, view-projection 4x4, projection 4x4, inverse view 3x4, near / far, ...) as the
+    // first depth-tested draw of a frame into the G-buffer (4+ color targets, 1200+ wide) has them in its
+    // constant buffer 1; this frame's and the last one's are kept. A frame dump logs both.
+    if (targets.size() >= 4 && s.ds.dt && s.viewport[0][2] >= 1200 && scene_camera.frame != frame_number) {
+        const auto& u = s.ubo[0][1].addr ? s.ubo[0][1] : s.ubo[1][1];
+        if (u.addr && u.size == sizeof scene_camera.v) {
+            scene_camera_prev = scene_camera;
+            gpu_read(u.addr, scene_camera.v, sizeof scene_camera.v);
+            scene_camera.frame = frame_number;
+            scene_camera.addr = u.addr;
+            scene_camera.width = s.viewport[0][2], scene_camera.height = s.viewport[0][3];
+            if (frame_dump_active()) {
+                for (const SceneCamera* c : {&scene_camera, &scene_camera_prev}) {
+                    char cb[160];
+                    std::snprintf(cb, sizeof cb, "  scene camera%s (frame %lld, at %llx, %gx%g):", c == &scene_camera ? "" : " (last frame)",
+                                  (long long)c->frame, (unsigned long long)c->addr, c->width, c->height);
+                    dump_draw(cb);
+                    for (int k = 0; k < 72; k += 8) {
+                        std::snprintf(cb, sizeof cb, "    [%2d] %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g", k, c->v[k], c->v[k + 1],
+                                      c->v[k + 2], c->v[k + 3], c->v[k + 4], c->v[k + 5], c->v[k + 6], c->v[k + 7]);
+                        dump_draw(cb);
+                    }
+                }
+            }
+        }
+    }
     if (frame_dump_active()) {
         char b[1600];
         std::snprintf(b, sizeof b,
@@ -3964,37 +3991,6 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
                                      (unsigned)targets[i].blend->alpha.srcFactor, (unsigned)targets[i].blend->alpha.dstFactor)
                      : std::snprintf(m + n, sizeof m - n, " %x", (unsigned)targets[i].writeMask);
         dump_draw(m);
-        // RX_DUMP_UBO=1 (finding the camera for FSR 2 / DLSS): the vertex stage's constant buffers, as floats, for the
-        // first 3 depth-tested geometry draws a frame into a pass of 4 or more color targets at least 640 wide (the
-        // G-buffer), so the view / projection matrices show.
-        static const bool dump_ubo = getenv("RX_DUMP_UBO") && *getenv("RX_DUMP_UBO") != '0';
-        static int ubo_dumped;
-        static int64_t ubo_frame = -1;
-        if (dump_ubo && targets.size() >= 4 && s.ds.dt && s.viewport[0][2] >= 640 && d.count > 6) {
-            if (ubo_frame != frame_number) ubo_frame = frame_number, ubo_dumped = 0;
-            if (ubo_dumped++ < 3) {
-                for (int i = 0; i < 14; i++) {
-                    if (!s.ubo[0][i].addr) continue;
-                    const uint32_t bytes = (uint32_t)std::min<uint64_t>(s.ubo[0][i].size, 1024);
-                    std::vector<float> f(bytes / 4);
-                    gpu_read(s.ubo[0][i].addr, f.data(), bytes & ~3u);
-                    std::snprintf(b, sizeof b, "  vs ubo %d at %llx (%llu bytes):", i, (unsigned long long)s.ubo[0][i].addr,
-                                  (unsigned long long)s.ubo[0][i].size);
-                    dump_draw(b);
-                    for (size_t k = 0; k < f.size(); k += 8) {
-                        std::string line = "    ";
-                        char fb[32];
-                        std::snprintf(fb, sizeof fb, "[%3zu]", k);
-                        line += fb;
-                        for (size_t j = k; j < k + 8 && j < f.size(); j++) {
-                            std::snprintf(fb, sizeof fb, " %.6g", f[j]);
-                            line += fb;
-                        }
-                        dump_draw(line.c_str());
-                    }
-                }
-            }
-        }
         std::string u = "  fs ubo:";
         for (int i = 0; i < 14; i++)
             if (s.ubo[1][i].addr) {

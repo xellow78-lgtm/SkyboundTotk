@@ -387,6 +387,14 @@ public:
 };
 extern RecursiveLock mu;
 extern int64_t frame_number;
+/// The game's scene camera constants (rx_draw.cpp; for temporal upscaling): this frame's and the last one's
+struct SceneCamera {
+    float v[592] = {};
+    int64_t frame = -1;
+    uint64_t addr = 0;
+    float width = 0, height = 0;
+};
+extern SceneCamera scene_camera, scene_camera_prev;
 
 // statistics
 extern int64_t st_draws, st_skipped, st_pipelines, st_clears;

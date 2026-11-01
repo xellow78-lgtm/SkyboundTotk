@@ -85,6 +85,7 @@ void RecursiveLock::unlock() {
     ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw_));
 }
 int64_t frame_number;
+SceneCamera scene_camera, scene_camera_prev;
 int64_t st_draws, st_skipped, st_pipelines, st_clears;
 Stream stream_ro, stream_rw;
 
