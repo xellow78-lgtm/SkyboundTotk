@@ -33,7 +33,7 @@ static int watch_mode(void) {   /* 0 off, 1 main controller and nodes, 2 the Npa
     if (m < 0) {
         const char *e = getenv("HOS_WATCH_STICK");
         m = !e || !*e || *e == '0' || !strcmp(e, "cam") ? 0 : !strcmp(e, "npad") ? 2 : !strcmp(e, "nodes") ? 3
-            : !strcmp(e, "getctl") ? 4 : !strcmp(e, "ctl") ? 5 : !strcmp(e, "rs") ? 6 : 1;
+            : !strcmp(e, "getctl") ? 4 : !strcmp(e, "ctl") ? 5 : !strcmp(e, "rs") ? 6 : !strcmp(e, "getters") ? 7 : 1;
         /* (cam: totk_mouse_cam.c; nodes: the two stick nodes' outputs as soon as they run, nothing else) */
     }
     return m;
@@ -79,9 +79,10 @@ int hos_watch_manager_update(Ctx *c) {   /* (ENTRY_HOOK(0x08479c20) in totk_mous
 }
 
 typedef struct { uint64_t lr; volatile LONG n, shown; } Caller;
-static Caller getctl[128], copies[128];   /* get-controller's callers; the controller copy's (f_0837d330) */
-static volatile LONG ngetctl, ncopies;
-static void census(Caller *t, volatile LONG *count, uint64_t lr, const char *what, uint64_t arg) {
+static Caller getctl[128], copies[128], getters[256];   /* get-controller's callers; the controller copy's; the
+                                                         player input properties' getters' (key: getter << 56 | caller) */
+static volatile LONG ngetctl, ncopies, ngetters;
+static void census_n(Caller *t, volatile LONG *count, LONG cap, uint64_t lr, const char *what, uint64_t arg) {
     LONG n = *count;
     for (LONG i = 0; i < n; i++)
         if (t[i].lr == lr) {
@@ -93,20 +94,26 @@ static void census(Caller *t, volatile LONG *count, uint64_t lr, const char *wha
     n = *count;
     LONG i = 0;
     while (i < n && t[i].lr != lr) i++;
-    if (i == n && n < 128) {
+    if (i == n && n < cap) {
         t[n].lr = lr;
         InterlockedExchange(count, n + 1);
         hos_log("watch: %s called from %#llx (%#llx)", what, (unsigned long long)lr, (unsigned long long)arg);
     }
-    if (i < 128) InterlockedIncrement(&t[i].n);
+    if (i < cap) InterlockedIncrement(&t[i].n);
     ReleaseSRWLockExclusive(&lock);
+}
+static void census(Caller *t, volatile LONG *count, uint64_t lr, const char *what, uint64_t arg) {
+    census_n(t, count, 128, lr, what, arg);
 }
 static int summarize(char *line, int len, int cap, Caller *t, LONG count) {
     int any = 0;
     for (LONG i = 0; i < count && len < cap - 60; i++) {
         const LONG n = t[i].n, d = n - t[i].shown;
         t[i].shown = n;
-        if (d) any = 1, len += snprintf(line + len, cap - len, " %#llx +%ld", (unsigned long long)t[i].lr, (long)d);
+        if (d && t[i].lr >> 56)
+            any = 1, len += snprintf(line + len, cap - len, " %02x@%#llx +%ld", (unsigned)(t[i].lr >> 56),
+                                     (unsigned long long)(t[i].lr & 0xFFFFFFFFFFFFull), (long)d);
+        else if (d) any = 1, len += snprintf(line + len, cap - len, " %#llx +%ld", (unsigned long long)t[i].lr, (long)d);
     }
     return any ? len : -len;
 }
@@ -175,6 +182,9 @@ static DWORD WINAPI getctl_summary(void *p) {
         if (r > 0) hos_log("%s", line);
         len = snprintf(line, sizeof line, "watch: controller copy callers at %d s:", tick * 5);
         r = summarize(line, len, (int)sizeof line, copies, ncopies);
+        if (r > 0) hos_log("%s", line);
+        len = snprintf(line, sizeof line, "watch: input property getters (getter@caller) at %d s:", tick * 5);
+        r = summarize(line, len, (int)sizeof line, getters, ngetters);
         if (r > 0) hos_log("%s", line);
     }
     return 0;
@@ -251,4 +261,24 @@ ENTRY_HOOK(0x08f24ab0) {
     }
     return 0;
 }
+/* HOS_WATCH_STICK=getters: the player input object's property getters (what the game's logic reads the stick node's
+   outputs through: right stick vector, length, angle and the rest), counted by getter and caller every 5 s. Software
+   counting: every thread, whatever reads them. The callers that show up only while Ultrahand holds something lead to
+   the holding camera. Getter ids: the low byte of its address (0x09bcc2XX -> XX), the offset it reads in brackets. */
+static void getter_hit(Ctx *c, unsigned id) {
+    if (watch_mode() != 7) return;
+    static volatile LONG started;
+    if (!InterlockedExchange(&started, 1)) CreateThread(NULL, 0, getctl_summary, NULL, 0, NULL);
+    census_n(getters, &ngetters, 256, (uint64_t)id << 56 | (c->x[30] & 0xFFFFFFFFFFFFull), "input property getter", id);
+}
+ENTRY_HOOK(0x09bcc260) { getter_hit(c, 0x60); return 0; }   /* float [152] */
+ENTRY_HOOK(0x09bcc26c) { getter_hit(c, 0x6c); return 0; }   /* float [168] compared */
+ENTRY_HOOK(0x09bcc280) { getter_hit(c, 0x80); return 0; }   /* float [152] compared */
+ENTRY_HOOK(0x09bcc29c) { getter_hit(c, 0x9c); return 0; }   /* vec2 [264] */
+ENTRY_HOOK(0x09bcc2b0) { getter_hit(c, 0xb0); return 0; }   /* float [120] */
+ENTRY_HOOK(0x09bcc2bc) { getter_hit(c, 0xbc); return 0; }   /* float [104] */
+ENTRY_HOOK(0x09bcc2c8) { getter_hit(c, 0xc8); return 0; }   /* float [136] */
+ENTRY_HOOK(0x09bcc2ec) { getter_hit(c, 0xec); return 0; }   /* float [184] compared */
+ENTRY_HOOK(0x09bcc300) { getter_hit(c, 0x00); return 0; }   /* float [216] compared */
+ENTRY_HOOK(0x09bcc31c) { getter_hit(c, 0x1c); return 0; }   /* vec2 [280] */
 #endif
