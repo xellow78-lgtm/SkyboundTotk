@@ -139,6 +139,7 @@ void hos_bind_defaults(Bindings *b) {
     b->mouse_sens = 1.0;
     b->walk_scale = 0.4;
     b->mouse_pitch = 1.0;
+    b->mouse_hold = 1.0;
 }
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -182,6 +183,7 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "mouse_invert_y")) { b->mouse_invert_y = atoi(v) != 0; continue; }
         if (!_stricmp(k, "walk_speed")) { b->walk_scale = atof(v); continue; }
         if (!_stricmp(k, "mouse_vertical_speed")) { b->mouse_pitch = atof(v); continue; }
+        if (!_stricmp(k, "mouse_ultrahand_holding_speed")) { b->mouse_hold = atof(v); continue; }
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -200,6 +202,7 @@ static void load(Bindings *b) {
     if (b->mouse_sens > 20) b->mouse_sens = 20;
     if (b->walk_scale < 0.1 || b->walk_scale > 1) b->walk_scale = 0.4;
     if (!(b->mouse_pitch >= 0.25 && b->mouse_pitch <= 2.5)) b->mouse_pitch = 1.0;
+    if (!(b->mouse_hold >= 0.25 && b->mouse_hold <= 4)) b->mouse_hold = 1.0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -211,8 +214,9 @@ static void save(const Bindings *b) {
     fprintf(f, "# SkyboundTOTK keyboard and mouse bindings. F1 in the game opens the editor; or edit this file (game\n"
                "# closed). Up to %d keys an action, separated by commas; nothing after = unbinds. Mouse buttons are\n"
                "# Mouse1 (left) .. Mouse5, the wheel WheelUp / WheelDown.\n\n", BIND_SLOTS);
-    fprintf(f, "mouse_camera = %d\nmouse_sensitivity = %.3f\nmouse_vertical_speed = %.2f\nmouse_invert_y = %d\n"
-               "walk_speed = %.2f\n\n", b->mouse_camera, b->mouse_sens, b->mouse_pitch, b->mouse_invert_y, b->walk_scale);
+    fprintf(f, "mouse_camera = %d\nmouse_sensitivity = %.3f\nmouse_vertical_speed = %.2f\n"
+               "mouse_ultrahand_holding_speed = %.2f\nmouse_invert_y = %d\nwalk_speed = %.2f\n\n", b->mouse_camera,
+               b->mouse_sens, b->mouse_pitch, b->mouse_hold, b->mouse_invert_y, b->walk_scale);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)
