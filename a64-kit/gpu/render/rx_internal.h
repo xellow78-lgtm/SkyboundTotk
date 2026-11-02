@@ -398,6 +398,7 @@ struct SceneCamera {
 extern SceneCamera scene_camera, scene_camera_prev;
 extern WGPUTexture scene_depth;         // the G-buffer's depth (a reference held), for the motion vectors
 extern WGPUTexture scene_color;         // its HDR colour target (rx_fsr2.cpp)
+extern WGPUTexture scene_mask;          // its object channel target (rx_fsr2.cpp)
 /// FSR 2 (rx_fsr2.cpp): the 3D draws' jitter; the game's scale-up draw replaced (true: skip it)
 bool fsr2_jitter(uint32_t w, uint32_t h, float* ndc_x, float* ndc_y);
 bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_count);

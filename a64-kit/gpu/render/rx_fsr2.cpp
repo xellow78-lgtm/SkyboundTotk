@@ -130,7 +130,8 @@ struct State {
     WGPUBindGroup blit_groups[kRing] = {};
     // resources (sizes: the scene's largest render size, the display's)
     uint32_t mw = 0, mh = 0, dw = 0, dh = 0;
-    Tex prepared, dil_mv[2], dil_depth, lock[2], lock_luma, new_locks, up[2], lum, luma_hist[2], dil_reactive, mv, out;
+    Tex prepared, dil_mv[2], dil_depth, lock[2], lock_luma, new_locks, up[2], lum, luma_hist[2], dil_reactive, mv, out,
+        reactive;
     WGPUTextureView lum_mip4 = nullptr, lum_mip5 = nullptr;
     Tex lanczos, bias, def_reactive, def_exposure, auto_exposure, dummy;
     WGPUBuffer rec_depth = nullptr, spd_atomic = nullptr;
@@ -151,9 +152,15 @@ struct M { inv_cur: mat4x4<f32>, vp_prev: mat4x4<f32>, size: vec4<f32>, dz: vec4
 @group(0) @binding(0) var dep: texture_depth_2d;
 @group(0) @binding(1) var<uniform> m: M;
 @group(0) @binding(2) var mv: texture_storage_2d<rg16float, write>;
+@group(0) @binding(3) var objects: texture_2d<f32>;
+@group(0) @binding(4) var reactive: texture_storage_2d<r8unorm, write>;
 @compute @workgroup_size(8, 8, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (f32(id.x) >= m.size.x || f32(id.y) >= m.size.y) { return; }
   let q = vec2<i32>(id.xy);
+  // (the G-buffer's object channel: Link and what he holds marked over 100 of 255; the camera's motion is not
+  // theirs, so FSR keeps less of their history there)
+  let o = textureLoad(objects, q, 0).g;
+  textureStore(reactive, q, vec4<f32>(select(0.0, m.dz.z, o > 0.4), 0.0, 0.0, 0.0));
   // (the pixel's unjittered position: the jitter moved the image by size.zw pixels)
   let uv = (vec2<f32>(id.xy) + 0.5 - m.size.zw) / m.size.xy;
   let d = textureLoad(dep, q, 0);
@@ -283,7 +290,16 @@ bool init_pipelines() {
         }
     }
     {
-        WGPUBindGroupLayoutEntry e[3]{};
+        WGPUBindGroupLayoutEntry e[5]{};
+        e[3].binding = 3;
+        e[3].visibility = WGPUShaderStage_Compute;
+        e[3].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+        e[3].texture.viewDimension = WGPUTextureViewDimension_2D;
+        e[4].binding = 4;
+        e[4].visibility = WGPUShaderStage_Compute;
+        e[4].storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
+        e[4].storageTexture.format = WGPUTextureFormat_R8Unorm;
+        e[4].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
         e[0].binding = 0;
         e[0].visibility = WGPUShaderStage_Compute;
         e[0].texture.sampleType = WGPUTextureSampleType_Depth;
@@ -297,7 +313,7 @@ bool init_pipelines() {
         e[2].storageTexture.format = WGPUTextureFormat_RG16Float;
         e[2].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
         WGPUBindGroupLayoutDescriptor bd{};
-        bd.entryCount = 3;
+        bd.entryCount = 5;
         bd.entries = e;
         st.mv_layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
         scope_push();
@@ -361,7 +377,7 @@ bool init_pipelines() {
 void free_sized() {
     for (Tex* t : {&st.prepared, &st.dil_mv[0], &st.dil_mv[1], &st.dil_depth, &st.lock[0], &st.lock[1], &st.lock_luma,
                    &st.new_locks, &st.up[0], &st.up[1], &st.lum, &st.luma_hist[0], &st.luma_hist[1], &st.dil_reactive,
-                   &st.mv, &st.out})
+                   &st.mv, &st.out, &st.reactive})
         free_tex(*t);
     if (st.lum_mip4) wgpuTextureViewRelease(st.lum_mip4), st.lum_mip4 = nullptr;
     if (st.lum_mip5) wgpuTextureViewRelease(st.lum_mip5), st.lum_mip5 = nullptr;
@@ -384,6 +400,7 @@ void ensure_sized(uint32_t mw, uint32_t mh, uint32_t dw, uint32_t dh) {
     st.new_locks = make_tex("FSR2 new locks", WGPUTextureFormat_R8Unorm, dw, dh);
     st.dil_reactive = make_tex("FSR2 dilated reactive", WGPUTextureFormat_RG8Unorm, mw, mh);
     st.mv = make_tex("FSR2 motion vectors", WGPUTextureFormat_RG16Float, mw, mh);
+    st.reactive = make_tex("FSR2 reactive", WGPUTextureFormat_R8Unorm, mw, mh);
     st.out = make_tex("FSR2 output", WGPUTextureFormat_RGBA16Float, dw, dh);
     const uint32_t lw = std::max(1u, mw / 2), lh = std::max(1u, mh / 2);
     uint32_t mips = 1;
@@ -450,6 +467,7 @@ extern SceneCamera scene_camera, scene_camera_prev;
 extern WGPUTexture scene_depth;
 void flush_clears_now();   // (rx_core.cpp)
 WGPUTexture scene_color;   // the G-buffer's HDR colour target (a reference held: rx_draw.cpp)
+WGPUTexture scene_mask;    // its first target (RGBA8): green marks Link and what he holds
 
 /// The jitter for a draw into a w x h target with a depth buffer: in NDC, added to the vertex position's x and y
 /// (times w); false when it gets none (FSR 2 off, or not the scene's size).
@@ -576,7 +594,8 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         for (int r = 0; r < 4; r++)
             for (int k = 0; k < 4; k++) mc.inv_cur[k * 4 + r] = (float)ic[r * 4 + k], mc.vp_prev[k * 4 + r] = (float)vp[r * 4 + k];
         mc.size[0] = (float)rw, mc.size[1] = (float)rh, mc.size[2] = c.jitter[0], mc.size[3] = c.jitter[1];
-        mc.dz[0] = cur.depth_a != 0 ? cur.depth_a : 1, mc.dz[1] = cur.depth_b, mc.dz[3] = 1;
+        static const float reactive = getenv("RX_FSR2_REACTIVE") ? (float)atof(getenv("RX_FSR2_REACTIVE")) : 0.9f;
+        mc.dz[0] = cur.depth_a != 0 ? cur.depth_a : 1, mc.dz[1] = cur.depth_b, mc.dz[2] = scene_mask ? reactive : 0, mc.dz[3] = 1;
     }
     wgpuQueueWriteBuffer(dev.queue, st.cb_mv[slot], 0, &mc, sizeof mc);
 
@@ -595,6 +614,11 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     cv.arrayLayerCount = 1;
     cv.aspect = WGPUTextureAspect_All;
     WGPUTextureView color_v = wgpuTextureCreateView(scene_color, &cv);
+    WGPUTextureView mask_v = nullptr;
+    if (scene_mask) {
+        cv.format = wgpuTextureGetFormat(scene_mask);
+        mask_v = wgpuTextureCreateView(scene_mask, &cv);
+    }
 
     const int cur_i = odd ? 1 : 0, prev_i = odd ? 0 : 1;    // dilated motion vectors: this frame's, the last's
     const int lock_srv = odd ? 1 : 0, lock_uav = odd ? 0 : 1;
@@ -604,7 +628,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         struct { const char* n; WGPUTextureView v; } m[] = {
             {"r_input_color_jittered", color_v}, {"r_input_depth", depth_v}, {"r_input_motion_vectors", st.mv.v},
             {"r_input_exposure", st.def_exposure.v}, {"r_auto_exposure", st.auto_exposure.v},
-            {"rw_auto_exposure", st.auto_exposure.v}, {"r_reactive_mask", st.def_reactive.v},
+            {"rw_auto_exposure", st.auto_exposure.v}, {"r_reactive_mask", st.reactive.v},
             {"r_transparency_and_composition_mask", st.def_reactive.v}, {"r_dilated_reactive_masks", st.dil_reactive.v},
             {"rw_dilated_reactive_masks", st.dil_reactive.v}, {"r_prepared_input_color", st.prepared.v},
             {"rw_prepared_input_color", st.prepared.v}, {"r_dilated_motion_vectors", st.dil_mv[cur_i].v},
@@ -631,7 +655,8 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     };
     std::vector<Job> jobs;
     jobs.push_back({st.mv_pipe, st.mv_layout, nullptr,
-                    {tex_entry(0, depth_v), buf_entry(1, st.cb_mv[slot], sizeof(MvConstants)), tex_entry(2, st.mv.v)},
+                    {tex_entry(0, depth_v), buf_entry(1, st.cb_mv[slot], sizeof(MvConstants)), tex_entry(2, st.mv.v),
+                     tex_entry(3, mask_v ? mask_v : st.dummy.v), tex_entry(4, st.reactive.v)},
                     {}, (rw + 7) / 8, (rh + 7) / 8});
     std::vector<WGPUBindGroupEntry> samplers(2);
     samplers[0] = {};
@@ -725,6 +750,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     if (!ok) {
         wgpuTextureViewRelease(depth_v);
         wgpuTextureViewRelease(color_v);
+        if (mask_v) wgpuTextureViewRelease(mask_v);
         st.init_failed = true;
         return false;
     }
@@ -741,6 +767,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     cp_end(cp);
     wgpuTextureViewRelease(depth_v);   // (after the recording took its references, not before: it uses them)
     wgpuTextureViewRelease(color_v);
+    if (mask_v) wgpuTextureViewRelease(mask_v);
     // the result into the game's target, where its scale-up would have drawn
     {
         if (st.blit_groups[slot]) wgpuBindGroupRelease(st.blit_groups[slot]);

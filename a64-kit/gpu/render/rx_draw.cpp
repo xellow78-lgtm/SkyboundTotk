@@ -3906,6 +3906,11 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
                     scene_color = ci->tex;
                     break;
                 }
+            if (Image* m = at.color[0]; m && m->tex && m->format == WGPUTextureFormat_RGBA8Unorm && m->tex != scene_mask) {
+                wgpuTextureAddRef(m->tex);   // (FSR 2's reactive mask: the G-buffer's object channel)
+                if (scene_mask) wgpuTextureRelease(scene_mask);
+                scene_mask = m->tex;
+            }
             if (at.depth && at.depth->tex && at.depth->tex != scene_depth) {
                 wgpuTextureAddRef(at.depth->tex);
                 if (scene_depth) wgpuTextureRelease(scene_depth);
