@@ -3867,9 +3867,10 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     }
     // The scene camera (groundwork for FSR 2 / DLSS: motion vectors from depth and the camera): the game's view
     // constants (2368 bytes: view 3x4, view-projection 4x4, projection 4x4, inverse view 3x4, near / far, ...) as the
-    // first depth-tested draw of a frame into the G-buffer (4+ color targets, 1200+ wide) has them in its
-    // constant buffer 1; this frame's and the last one's are kept. A frame dump logs both.
-    if (targets.size() >= 4 && s.ds.dt && s.viewport[0][2] >= 1200 && scene_camera.frame != frame_number) {
+    // first depth-tested draw of a frame into the G-buffer (4+ color targets 1200+ wide, the viewport 320+ wide: the
+    // scene, at whatever size dynamic resolution or HOS_RENDER_SCALE gives it) has them in its constant buffer 1;
+    // this frame's and the last one's are kept. A frame dump logs both.
+    if (targets.size() >= 4 && s.ds.dt && at.width >= 1200 && s.viewport[0][2] >= 320 && scene_camera.frame != frame_number) {
         const auto& u = s.ubo[0][1].addr ? s.ubo[0][1] : s.ubo[1][1];
         if (u.addr && u.size == sizeof scene_camera.v) {
             scene_camera_prev = scene_camera;

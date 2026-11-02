@@ -146,6 +146,8 @@ static void grab(void) {
 }
 
 const char *rx_present_hotkey(int key);   /* gpu/render/rx_present_fx.cpp */
+static char render_notice[96];               /* the 3D resolution mode (F4), shown in the title until then */
+static int64_t render_notice_until;
 static int64_t present_notice_until;         /* the present settings shown in the title until then (a hotkey) */
 static void update_title(void) {
     static int64_t last_t, last_presents, last_draws;
@@ -179,6 +181,10 @@ static void update_title(void) {
     if (renderer && t < present_notice_until) {
         strncat(title, "  |  ", sizeof title - strlen(title) - 1);
         strncat(title, rx_present_hotkey(0), sizeof title - strlen(title) - 1);
+    }
+    if (renderer && t < render_notice_until) {
+        strncat(title, "  |  ", sizeof title - strlen(title) - 1);
+        strncat(title, render_notice, sizeof title - strlen(title) - 1);
     }
     SetWindowTextA(hwnd, title);
     last_t = t;
@@ -228,6 +234,12 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_F5 && !(lp & (1 << 30))) {   /* (debugging: 15 s of the sampling profiler, from now) */
             void hos_profile_start(int seconds);   /* hos_prof.c */
             hos_profile_start(15);
+        }
+        if (wp == VK_F4 && !(lp & (1 << 30)) && renderer) {   /* the 3D scene's resolution mode (totk_drs.c) */
+            const char *hos_render_mode_cycle(void);
+            snprintf(render_notice, sizeof render_notice, "%s", hos_render_mode_cycle());
+            render_notice_until = hos_now_ns() + 4000000000LL;
+            update_title();
         }
         if (wp == VK_F12 && !(lp & (1 << 30)) && renderer) {   /* (debugging: the next frame's passes and targets) */
             void rx_request_frame_dump(void);   /* gpu/render/rx_debug.cpp */

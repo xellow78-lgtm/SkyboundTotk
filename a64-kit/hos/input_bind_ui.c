@@ -102,7 +102,7 @@ static void bind_to(int code) {
 }
 
 /* Keys the game window uses itself: not bindable (Esc is cancel here; F1 this window; F6-F11 display settings) */
-static int reserved(int vk) { return vk == VK_ESCAPE || vk == VK_F1 || (vk >= VK_F6 && vk <= VK_F11); }
+static int reserved(int vk) { return vk == VK_ESCAPE || vk == VK_F1 || vk == VK_F4 || (vk >= VK_F6 && vk <= VK_F11); }
 
 static void listen_tick(void) {
     uint8_t now[256];
