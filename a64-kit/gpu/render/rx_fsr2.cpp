@@ -131,6 +131,7 @@ struct State {
     // resources (sizes: the scene's largest render size, the display's)
     uint32_t mw = 0, mh = 0, dw = 0, dh = 0;
     uint32_t last_rw = 0, last_rh = 0;   // (the last frame's render size: logged when it changes)
+    uint32_t cw = 0, ch = 0;             // the scene's targets' size last frame (draws into them get the jitter)
     Tex prepared, dil_mv[2], dil_depth, lock[2], lock_luma, new_locks, up[2], lum, luma_hist[2], dil_reactive, mv, out,
         reactive;
     WGPUTextureView lum_mip4 = nullptr, lum_mip5 = nullptr;
@@ -386,6 +387,9 @@ void free_sized() {
 }
 
 void ensure_sized(uint32_t mw, uint32_t mh, uint32_t dw, uint32_t dh) {
+    // (only ever larger: the game draws each resolution level into targets of its own size, and the level can change
+    // every few frames; FSR 2's own resources at the largest render size seen take any size up to it)
+    if (st.out.t && st.dw == dw && st.dh == dh) mw = std::max(mw, st.mw), mh = std::max(mh, st.mh);
     if (st.mw == mw && st.mh == mh && st.dw == dw && st.dh == dh && st.out.t) return;
     free_sized();
     st.mw = mw, st.mh = mh, st.dw = dw, st.dh = dh;
@@ -411,8 +415,8 @@ void ensure_sized(uint32_t mw, uint32_t mh, uint32_t dw, uint32_t dh) {
     st.lum_mip5 = mip_view(st.lum, std::min(5u, mips - 1));
     st.rec_depth = make_buffer((uint64_t)mw * mh * 4, WGPUBufferUsage_Storage);
     st.reset = true;
-    for (WGPUBindGroup& g : st.blit_groups)
-        if (g) wgpuBindGroupRelease(g), g = nullptr;
+    // (the blit groups stay: recorded passes not yet replayed use them, and rp_set_bind_group does not hold them; the
+    // ring replaces each after kRing frames, and a group keeps its own reference to the old output)
     hos_log("rx: FSR 2: scene up to %ux%u -> %ux%u", mw, mh, dw, dh);
 }
 
@@ -475,7 +479,7 @@ WGPUTexture scene_mask;    // its first target (RGBA8): green marks Link and wha
 bool fsr2_jitter(uint32_t w, uint32_t h, float* ndc_x, float* ndc_y) {
     if (!fsr2_on() || frame_number - st.last_fsr_frame > 2) return false;
     static const bool off = getenv("RX_FSR2_JITTER") && *getenv("RX_FSR2_JITTER") == '0';
-    if (off || !st.mw || w != st.mw || h != st.mh) return false;
+    if (off || !st.cw || w != st.cw || h != st.ch) return false;
     if (st.jitter_frame != frame_number) {
         st.jitter_frame = frame_number;
         st.jitter_index++;
@@ -507,6 +511,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     }
     const uint32_t mw = wgpuTextureGetWidth(scene_color), mh = wgpuTextureGetHeight(scene_color);
     const uint32_t dw = at.width, dh = at.height;
+    st.cw = mw, st.ch = mh;
     const uint32_t rw = (uint32_t)cur.width, rh = (uint32_t)cur.height;
     if (!rw || !rh || rw > mw || rh > mh || wgpuTextureGetWidth(scene_depth) < rw || dw < rw) {
         static int lines;
@@ -562,11 +567,11 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     const float q = far_ / (near_ - far_);
     Constants c{};
     c.render_size[0] = (int32_t)rw, c.render_size[1] = (int32_t)rh;
-    c.max_render_size[0] = (int32_t)mw, c.max_render_size[1] = (int32_t)mh;
+    c.max_render_size[0] = (int32_t)st.mw, c.max_render_size[1] = (int32_t)st.mh;   // (its own resources' size)
     c.display_size[0] = (int32_t)dw, c.display_size[1] = (int32_t)dh;
     c.input_color_dims[0] = (int32_t)mw, c.input_color_dims[1] = (int32_t)mh;
     c.luma_mip_level = 4;
-    c.luma_mip_dims[0] = (int32_t)(mw / 32), c.luma_mip_dims[1] = (int32_t)(mh / 32);
+    c.luma_mip_dims[0] = (int32_t)(st.mw / 32), c.luma_mip_dims[1] = (int32_t)(st.mh / 32);
     c.frame_index = st.reset ? 0 : (int32_t)st.dispatches;
     c.device_to_view_depth[0] = -q;   // (ffx_fsr2.cpp, not inverted, not infinite: d = -1 times c, then e)
     c.device_to_view_depth[1] = q * near_;
@@ -689,7 +694,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
                                        spd_cb ? sizeof(SpdConstants) : rcas_cb ? sizeof(RcasConstants) : sizeof(Constants)));
             } else if (b.kind == kStorageRO || b.kind == kStorageRW) {
                 const bool spd = !std::strncmp(b.name, "SpdAtomic", 9);
-                ge.push_back(buf_entry(b.binding, spd ? st.spd_atomic : st.rec_depth, spd ? 16 : (uint64_t)mw * mh * 4));
+                ge.push_back(buf_entry(b.binding, spd ? st.spd_atomic : st.rec_depth, spd ? 16 : (uint64_t)st.mw * st.mh * 4));
             } else {
                 WGPUTextureView v = view_for(b.name);
                 if (!v) {
