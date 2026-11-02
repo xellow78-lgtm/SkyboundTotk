@@ -132,7 +132,7 @@ struct State {
     uint32_t mw = 0, mh = 0, dw = 0, dh = 0;
     Tex prepared, dil_mv[2], dil_depth, lock[2], lock_luma, new_locks, up[2], lum, luma_hist[2], dil_reactive, mv, out;
     WGPUTextureView lum_mip4 = nullptr, lum_mip5 = nullptr;
-    Tex lanczos, bias, def_reactive, def_exposure, auto_exposure;
+    Tex lanczos, bias, def_reactive, def_exposure, auto_exposure, dummy;
     WGPUBuffer rec_depth = nullptr, spd_atomic = nullptr;
     WGPUBuffer cb[kRing] = {}, cb_spd[kRing] = {}, cb_rcas[kRing] = {}, cb_mv[kRing] = {};
     int64_t dispatches = 0;   // (FSR frames: the ping-pong side and the ring slot)
@@ -353,6 +353,7 @@ bool init_pipelines() {
     const float ae[2] = {-1.0f, 1e8f};
     upload(st.auto_exposure, ae, 8);
     st.spd_atomic = make_buffer(16, WGPUBufferUsage_Storage);
+    st.dummy = make_tex("FSR2 stand-in", WGPUTextureFormat_RGBA16Float, 1, 1, 1, false);
     hos_log("rx: FSR 2 ready (sharpness %.2f)", getenv("RX_FSR2_SHARPNESS") ? atof(getenv("RX_FSR2_SHARPNESS")) : 0.5);
     return true;
 }
@@ -621,32 +622,22 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         return nullptr;
     };
 
-    flush_clears_now();   // (a clear of the target still waiting would be folded into the pass after the blit)
-    end_render_pass("fsr2");
-    WGPUCommandEncoder e = encoder();
-    WGPUComputePassEncoder cp = ce_begin_compute_pass(e);
-    // the motion vectors
-    {
-        WGPUBindGroupEntry ge[3] = {tex_entry(0, depth_v), buf_entry(1, st.cb_mv[slot], sizeof(MvConstants)),
-                                    tex_entry(2, st.mv.v)};
-        if (!st.validated) {
-            scope_push();
-            WGPUBindGroupDescriptor bd{};
-            bd.layout = st.mv_layout;
-            bd.entryCount = 3;
-            bd.entries = ge;
-            WGPUBindGroup g = wgpuDeviceCreateBindGroup(dev.device, &bd);
-            if (g) wgpuBindGroupRelease(g);
-            const std::string err = scope_pop();
-            if (!err.empty()) hos_log("rx: FSR 2: the motion vector pass's resources do not fit. %s", err.c_str());
-        }
-        cp_set_pipeline(cp, st.mv_pipe);
-        cp_set_bind_group_desc(cp, 0, st.mv_layout, ge, 3);
-        cp_dispatch(cp, (rw + 7) / 8, (rh + 7) / 8, 1);
-    }
-    WGPUBindGroupEntry samplers[2]{};
+    // ---- the dispatches: the motion vectors, then FSR 2's six passes ----
+    struct Job {
+        WGPUComputePipeline pipe;
+        WGPUBindGroupLayout layout0, layout1;
+        std::vector<WGPUBindGroupEntry> e0, e1;
+        uint32_t gx, gy;
+    };
+    std::vector<Job> jobs;
+    jobs.push_back({st.mv_pipe, st.mv_layout, nullptr,
+                    {tex_entry(0, depth_v), buf_entry(1, st.cb_mv[slot], sizeof(MvConstants)), tex_entry(2, st.mv.v)},
+                    {}, (rw + 7) / 8, (rh + 7) / 8});
+    std::vector<WGPUBindGroupEntry> samplers(2);
+    samplers[0] = {};
     samplers[0].binding = 0;
     samplers[0].sampler = st.point;
+    samplers[1] = {};
     samplers[1].binding = 1;
     samplers[1].sampler = st.linear;
     bool ok = true;
@@ -673,39 +664,81 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
             }
         }
         if (!ok) break;
+        // A texture both read and written in one dispatch is a conflict WebGPU refuses (depth_clip declares the
+        // prepared colour it writes as an input too, unused): the read side gets a 1x1 stand-in
+        for (int i = 0; i < ps.nbindings; i++) {
+            if (ps.bindings[i].kind != kTexture) continue;
+            for (WGPUBindGroupEntry& a : ge) {
+                if (a.binding != ps.bindings[i].binding) continue;
+                for (int k = 0; k < ps.nbindings; k++) {
+                    if (ps.bindings[k].kind != kStorageTexture) continue;
+                    for (const WGPUBindGroupEntry& w : ge)
+                        if (w.binding == ps.bindings[k].binding && w.textureView == a.textureView) a.textureView = st.dummy.v;
+                }
+            }
+        }
         uint32_t gx, gy;
         if (p == 0) gx = (rw - 1) / 64 + 1, gy = (rh - 1) / 64 + 1;                 // luminance pyramid (SPD)
         else if (p <= 3) gx = (rw + 7) / 8, gy = (rh + 7) / 8;                    // reconstruct, depth clip, lock
         else if (p == 4) gx = (dw + 7) / 8, gy = (dh + 7) / 8;                    // accumulate
         else gx = (dw + 15) / 16, gy = (dh + 15) / 16;                            // RCAS
-        if (!st.validated) {   // (once: each pass's group made here, so a mistake turns FSR 2 off instead)
-            scope_push();
-            WGPUBindGroupDescriptor bd{};
-            bd.layout = st.pass[p].layout;
-            bd.entryCount = ge.size();
-            bd.entries = ge.data();
-            WGPUBindGroup g = wgpuDeviceCreateBindGroup(dev.device, &bd);
-            if (g) wgpuBindGroupRelease(g);
-            const std::string err = scope_pop();
-            if (!err.empty()) {
-                hos_log("rx: FSR 2: pass %s: its resources do not fit: off. %s", ps.name, err.c_str());
-                ok = false;
-                break;
-            }
-        }
-        cp_set_pipeline(cp, st.pass[p].pipe);
-        cp_set_bind_group_desc(cp, 0, st.samplers_layout, samplers, 2);
-        cp_set_bind_group_desc(cp, 1, st.pass[p].layout, ge.data(), ge.size());
-        cp_dispatch(cp, gx, gy, 1);
+        jobs.push_back({st.pass[p].pipe, st.samplers_layout, st.pass[p].layout, samplers, ge, gx, gy});
     }
-    cp_end(cp);
-    st.validated = st.validated || ok;
+    // Once: the whole sequence encoded on an encoder of its own (never submitted) under an error scope, so a
+    // mistake (a group that does not fit, a texture read and written at once) turns FSR 2 off and the game's own
+    // scale-up runs, instead of the frame's commands being refused every frame
+    if (ok && !st.validated) {
+        scope_push();
+        WGPUCommandEncoder te = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
+        WGPUComputePassEncoder tp = wgpuCommandEncoderBeginComputePass(te, nullptr);
+        std::vector<WGPUBindGroup> groups;
+        for (const Job& j : jobs) {
+            wgpuComputePassEncoderSetPipeline(tp, j.pipe);
+            for (int g = 0; g < 2; g++) {
+                const auto& en = g ? j.e1 : j.e0;
+                if (!(g ? j.layout1 : j.layout0)) continue;
+                WGPUBindGroupDescriptor bd{};
+                bd.layout = g ? j.layout1 : j.layout0;
+                bd.entryCount = en.size();
+                bd.entries = en.data();
+                groups.push_back(wgpuDeviceCreateBindGroup(dev.device, &bd));
+                wgpuComputePassEncoderSetBindGroup(tp, g, groups.back(), 0, nullptr);
+            }
+            wgpuComputePassEncoderDispatchWorkgroups(tp, j.gx, j.gy, 1);
+        }
+        wgpuComputePassEncoderEnd(tp);
+        wgpuComputePassEncoderRelease(tp);
+        WGPUCommandBuffer cb = wgpuCommandEncoderFinish(te, nullptr);
+        if (cb) wgpuCommandBufferRelease(cb);
+        wgpuCommandEncoderRelease(te);
+        for (WGPUBindGroup g : groups)
+            if (g) wgpuBindGroupRelease(g);
+        const std::string err = scope_pop();
+        if (!err.empty()) {
+            hos_log("rx: FSR 2: its passes do not check out: off (the game's scale-up instead). %s", err.c_str());
+            ok = false;
+        } else {
+            hos_log("rx: FSR 2: its passes check out");
+            st.validated = true;
+        }
+    }
     wgpuTextureViewRelease(depth_v);
     wgpuTextureViewRelease(color_v);
     if (!ok) {
         st.init_failed = true;
         return false;
     }
+    flush_clears_now();   // (a clear of the target still waiting would be folded into the pass after the blit)
+    end_render_pass("fsr2");
+    WGPUCommandEncoder e = encoder();
+    WGPUComputePassEncoder cp = ce_begin_compute_pass(e);
+    for (const Job& j : jobs) {
+        cp_set_pipeline(cp, j.pipe);
+        cp_set_bind_group_desc(cp, 0, j.layout0, j.e0.data(), j.e0.size());
+        if (j.layout1) cp_set_bind_group_desc(cp, 1, j.layout1, j.e1.data(), j.e1.size());
+        cp_dispatch(cp, j.gx, j.gy, 1);
+    }
+    cp_end(cp);
     // the result into the game's target, where its scale-up would have drawn
     {
         if (st.blit_groups[slot]) wgpuBindGroupRelease(st.blit_groups[slot]);
