@@ -24,7 +24,14 @@ typedef struct {
     double walk_scale;                     /* the left stick while walk is held, 0.1 .. 1 */
     double mouse_pitch;                    /* the mouse camera's up / down speed over its left / right, 0.25 .. 2.5 */
     double mouse_hold;                     /* the mouse's speed while Ultrahand holds something, 0.25 .. 4 */
+    int render_mode;                       /* the 3D resolution (totk_drs.c): 0 the game's own, 1 Quality .. 4 Ultra
+                                              Performance (not a binding, but saved with them: F1 shows it) */
 } Bindings;
+
+/* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
+int hos_render_mode_count(void);
+const char *hos_render_mode_name(int mode);
+void hos_render_mode_apply(int mode);
 
 /* A copy of the current bindings (loaded from <user>/input.ini on first use). */
 void hos_bind_get(Bindings *out);

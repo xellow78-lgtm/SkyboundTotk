@@ -3867,10 +3867,15 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     }
     // The scene camera (groundwork for FSR 2 / DLSS: motion vectors from depth and the camera): the game's view
     // constants (2368 bytes: view 3x4, view-projection 4x4, projection 4x4, inverse view 3x4, near / far, ...) as the
-    // first depth-tested draw of a frame into the G-buffer (4+ color targets 1200+ wide, the viewport 320+ wide: the
-    // scene, at whatever size dynamic resolution or HOS_RENDER_SCALE gives it) has them in its constant buffer 1;
-    // this frame's and the last one's are kept. A frame dump logs both.
-    if (targets.size() >= 4 && s.ds.dt && at.width >= 1200 && s.viewport[0][2] >= 320 && scene_camera.frame != frame_number) {
+    // first depth-tested draw of a frame into the G-buffer (4+ color targets, a 16:9 viewport 320+ wide: the scene,
+    // at whatever size dynamic resolution or the 3D resolution setting gives it; the game then draws into targets
+    // of about that size, not always 1600x896) has them in its constant buffer 1; this frame's and the last one's
+    // are kept. A frame dump logs both.
+    if (targets.size() >= 4 && s.ds.dt && s.viewport[0][2] >= 320 && s.viewport[0][3] >= 180 &&
+        std::fabs(s.viewport[0][2] / s.viewport[0][3] - 16.0f / 9.0f) < 0.1f && scene_camera.frame != frame_number &&
+        at.color[0] && at.color[0]->format == WGPUTextureFormat_RGBA8Unorm &&
+        std::any_of(std::begin(at.color), std::end(at.color),
+                    [](const Image* ci) { return ci && ci->format == WGPUTextureFormat_RG11B10Ufloat; })) {
         const auto& u = s.ubo[0][1].addr ? s.ubo[0][1] : s.ubo[1][1];
         if (u.addr && u.size == sizeof scene_camera.v) {
             scene_camera_prev = scene_camera;
@@ -3896,6 +3901,12 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
             }
             scene_camera.frame = frame_number;
             scene_camera.addr = u.addr;
+            if (scene_camera.width != s.viewport[0][2] || scene_camera.height != s.viewport[0][3]) {
+                static int lines;
+                if (lines++ < 200)
+                    hos_log("rx: the 3D scene is now %gx%g (in %ux%u targets)", s.viewport[0][2], s.viewport[0][3],
+                            at.width, at.height);
+            }
             scene_camera.width = s.viewport[0][2], scene_camera.height = s.viewport[0][3];
             const bool mw = nvn_depth_minus_w() != 0;
             scene_camera.depth_a = mw ? (s.depth_far - s.depth_near) * 0.5f : s.depth_far - s.depth_near;

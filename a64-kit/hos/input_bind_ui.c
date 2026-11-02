@@ -16,7 +16,7 @@
 
 enum {
     ID_BIND = 1000,          /* + act * BIND_SLOTS + slot */
-    ID_MOUSE_CAMERA = 2000, ID_INVERT, ID_SENS, ID_SENS_LABEL, ID_WALK, ID_WALK_LABEL, ID_PITCH, ID_PITCH_LABEL, ID_HOLD, ID_HOLD_LABEL, ID_DEFAULTS, ID_CLOSE,
+    ID_MOUSE_CAMERA = 2000, ID_INVERT, ID_SENS, ID_SENS_LABEL, ID_WALK, ID_WALK_LABEL, ID_PITCH, ID_PITCH_LABEL, ID_HOLD, ID_HOLD_LABEL, ID_RES, ID_RES_LABEL, ID_DEFAULTS, ID_CLOSE,
     ID_STATUS,
     TIMER_LISTEN = 1
 };
@@ -28,8 +28,9 @@ static int dpi = 96;
 static int listen_act = -1, listen_slot, listen_armed;
 static uint8_t listen_prev[256];
 
-/* the status line and the buttons: under the mouse settings (right column: 9 rows, then 262 px of them) */
-enum { BOTTOM_Y = 36 + 9 * 28 + 14 + 262 + 12 };
+/* the status line and the buttons: under the mouse and graphics settings (right column: 9 rows, then 346 px of
+   them) */
+enum { BOTTOM_Y = 36 + 9 * 28 + 14 + 346 + 12 };
 
 static int S(int v) { return MulDiv(v, dpi, 96); }
 
@@ -63,6 +64,10 @@ static void refresh(void) {
     SetScrollPos(GetDlgItem(win, ID_HOLD), SB_CTL, hold, TRUE);
     snprintf(t, sizeof t, "Ultrahand holding: mouse speed: %d%% (100 = camera)", hold);
     SetDlgItemTextA(win, ID_HOLD_LABEL, t);
+    SetScrollPos(GetDlgItem(win, ID_RES), SB_CTL, b.render_mode, TRUE);
+    char r[128];
+    snprintf(r, sizeof r, "3D resolution: %s", hos_render_mode_name(b.render_mode));
+    SetDlgItemTextA(win, ID_RES_LABEL, r);
 }
 
 static void stop_listening(void) {
@@ -151,7 +156,7 @@ static HWND make(const char *cls, const char *text, DWORD style, int x, int y, i
 static void scroll(HWND bar, int code, int pos) {
     const int id = GetDlgCtrlID(bar);
     int v = GetScrollPos(bar, SB_CTL);
-    const int step = id == ID_SENS ? 5 : 5, page = id == ID_SENS ? 25 : 10;
+    const int step = id == ID_RES ? 1 : 5, page = id == ID_SENS ? 25 : id == ID_RES ? 1 : 10;
     switch (code) {
     case SB_LINELEFT: v -= step; break;
     case SB_LINERIGHT: v += step; break;
@@ -165,6 +170,10 @@ static void scroll(HWND bar, int code, int pos) {
     if (id == ID_SENS) b.mouse_sens = (v < 5 ? 5 : v > 500 ? 500 : v) / 100.0;
     else if (id == ID_PITCH) b.mouse_pitch = (v < 25 ? 25 : v > 250 ? 250 : v) / 100.0;
     else if (id == ID_HOLD) b.mouse_hold = (v < 25 ? 25 : v > 400 ? 400 : v) / 100.0;
+    else if (id == ID_RES) {
+        const int n = hos_render_mode_count();
+        b.render_mode = v < 0 ? 0 : v >= n ? n - 1 : v;
+    }
     else b.walk_scale = (v < 10 ? 10 : v > 100 ? 100 : v) / 100.0;
     hos_bind_set(&b);
     refresh();
@@ -209,6 +218,10 @@ static void layout(void) {
     make("STATIC", "", 0, mx, my + 222, 470, 20, ID_HOLD_LABEL, font);
     HWND hb = make("SCROLLBAR", "", SBS_HORZ, mx, my + 242, 460, 18, ID_HOLD, font);
     SetScrollRange(hb, SB_CTL, 25, 400, FALSE);
+    make("STATIC", "Graphics", 0, mx, my + 274, 200, 20, -1, bold);
+    make("STATIC", "", 0, mx, my + 298, 470, 20, ID_RES_LABEL, font);
+    HWND rb = make("SCROLLBAR", "", SBS_HORZ, mx, my + 318, 460, 18, ID_RES, font);
+    SetScrollRange(rb, SB_CTL, 0, hos_render_mode_count() - 1, FALSE);
     SetScrollRange(wb, SB_CTL, 10, 100, FALSE);
     const int by = BOTTOM_Y;
     status = make("STATIC", "Click a binding, then press the key or mouse button for it. Changes save at once.",
@@ -231,7 +244,9 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         else if (id == ID_INVERT) { b.mouse_invert_y = IsDlgButtonChecked(w, id) == BST_CHECKED; hos_bind_set(&b); }
         else if (id == ID_DEFAULTS) {
             stop_listening();
+            const int render_mode = b.render_mode;   /* (a graphics setting: kept) */
             hos_bind_defaults(&b);
+            b.render_mode = render_mode;
             hos_bind_set(&b);
             set_status("All bindings and mouse settings are back to the defaults.");
             refresh();

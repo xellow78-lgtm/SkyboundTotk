@@ -130,6 +130,7 @@ struct State {
     WGPUBindGroup blit_groups[kRing] = {};
     // resources (sizes: the scene's largest render size, the display's)
     uint32_t mw = 0, mh = 0, dw = 0, dh = 0;
+    uint32_t last_rw = 0, last_rh = 0;   // (the last frame's render size: logged when it changes)
     Tex prepared, dil_mv[2], dil_depth, lock[2], lock_luma, new_locks, up[2], lum, luma_hist[2], dil_reactive, mv, out,
         reactive;
     WGPUTextureView lum_mip4 = nullptr, lum_mip5 = nullptr;
@@ -507,7 +508,18 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     const uint32_t mw = wgpuTextureGetWidth(scene_color), mh = wgpuTextureGetHeight(scene_color);
     const uint32_t dw = at.width, dh = at.height;
     const uint32_t rw = (uint32_t)cur.width, rh = (uint32_t)cur.height;
-    if (!rw || !rh || rw > mw || rh > mh || wgpuTextureGetWidth(scene_depth) < rw || dw < rw) return false;
+    if (!rw || !rh || rw > mw || rh > mh || wgpuTextureGetWidth(scene_depth) < rw || dw < rw) {
+        static int lines;
+        if (lines++ < 50)
+            hos_log("rx: FSR 2 skipped a frame: scene %ux%u, its colour %ux%u, depth %u wide, output %ux%u", rw, rh,
+                    mw, mh, wgpuTextureGetWidth(scene_depth), dw, dh);
+        return false;
+    }
+    if (rw != st.last_rw || rh != st.last_rh) {
+        static int lines;
+        if (lines++ < 200) hos_log("rx: FSR 2: rendering at %ux%u -> %ux%u", rw, rh, dw, dh);
+        st.last_rw = rw, st.last_rh = rh;
+    }
     ensure_sized(mw, mh, dw, dh);
     if (st.blit_format != at.color[0]->format) {   // (the blit into the game's target, its format)
         if (st.blit) wgpuRenderPipelineRelease(st.blit);

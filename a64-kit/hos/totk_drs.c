@@ -23,8 +23,10 @@
 #include <string.h>
 
 /* The scene's size as a fraction of the full size (0 = the game's own dynamic resolution), and its modes for a
-   1920x1080 output (FSR 2 / DLSS names): HOS_RENDER_SCALE at start (a number, or quality / balanced / performance /
-   ultra), F4 to go through them (display.c). The full size is the targets' 1600x896, so nothing above it. */
+   1920x1080 output (FSR 2 / DLSS names). The setting is "render_resolution" in input.ini (the F1 window's slider,
+   input_bind.c); F4 goes to the next one; HOS_RENDER_SCALE (a number, or quality / balanced / performance / ultra)
+   overrides it at start. The full size is the targets' 1600x896, so nothing above it. */
+#include "input_bind.h"
 static const struct { const char *name; float scale; } modes[] = {
     {"the game's own (dynamic, up to 1600x896)", 0},
     {"Quality (1.5x: 1280x720)", 0.8f},
@@ -32,34 +34,45 @@ static const struct { const char *name; float scale; } modes[] = {
     {"Performance (2x: 960x540)", 0.6f},
     {"Ultra Performance (3x: 640x360)", 0.4f},
 };
+enum { NMODES = sizeof modes / sizeof *modes };
 volatile float hos_render_scale = -1;
-static int mode_now;
+int hos_render_mode_count(void) { return NMODES; }
+const char *hos_render_mode_name(int m) { return modes[m < 0 || m >= NMODES ? 0 : m].name; }
+void hos_render_mode_apply(int m) {
+    if (m < 0 || m >= NMODES) m = 0;
+    if (hos_render_scale != modes[m].scale) hos_log("drs: 3D resolution: %s", modes[m].name);
+    hos_render_scale = modes[m].scale;
+}
 static float render_scale(void) {
     if (hos_render_scale < 0) {
         const char *e = getenv("HOS_RENDER_SCALE");
-        float s = 0;
         if (e && *e) {
             static const char *const keys[] = {"", "quality", "balanced", "performance", "ultra"};
             char low[16] = {0};
             for (int i = 0; i < 15 && e[i]; i++) low[i] = (char)(e[i] | 0x20);
-            for (int i = 1; i < (int)(sizeof keys / sizeof *keys); i++)
-                if (!strncmp(low, keys[i], strlen(keys[i]))) s = modes[i].scale, mode_now = i;
+            float s = 0;
+            for (int i = 1; i < NMODES; i++)
+                if (!strncmp(low, keys[i], strlen(keys[i]))) s = modes[i].scale;
             if (!s) s = (float)atof(e);
+            hos_render_scale = s > 0.2f && s <= 1 ? s : 0;
+            hos_log("drs: the 3D scene at %.3g of its full size (HOS_RENDER_SCALE)", hos_render_scale);
+        } else {
+            Bindings b;
+            hos_bind_get(&b);   /* (loads input.ini, and applies its render_resolution) */
+            hos_render_mode_apply(b.render_mode);
         }
-        hos_render_scale = s > 0.2f && s <= 1 ? s : 0;
-        if (hos_render_scale) hos_log("drs: the 3D scene at %.3g of its full size", hos_render_scale);
     }
     return hos_render_scale;
 }
-/* F4: the next mode; its name */
+/* F4: the next mode, saved; its name */
 const char *hos_render_mode_cycle(void) {
-    render_scale();
-    mode_now = (mode_now + 1) % (int)(sizeof modes / sizeof *modes);
-    hos_render_scale = modes[mode_now].scale;
-    static char b[96];
-    snprintf(b, sizeof b, "3D resolution: %s", modes[mode_now].name);
-    hos_log("drs: %s", b);
-    return b;
+    Bindings b;
+    hos_bind_get(&b);
+    b.render_mode = (b.render_mode + 1) % NMODES;
+    hos_bind_set(&b);   /* (applies it) */
+    static char t[96];
+    snprintf(t, sizeof t, "3D resolution: %s", modes[b.render_mode].name);
+    return t;
 }
 
 #if GAME_VERSION == 143
