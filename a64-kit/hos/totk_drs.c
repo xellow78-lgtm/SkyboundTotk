@@ -95,6 +95,65 @@ static void sf(uint64_t a, float f) {
     HOS_WRITTEN(GP(a), 4);
 }
 
+/* The game's own dynamic resolution levels (game::gfx::DynamicResolutionEachLevelParam, 0x78 bytes): f_09ead7b4 is
+   their reflection (x0 the level: StressThresh at +0x3c, ResolutionReduceScale at +0x38, EnableFXAA +0x40,
+   EnableSuperResolution +0x41). They keep working under a fixed 3D resolution and multiply it (run_quality.log,
+   2026-11-02: Balanced's 1128x632 went to 1008x568 and 896x504 every few frames, Ultra Performance's 640x360 to
+   568x320 and 512x288), which made the lower modes smear. Under a fixed mode, every level's scale is made the full
+   level's (HOS_DRS_LOCK=0: not), and put back for the game's own. */
+static struct { uint64_t at, vtable; float scale, saved; int locked; } levels[32];
+static int nlevels;
+ENTRY_HOOK(0x09ead7b4) {
+    const uint64_t at = c->x[0];
+    if (at < 0x8000000) return 0;
+    for (int i = 0; i < nlevels; i++)
+        if (levels[i].at == at) return 0;
+    if (nlevels < 32) levels[nlevels].at = at, levels[nlevels].vtable = G64(at), nlevels++;
+    return 0;
+}
+static void lock_levels(int lock) {
+    static int off = -1, logged;
+    if (off < 0) off = getenv("HOS_DRS_LOCK") && *getenv("HOS_DRS_LOCK") == '0';
+    if (off || !nlevels) return;
+    /* (a level still there: its object unchanged, its scale a fraction) */
+    float lo = 2, hi = -1;
+    int live = 0;
+    for (int i = 0; i < nlevels; i++) {
+        if (G64(levels[i].at) != levels[i].vtable) continue;
+        const float v = gf(levels[i].at + 0x38);
+        if (!(v >= 0 && v <= 1)) continue;
+        if (!levels[i].locked) lo = fminf(lo, v), hi = fmaxf(hi, v);
+        live++;
+    }
+    if (!logged && live) {
+        logged = 1;
+        for (int i = 0; i < nlevels; i++)
+            hos_log("drs: level %d at %#llx: ResolutionReduceScale %g, StressThresh %g, FXAA %d, super resolution %d", i,
+                    (unsigned long long)levels[i].at, gf(levels[i].at + 0x38), gf(levels[i].at + 0x3c),
+                    *(uint8_t *)GP(levels[i].at + 0x40), *(uint8_t *)GP(levels[i].at + 0x41));
+    }
+    /* the full level's value: 1 if the scales are multipliers, 0 if they are how much to take off */
+    static float full = -1;
+    if (full < 0 && hi >= lo) {
+        full = hi == 1 ? 1.0f : lo == 0 ? 0.0f : -2.0f;
+        hos_log("drs: the levels' scales go from %g to %g: %s", lo, hi,
+                full == 1 ? "multipliers, locked at 1 under a fixed 3D resolution"
+                : full == 0 ? "reductions, locked at 0 under a fixed 3D resolution" : "not understood, left alone");
+    }
+    if (full < 0) return;
+    for (int i = 0; i < nlevels; i++) {
+        if (G64(levels[i].at) != levels[i].vtable) continue;
+        const float v = gf(levels[i].at + 0x38);
+        if (lock && !levels[i].locked && v >= 0 && v <= 1) {
+            levels[i].saved = v, levels[i].locked = 1;
+            sf(levels[i].at + 0x38, full);
+        } else if (!lock && levels[i].locked) {
+            if (v == full) sf(levels[i].at + 0x38, levels[i].saved);
+            levels[i].locked = 0;
+        }
+    }
+}
+
 /* f_080d5a48(x0, w1 the view's index, x2 the view, x3 ...): the view's box is in the scene frame buffer's virtual
    units, 1280x720 at full size */
 ENTRY_HOOK(0x080d5a48) {
@@ -122,16 +181,18 @@ ENTRY_HOOK(0x080d5a48) {
             }
         }
 #ifndef __EMSCRIPTEN__
-        if (!armed && scene) {
+        /* (the levels' scale: who reads it, i.e. the game's own dynamic resolution) */
+        if (!armed && nlevels >= 2) {
             armed = 1;
             void hos_watch_arm(uint64_t guest, int len, const char *why);
-            hos_watch_arm(box, 8, "drs: scene view box min");
-            hos_watch_arm(box + 8, 8, "drs: scene view box max");
+            hos_watch_arm(levels[0].at + 0x38, 4, "drs: level 0 scale");
+            hos_watch_arm(levels[1].at + 0x38, 4, "drs: level 1 scale");
         }
 #endif
     }
     /* (the game may write the box only when its level changes: what it last wrote is kept, and put back when the
        mode goes back to the game's own) */
+    if (scene) lock_levels(s > 0);
     static float game_w, game_h, ours_w = -1, ours_h = -1;
     if (scene && (x1 != ours_w || y1 != ours_h)) game_w = x1, game_h = y1;
     if (s && scene) {
