@@ -1258,14 +1258,32 @@ NV(nvnCommandBufferClearDepthStencil) {
     r->stencil = I(2);
     r->stencil_mask = I(3);
 }
+/* HOS_LOG_VIEWPORT=1 (finding TOTK's dynamic resolution): each new scene-sized viewport (900..1800 wide, not the
+   1920x1080 frame), once per size and call chain, with the guest call chain that set it */
+static void log_viewport(Ctx *c, float w, float h) {
+    static int on = -1, n;
+    if (on < 0) on = getenv("HOS_LOG_VIEWPORT") && atoi(getenv("HOS_LOG_VIEWPORT"));
+    if (!on || n >= 200 || w < 900 || w > 1800 || h < 400 || (w == 1920 && h == 1080)) return;
+    char b[512];
+    guest_chain(c, b, sizeof b);
+    static char seen[200][560];
+    char key[560];
+    snprintf(key, sizeof key, "%gx%g %s", w, h, b);
+    for (int i = 0; i < n; i++)
+        if (!strcmp(seen[i], key)) return;
+    snprintf(seen[n++], sizeof seen[0], "%s", key);
+    hos_log("nvn: viewport %s", key);
+}
 NV(nvnCommandBufferSetViewports) {
     const int first = I(1), n = I(2);
     if (n < 0 || first < 0 || first + n > 16) die("SetViewports %d+%d", first, n);
+    if (n > 0 && P(3)) log_viewport(c, ((const float *)P(3))[2], ((const float *)P(3))[3]);
     nvn_p_viewports *r = REC(CB(P(0)), NOP_VIEWPORTS, nvn_p_viewports);
     r->first = first, r->n = n;
     memcpy(r->v, P(3), 16 * (size_t)n);
 }
 NV(nvnCommandBufferSetViewport) {
+    log_viewport(c, (float)I(3), (float)I(4));
     nvn_p_viewports *r = REC(CB(P(0)), NOP_VIEWPORTS, nvn_p_viewports);
     r->first = 0, r->n = 1;
     r->v[0][0] = (float)I(1), r->v[0][1] = (float)I(2), r->v[0][2] = (float)I(3), r->v[0][3] = (float)I(4);
