@@ -722,9 +722,9 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
             st.validated = true;
         }
     }
-    wgpuTextureViewRelease(depth_v);
-    wgpuTextureViewRelease(color_v);
     if (!ok) {
+        wgpuTextureViewRelease(depth_v);
+        wgpuTextureViewRelease(color_v);
         st.init_failed = true;
         return false;
     }
@@ -739,6 +739,8 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         cp_dispatch(cp, j.gx, j.gy, 1);
     }
     cp_end(cp);
+    wgpuTextureViewRelease(depth_v);   // (after the recording took its references, not before: it uses them)
+    wgpuTextureViewRelease(color_v);
     // the result into the game's target, where its scale-up would have drawn
     {
         if (st.blit_groups[slot]) wgpuBindGroupRelease(st.blit_groups[slot]);
