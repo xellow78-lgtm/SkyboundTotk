@@ -100,7 +100,10 @@ static void sf(uint64_t a, float f) {
    EnableSuperResolution +0x41). They keep working under a fixed 3D resolution and multiply it (run_quality.log,
    2026-11-02: Balanced's 1128x632 went to 1008x568 and 896x504 every few frames, Ultra Performance's 640x360 to
    568x320 and 512x288), which made the lower modes smear. Under a fixed mode, every level's scale is made the full
-   level's (HOS_DRS_LOCK=0: not), and put back for the game's own. */
+   level's (HOS_DRS_LOCK=0: not), and put back for the game's own.
+   That did nothing (run_quality.log, 15:37): nothing but this file reads these objects while playing, the game keeps
+   its own copy. What holds the game at its full level now is the GPU time it measures (gpu/render/rx_nvn.cpp,
+   gpu_ticks: none within a frame under a fixed mode). With HOS_DRS_PROBE the levels are still logged (0.58 .. 1). */
 static struct { uint64_t at, vtable; float scale, saved; int locked; } levels[32];
 static int nlevels;
 ENTRY_HOOK(0x09ead7b4) {
@@ -180,19 +183,36 @@ ENTRY_HOOK(0x080d5a48) {
                         (int)c->x[1], x0, y0, x1, y1, is_new ? " (first)" : " (changed)", (unsigned long long)c->x[30]);
             }
         }
+        /* The view's pixel rect (its +0x2e00: min x, y, max x, y; what the shaders' p_dynamic_resolution_ratio and
+           the targets' size come from): the box times the game's own level. The level objects themselves are only
+           read when loaded (run_quality.log 2026-11-02: no reads while playing), so who writes this rect is where the
+           level's scale is applied. (f_080e1f50's view: x0+0x18 the views' manager, its +0x10 the views, 0x3ce0
+           bytes each, w1 the index) */
+        const uint64_t mgr = G64(c->x[0] + 0x18), views = mgr >= 0x8000000 ? G64(mgr + 0x10) : 0;
+        if (views >= 0x8000000 && scene) {
+            const uint64_t rect = views + (uint64_t)(uint32_t)c->x[1] * 0x3ce0 + 0x2e00;
+            static float last[4];
+            float r[4];
+            memcpy(r, GP(rect), 16);
+            if (memcmp(r, last, 16) && lines < 800) {
+                lines++;
+                hos_log("drs: view %d pixel rect (%g,%g)-(%g,%g) at %#llx", (int)c->x[1], r[0], r[1], r[2], r[3],
+                        (unsigned long long)rect);
+                memcpy(last, r, 16);
+            }
 #ifndef __EMSCRIPTEN__
-        /* (the levels' scale: who reads it, i.e. the game's own dynamic resolution) */
-        if (!armed && nlevels >= 2) {
-            armed = 1;
-            void hos_watch_arm(uint64_t guest, int len, const char *why);
-            hos_watch_arm(levels[0].at + 0x38, 4, "drs: level 0 scale");
-            hos_watch_arm(levels[1].at + 0x38, 4, "drs: level 1 scale");
-        }
+            if (!armed) {
+                armed = 1;
+                void hos_watch_arm(uint64_t guest, int len, const char *why);
+                hos_watch_arm(rect, 8, "drs: view pixel rect min");
+                hos_watch_arm(rect + 8, 8, "drs: view pixel rect max");
+            }
 #endif
+        }
     }
     /* (the game may write the box only when its level changes: what it last wrote is kept, and put back when the
        mode goes back to the game's own) */
-    if (scene) lock_levels(s > 0);
+    if (scene && drs_probe()) lock_levels(0);   /* (only logs them now: see above) */
     static float game_w, game_h, ours_w = -1, ours_h = -1;
     if (scene && (x1 != ours_w || y1 != ours_h)) game_w = x1, game_h = y1;
     if (s && scene) {
