@@ -993,6 +993,8 @@ std::array<uint8_t, 0x1000> method_table() {
     return t;
 }
 } // namespace
+/// (rx_fsr2.cpp: the clears still waiting, done now, before it draws into a target itself)
+void flush_clears_now() { flush_pending_clears(); }
 
 WGPUShaderModule program_module(const WGPUShaderModuleDescriptor* d) {
 #if !RX_WEB

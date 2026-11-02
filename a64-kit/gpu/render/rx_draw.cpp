@@ -3366,6 +3366,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     }
     ProgramPair* prog = nvn_programs(s, out_types);
     if (!prog) return skip("programs");
+    if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) return;   // (rx_fsr2.cpp)
 
     // ---- vertices and indices ----
     WGPUPrimitiveTopology topology{};
@@ -3493,6 +3494,10 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     float rescale[16] = {0, 0, 1.0f, 0, W, H, 0, 0,
                          vw / W, (2.0f * vx + vw) / W - 1.0f, vh / H, 1.0f - (2.0f * vy + vh) / H,
                          minus_w ? (f - n) * 0.5f : f - n, minus_w ? (f + n) * 0.5f : n, 0, 0};
+    if (at.depth && s.ds.dt) {   // FSR 2's sub-pixel jitter for the 3D draws into the scene (rx_fsr2.cpp)
+        float jx, jy;
+        if (fsr2_jitter(at.width, at.height, &jx, &jy)) rescale[9] += jx, rescale[11] += jy;
+    }
     {
         const int32_t vertex_offset = cached ? 0 : (int32_t)vmin;
         const int32_t instance_offset = cached ? -(int32_t)d.base_instance : 0;
@@ -3894,6 +3899,13 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
             const bool mw = nvn_depth_minus_w() != 0;
             scene_camera.depth_a = mw ? (s.depth_far - s.depth_near) * 0.5f : s.depth_far - s.depth_near;
             scene_camera.depth_b = mw ? (s.depth_far + s.depth_near) * 0.5f : s.depth_near;
+            for (Image* ci : at.color)   // (the HDR colour target: FSR 2's input, rx_fsr2.cpp)
+                if (ci && ci->tex && ci->format == WGPUTextureFormat_RG11B10Ufloat && ci->tex != scene_color) {
+                    wgpuTextureAddRef(ci->tex);
+                    if (scene_color) wgpuTextureRelease(scene_color);
+                    scene_color = ci->tex;
+                    break;
+                }
             if (at.depth && at.depth->tex && at.depth->tex != scene_depth) {
                 wgpuTextureAddRef(at.depth->tex);
                 if (scene_depth) wgpuTextureRelease(scene_depth);
