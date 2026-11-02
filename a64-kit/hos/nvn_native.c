@@ -391,7 +391,12 @@ NV(nvnTextureBuilderSetWidth) { TB(P(0))->d.width = U32(1); }
 NV(nvnTextureBuilderSetHeight) { TB(P(0))->d.height = U32(1); }
 NV(nvnTextureBuilderSetDepth) { TB(P(0))->d.depth = U32(1); }
 NV(nvnTextureBuilderSetSize1D) { nvn_tex_builder *b = TB(P(0)); b->d.width = U32(1); b->d.height = b->d.depth = 1; }
-NV(nvnTextureBuilderSetSize2D) { nvn_tex_builder *b = TB(P(0)); b->d.width = U32(1); b->d.height = U32(2); b->d.depth = 1; }
+static void log_scene_size(Ctx *c, const char *what, uint32_t w, uint32_t h);   /* (HOS_LOG_VIEWPORT: below) */
+NV(nvnTextureBuilderSetSize2D) {
+    nvn_tex_builder *b = TB(P(0));
+    b->d.width = U32(1); b->d.height = U32(2); b->d.depth = 1;
+    log_scene_size(c, "texture", U32(1), U32(2));
+}
 NV(nvnTextureBuilderSetSize3D) { nvn_tex_builder *b = TB(P(0)); b->d.width = U32(1); b->d.height = U32(2); b->d.depth = U32(3); }
 NV(nvnTextureBuilderSetLevels) { TB(P(0))->d.levels = U32(1); }
 NV(nvnTextureBuilderSetFormat) { TB(P(0))->d.format = I(1); }
@@ -1260,20 +1265,25 @@ NV(nvnCommandBufferClearDepthStencil) {
 }
 /* HOS_LOG_VIEWPORT=1 (finding TOTK's dynamic resolution): each new scene-sized viewport (900..1800 wide, not the
    1920x1080 frame), once per size and call chain, with the guest call chain that set it */
-static void log_viewport(Ctx *c, float w, float h) {
-    static int on = -1, n;
+static void log_scene_size(Ctx *c, const char *what, uint32_t w, uint32_t h) {
+    static int on = -1, n, other;
     if (on < 0) on = getenv("HOS_LOG_VIEWPORT") && atoi(getenv("HOS_LOG_VIEWPORT"));
-    if (!on || n >= 200 || w < 900 || w > 1800 || h < 400 || (w == 1920 && h == 1080)) return;
+    if (!on || w < 900 || w > 1800 || h < 400 || (w == 1920 && h == 1080)) return;
+    /* (1600x896 viewports came with 200 call chains in the first probe: those are logged by size once, the rest
+       (other sizes, and every texture made at a scene size) with their call chains) */
+    if (!strcmp(what, "viewport") && w == 1600 && h == 896) return;
     char b[512];
     guest_chain(c, b, sizeof b);
-    static char seen[200][560];
-    char key[560];
-    snprintf(key, sizeof key, "%gx%g %s", w, h, b);
+    static char seen[300][600];
+    char key[600];
+    snprintf(key, sizeof key, "%s %ux%u %s", what, w, h, b);
     for (int i = 0; i < n; i++)
         if (!strcmp(seen[i], key)) return;
+    if (n >= 300) { if (!other++) hos_log("nvn: (scene-size log full)"); return; }
     snprintf(seen[n++], sizeof seen[0], "%s", key);
-    hos_log("nvn: viewport %s", key);
+    hos_log("nvn: %s", key);
 }
+static void log_viewport(Ctx *c, float w, float h) { log_scene_size(c, "viewport", (uint32_t)w, (uint32_t)h); }
 NV(nvnCommandBufferSetViewports) {
     const int first = I(1), n = I(2);
     if (n < 0 || first < 0 || first + n > 16) die("SetViewports %d+%d", first, n);
