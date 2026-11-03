@@ -338,14 +338,9 @@ NvnState state;                    // the queue's state
 /* Counter timestamps: within a frame the time runs at RX_NVN_TS_SCALE (default 0.1), from the real time at its start.
    TOTK's dynamic resolution reads the frame's GPU time from them, and the replay's CPU time is not the GPU's (several
    times the GPU's work): after every load it dropped to 1280x720 for ~1.5 s, and in heavy scenes for good. */
-/* Under a fixed 3D resolution (the F1 window's slider, hos/totk_drs.c) the time stands still within a frame: the
-   game's dynamic resolution then never sees a busy GPU and stays at its full level, instead of taking its own
-   levels off the chosen size every few frames (which made FSR 2 smear and the water show blocks). */
-extern "C" volatile float hos_render_scale;
 bool ts_new_frame = true;
 uint64_t gpu_ticks() {
-    static const double env_scale = getenv("RX_NVN_TS_SCALE") ? atof(getenv("RX_NVN_TS_SCALE")) : 0.1;
-    const double scale = hos_render_scale > 0 ? 0.0 : env_scale;
+    static const double scale = getenv("RX_NVN_TS_SCALE") ? atof(getenv("RX_NVN_TS_SCALE")) : 0.1;
     const uint64_t real = (uint64_t)hos_now_ns();
     static uint64_t origin_real, origin_out, last_out;
     if (ts_new_frame) {

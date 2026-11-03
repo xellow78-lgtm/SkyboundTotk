@@ -3901,6 +3901,25 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
             }
             scene_camera.frame = frame_number;
             scene_camera.addr = u.addr;
+            {   // (each 10 s: how many frames had which size; the game's own resolution levels show as drops)
+                static struct { float w, h; int n; } sizes[8];
+                static int nsizes;
+                static int64_t t0;
+                int k = 0;
+                while (k < nsizes && (sizes[k].w != s.viewport[0][2] || sizes[k].h != s.viewport[0][3])) k++;
+                if (k == nsizes && nsizes < 8) sizes[nsizes++] = {s.viewport[0][2], s.viewport[0][3], 0};
+                if (k < nsizes) sizes[k].n++;
+                const int64_t now = hos_now_ns();
+                if (!t0) t0 = now;
+                if (now - t0 >= 10000000000ll) {
+                    char line[512];
+                    int len = std::snprintf(line, sizeof line, "rx: 3D scene sizes in the last 10 s (frames):");
+                    for (int j = 0; j < nsizes && len < (int)sizeof line - 40; j++)
+                        len += std::snprintf(line + len, sizeof line - len, " %gx%g x%d", sizes[j].w, sizes[j].h, sizes[j].n);
+                    hos_log("%s", line);
+                    nsizes = 0, t0 = now;
+                }
+            }
             if (scene_camera.width != s.viewport[0][2] || scene_camera.height != s.viewport[0][3]) {
                 static int lines;
                 if (lines++ < 200)

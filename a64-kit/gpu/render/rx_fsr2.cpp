@@ -497,9 +497,13 @@ bool fsr2_jitter(uint32_t w, uint32_t h, float* ndc_x, float* ndc_y) {
 /// done (the draw is then skipped); false to let the game's draw run.
 bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_count) {
     if (!fsr2_on() || st.init_failed) return false;
+    // (TOTK's two scale-ups: its levels with EnableSuperResolution use 7102057103341499, the others 7f5070f0c3f67c3e,
+    // whose viewport follows the scene view's box: left to it under a fixed 3D resolution, it drew the scene into a
+    // corner of the screen)
     static const uint64_t hook = getenv("RX_FSR2_HOOK_FS") ? strtoull(getenv("RX_FSR2_HOOK_FS"), nullptr, 16)
                                                           : 0x7102057103341499ull;
-    if (fs_key != hook || vertex_count != 3 || !at.color[0] || !at.color[0]->tex) return false;
+    static const uint64_t hook2 = getenv("RX_FSR2_HOOK_FS") ? hook : 0x7f5070f0c3f67c3eull;
+    if ((fs_key != hook && fs_key != hook2) || vertex_count != 3 || !at.color[0] || !at.color[0]->tex) return false;
     const SceneCamera cur = scene_camera, prev = scene_camera_prev;
     if (!scene_color || !scene_depth || cur.frame != frame_number || prev.frame < 0) return false;
     if (!st.ready) {

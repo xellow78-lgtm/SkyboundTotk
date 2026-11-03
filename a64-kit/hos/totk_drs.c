@@ -43,7 +43,18 @@ void hos_render_mode_apply(int m) {
     if (hos_render_scale != modes[m].scale) hos_log("drs: 3D resolution: %s", modes[m].name);
     hos_render_scale = modes[m].scale;
 }
+/* (the modes need FSR 2: the game's own scale-up draws a smaller scene into a corner of the screen, see below) */
+static int fsr2_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RX_FSR2");
+        on = e && *e && *e != '0';
+        if (!on) hos_log("drs: the 3D resolution setting needs FSR 2 (RX_FSR2=1, play_portable_fsr2.bat): the game's own");
+    }
+    return on;
+}
 static float render_scale(void) {
+    if (!fsr2_enabled()) return 0;
     if (hos_render_scale < 0) {
         const char *e = getenv("HOS_RENDER_SCALE");
         if (e && *e) {
@@ -102,8 +113,12 @@ static void sf(uint64_t a, float f) {
    568x320 and 512x288), which made the lower modes smear. Under a fixed mode, every level's scale is made the full
    level's (HOS_DRS_LOCK=0: not), and put back for the game's own.
    That did nothing (run_quality.log, 15:37): nothing but this file reads these objects while playing, the game keeps
-   its own copy. What holds the game at its full level now is the GPU time it measures (gpu/render/rx_nvn.cpp,
-   gpu_ticks: none within a frame under a fixed mode). With HOS_DRS_PROBE the levels are still logged (0.58 .. 1). */
+   its own copy. Stopping the GPU time it measures within a frame (gpu/render/rx_nvn.cpp, gpu_ticks) did not hold it
+   either (run_quality.log 2026-11-03: Quality still went to 1144x640 / 1024x576), so the levels still come and go.
+   With HOS_DRS_PROBE the levels are logged (0.58 .. 1).
+   Levels with EnableSuperResolution 0 scale the scene up with another shader (fs 7f5070f0c3f67c3e instead of
+   7102057103341499), whose viewport follows the view's box: under a fixed mode it drew the scene into the lower left
+   0.8 of the screen, black around it (the black box; frame dump 27966). FSR 2 now replaces both (rx_fsr2.cpp). */
 static struct { uint64_t at, vtable; float scale, saved; int locked; } levels[32];
 static int nlevels;
 ENTRY_HOOK(0x09ead7b4) {
