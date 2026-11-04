@@ -552,7 +552,7 @@ def dlss_deps(wgpu):
     if os.environ.get("RX_DLSS_BUILD") == "0" or os.name != "nt":
         return False
     tp = os.path.join(HERE, "..", "third_party")
-    need = [os.path.join(tp, "dlss", "include", "nvsdk_ngx_vk.h"), os.path.join(tp, "dlss", "lib", "nvsdk_ngx_d.lib"),
+    need = [os.path.join(tp, "dlss", "include", "nvsdk_ngx_vk.h"), os.path.join(tp, "dlss", "lib", "nvsdk_ngx_s.lib"),
             os.path.join(tp, "dlss", "lib", "nvngx_dlss.dll"),
             os.path.join(tp, "vulkan-headers", "include", "vulkan", "vulkan_core.h")]
     if not all(os.path.isfile(p) for p in need):
@@ -726,7 +726,7 @@ def cmd_native(a):
             "-lmfuuid"] if os.name == "nt" else []
     if wgpu and dlss_deps(wgpu):
         tp = os.path.join(HERE, "..", "third_party", "dlss", "lib")
-        libs += [os.path.join(tp, "nvsdk_ngx_d.lib"), "-ladvapi32"]
+        libs += [os.path.join(tp, "nvsdk_ngx_s.lib"), "-ladvapi32"]   # (static CRT, /MT, as the exe)
         dll, dst = os.path.join(tp, "nvngx_dlss.dll"), os.path.join(nat, "nvngx_dlss.dll")
         if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(dll):
             shutil.copyfile(dll, dst)

@@ -40,7 +40,8 @@ DLSS_HEADERS = ["nvsdk_ngx.h", "nvsdk_ngx_defs.h", "nvsdk_ngx_defs_vk.h", "nvsdk
                 "nvsdk_ngx_params.h", "nvsdk_ngx_vk.h", "nvsdk_ngx_defs_dlssd.h", "nvsdk_ngx_defs_dlssg.h",
                 "nvsdk_ngx_params_dlssd.h", "nvsdk_ngx_params_dlssg.h"]
 DLSS_FILES = [("include/" + h, "include/" + h) for h in DLSS_HEADERS] + [
-    ("lib/Windows_x86_64/x64/nvsdk_ngx_d.lib", "lib/nvsdk_ngx_d.lib"),
+    # (the static-CRT one, /MT, as the game's exe is built; _d is /MD: the link refuses the mismatch)
+    ("lib/Windows_x86_64/x64/nvsdk_ngx_s.lib", "lib/nvsdk_ngx_s.lib"),
     ("lib/Windows_x86_64/rel/nvngx_dlss.dll", "lib/nvngx_dlss.dll"),
     ("LICENSE.txt", "LICENSE.txt"),
 ]
