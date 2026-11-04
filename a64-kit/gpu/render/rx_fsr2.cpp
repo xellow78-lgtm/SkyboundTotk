@@ -889,4 +889,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     return true;
 }
 
+/// (the settings menu: whether FSR 2 runs this session, RX_FSR2)
+bool fsr2_wanted() { return fsr2_on(); }
+
 }  // namespace rx

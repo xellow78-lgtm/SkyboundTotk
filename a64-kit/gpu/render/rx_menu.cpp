@@ -39,7 +39,7 @@ extern "C" {
 }
 
 namespace rx {
-bool fsr2_on();   // rx_fsr2.cpp
+bool fsr2_wanted();   // rx_fsr2.cpp
 
 namespace {
 
@@ -83,7 +83,7 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
         return r.back();
     };
     if (page == kGraphics) {
-        const bool scaler = fsr2_on();
+        const bool scaler = fsr2_wanted();
         Row& res = add(kOption, kRes, "3D resolution", hos_render_mode_name(b.render_mode),
                        scaler ? "The 3D scene's size before the upscaler." : "Needs FSR 2 or DLSS (set at launch).");
         res.enabled = scaler;
