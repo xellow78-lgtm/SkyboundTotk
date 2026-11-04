@@ -19,6 +19,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <dxgi1_4.h>   // (vram_text)
+#endif
 
 #include "rx_internal.h"
 #include "video_core/textures/decoders.h"
@@ -2265,6 +2268,56 @@ void flush_batch() {
 extern "C" volatile LONG64 hos_fs_read_ns, hos_fs_read_bytes;   // hos/nn_fs.c
 #endif
 
+/// The GPU memory this process uses on the graphics card and in shared system memory, against what Windows gives it
+/// (DXGI's QueryVideoMemoryInfo: WDDM counts every API's allocations, Vulkan's too). Over the budget, Windows moves
+/// some of it into system memory, and everything that touches it slows down whatever the resolution. Text for the
+/// 5 s fps line; empty when not on Windows or no DXGI.
+static std::string vram_text() {
+#if !RX_WEB && defined(_WIN32)
+    static IDXGIAdapter3* adapter = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE m = LoadLibraryW(L"dxgi.dll");
+        using Create = HRESULT(WINAPI*)(REFIID, void**);
+        Create create = m ? reinterpret_cast<Create>(reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory1")))
+                          : nullptr;
+        IDXGIFactory1* f = nullptr;
+        if (create && SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&f)))) {
+            // (the adapter with the most memory of its own: the graphics card, not the integrated GPU)
+            SIZE_T best = 0;
+            IDXGIAdapter1* a = nullptr;
+            for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+                DXGI_ADAPTER_DESC1 d{};
+                IDXGIAdapter3* a3 = nullptr;
+                if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                    d.DedicatedVideoMemory > best &&
+                    SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&a3)))) {
+                    if (adapter) adapter->Release();
+                    adapter = a3;
+                    best = d.DedicatedVideoMemory;
+                }
+                a->Release();
+            }
+            f->Release();
+        }
+        if (!adapter) hos_log("rx: no DXGI adapter: no VRAM numbers in the log");
+    }
+    if (!adapter) return {};
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+    if (FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) ||
+        FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
+        return {};
+    char b[160];
+    std::snprintf(b, sizeof b, "; VRAM %llu of %llu MB%s, shared memory %llu MB",
+                  (unsigned long long)(local.CurrentUsage >> 20), (unsigned long long)(local.Budget >> 20),
+                  local.CurrentUsage > local.Budget ? " (OVER)" : "", (unsigned long long)(shared.CurrentUsage >> 20));
+    return b;
+#else
+    return {};
+#endif
+}
+
 /// A present that came long after the one before (RX_STALL_MS, default 100): what the renderer did in between, from
 /// the render thread's running totals (spike: translations and pipelines made in place, texture decoding, waits for
 /// the submit thread), the pipelines made meanwhile (in place or by the compilers), and the game's file reads. When
@@ -2313,9 +2366,12 @@ void present_pacing() {
         stutters += g > limit;
         longest = std::max(longest, g);
     }
-    if (stutters)
-        hos_log("rx: presents at %.0f s: %.1f fps, %d stutters (gaps over %.0f ms), longest %.1f ms", (now - first) / 1e9,
-                (double)gaps.size() * 1e9 / (double)(now - window_start), stutters, limit / 1e6, longest / 1e6);
+    // (every 5 s with RX_VRAM_LOG, else with stutters only, as before)
+    static const bool every = env_flag("RX_VRAM_LOG");
+    if (stutters || every)
+        hos_log("rx: presents at %.0f s: %.1f fps, %d stutters (gaps over %.0f ms), longest %.1f ms%s", (now - first) / 1e9,
+                (double)gaps.size() * 1e9 / (double)(now - window_start), stutters, limit / 1e6, longest / 1e6,
+                every ? vram_text().c_str() : "");
     gaps.clear();
     window_start = now;
 }
