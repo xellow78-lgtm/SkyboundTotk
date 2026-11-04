@@ -18,7 +18,7 @@ enum Op : uint64_t {
     kBeginRenderPass = 1, kEndRenderPass, kSetViewport, kSetPipeline, kSetBindGroup, kSetVertexBuffer, kSetIndexBuffer,
     kSetScissor, kSetBlendConstant, kSetStencilReference, kDraw, kDrawIndexed, kCopyBufferToBuffer,
     kCopyTextureToTexture, kBeginComputePass, kComputeSetPipeline, kComputeSetBindGroup, kDispatch, kEndComputePass,
-    kCopyTextureToBuffer, kComputeSetBindGroupDesc,
+    kCopyTextureToBuffer, kComputeSetBindGroupDesc, kTotkRaw,
 };
 enum RefKind : uint8_t { kView, kTexture, kBuffer, kRenderPipeline, kComputePipeline, kBindGroup };
 
@@ -54,7 +54,7 @@ uint64_t op_counts[32];
 const char* const op_names[32] = {"", "begin pass", "end pass", "viewport", "pipeline", "bind group", "vertex buffer",
                                   "index buffer", "scissor", "blend constant", "stencil ref", "draw", "draw indexed",
                                   "copy b2b", "copy t2t", "begin compute", "compute pipeline", "compute bind group",
-                                  "dispatch", "end compute", "copy t2b", "compute bind group desc"};
+                                  "dispatch", "end compute", "copy t2b", "compute bind group desc", "raw vulkan"};
 void put_op(Op o) {
     static const bool stats = env_flag("RX_REC_STATS");
     if (stats) {
@@ -314,6 +314,24 @@ void gpu_timer_read(GpuTimer* t) {
     wgpuBufferMapAsync(t->read, WGPUMapMode_Read, 0, t->passes.size() * 16, mc);
 }
 
+#if RX_DLSS
+extern "C" {
+struct WGPUTotkTextureTransition {
+    WGPUTexture texture;
+    uint32_t state;
+};
+void wgpuTotkCommandEncoderRaw(WGPUCommandEncoder encoder, const WGPUTotkTextureTransition* transitions, size_t count,
+                               void (*callback)(uint64_t, void*), void* user);
+}
+static void totk_raw_now(WGPUCommandEncoder e, const WGPUTexture* textures, const uint32_t* states, uint32_t n,
+                         void (*cb)(uint64_t, void*), void* user) {
+    WGPUTotkTextureTransition t[8];
+    n = std::min<uint32_t>(n, 8);
+    for (uint32_t i = 0; i < n; i++) t[i] = {textures[i], states[i]};
+    wgpuTotkCommandEncoderRaw(e, t, n, cb, user);
+}
+#endif
+
 void recording_replay(Recording* r, WGPUCommandEncoder e) {
     recording_replay(r, e, 0, r->words.size());
 }
@@ -444,6 +462,18 @@ void recording_replay(Recording* r, WGPUCommandEncoder e, size_t from, size_t to
             wgpuCommandEncoderCopyTextureToTexture(e, &src, &dst, &extent);
             break;
         }
+#if RX_DLSS
+        case kTotkRaw: {
+            auto cb = reinterpret_cast<void (*)(uint64_t, void*)>(static_cast<uintptr_t>(*w++));
+            void* user = as<void*>(*w++);
+            const uint32_t n = static_cast<uint32_t>(*w++);
+            WGPUTexture tex[8];
+            uint32_t st[8];
+            for (uint32_t i = 0; i < n; i++) tex[i] = as<WGPUTexture>(*w++), st[i] = static_cast<uint32_t>(*w++);
+            totk_raw_now(e, tex, st, n, cb, user);
+            break;
+        }
+#endif
         case kCopyTextureToBuffer: {
             const WGPUTexelCopyTextureInfo src = get_copy_info(w);
             WGPUTexelCopyBufferInfo dst{};
@@ -682,6 +712,27 @@ void ce_copy_texture_to_buffer(WGPUCommandEncoder e, const WGPUTexelCopyTextureI
     put(uint64_t{dst->layout.bytesPerRow} | uint64_t{dst->layout.rowsPerImage} << 32);
     put(uint64_t{extent->width} | uint64_t{extent->height} << 32);
     put(extent->depthOrArrayLayers);
+}
+
+
+void ce_totk_raw(WGPUCommandEncoder e, const WGPUTexture* textures, const uint32_t* states, uint32_t n,
+                 const WGPUTextureView* views, uint32_t nviews, void (*cb)(uint64_t, void*), void* user) {
+#if RX_DLSS
+    if (!encoding_deferred()) return totk_raw_now(e, textures, states, n, cb, user);
+    n = std::min<uint32_t>(n, 8);
+    put_op(kTotkRaw);
+    put_ptr(reinterpret_cast<const void*>(cb));
+    put_ptr(user);
+    put(n);
+    for (uint32_t i = 0; i < n; i++) {
+        hold(kTexture, textures[i]);
+        put_ptr(textures[i]);
+        put(states[i]);
+    }
+    for (uint32_t i = 0; i < nviews; i++) hold(kView, views[i]);
+#else
+    (void)e, (void)textures, (void)states, (void)n, (void)views, (void)nviews, (void)cb, (void)user;
+#endif
 }
 
 WGPUComputePassEncoder ce_begin_compute_pass(WGPUCommandEncoder e) {

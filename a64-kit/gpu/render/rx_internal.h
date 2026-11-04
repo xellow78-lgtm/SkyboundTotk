@@ -403,6 +403,32 @@ extern WGPUTexture scene_mask;          // its object channel target (rx_fsr2.cp
 bool fsr2_jitter(uint32_t w, uint32_t h, float* ndc_x, float* ndc_y);
 bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_count);
 
+/// DLSS (rx_dlss.cpp; a build with RX_DLSS: otherwise these do nothing). Around the device's creation (rx_core.cpp):
+/// the Vulkan extensions NGX needs, then NGX itself; dlss_ready() once DLSS can run. dlss_record puts one frame's
+/// evaluation into the encoder (rx_fsr2.cpp, in FSR 2's place); false when it cannot.
+struct DlssInputs {
+    WGPUTexture color, depth, mv, mask, out;   // (mask may be null)
+    WGPUTextureView color_v, depth_v, mv_v, mask_v, out_v;
+    uint32_t rw, rh;   // the render size this frame (the inputs' top left)
+    uint32_t mw, mh;   // the largest render size (the feature is made for it)
+    uint32_t dw, dh;   // the output size
+    float jx, jy;      // the jitter, render pixels (FSR 2's values)
+    float dt_ms;
+    bool reset;
+    int quality;       // NVSDK_NGX_PerfQuality_Value: 0 performance, 1 balanced, 2 quality, 3 ultra performance, 5 DLAA
+};
+void dlss_before_instance();
+bool dlss_wants_vulkan();
+void dlss_before_device(WGPUAdapter adapter);
+void dlss_after_device();
+bool dlss_ready();
+bool dlss_record(WGPUCommandEncoder e, const DlssInputs& in);
+/// Raw Vulkan commands at this point of the encoder (wgpu-native's wgpuTotkCommandEncoderRaw, deferred like the
+/// rest): the textures are moved to the given states (wgpu's TextureUses bits) and held with the views until the
+/// replay; cb(VkCommandBuffer, user) runs when the encoder is finished. RX_DLSS builds only.
+void ce_totk_raw(WGPUCommandEncoder e, const WGPUTexture* textures, const uint32_t* states, uint32_t n,
+                 const WGPUTextureView* views, uint32_t nviews, void (*cb)(uint64_t, void*), void* user);
+
 // statistics
 extern int64_t st_draws, st_skipped, st_pipelines, st_clears;
 /// Validation error scopes: the error the calls in between made (empty: none).

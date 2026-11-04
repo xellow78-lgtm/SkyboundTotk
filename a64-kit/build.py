@@ -546,6 +546,21 @@ def tree_headers_key(root):
     return h.hexdigest()
 
 
+def dlss_deps(wgpu):
+    """Whether this build can have DLSS (gpu/render/rx_dlss.cpp): NVIDIA's SDK files and the Vulkan headers in
+    third_party, and a wgpu-native with the TOTK Vulkan interop (wgpuTotk* in its import library). RX_DLSS_BUILD=0: no."""
+    if os.environ.get("RX_DLSS_BUILD") == "0" or os.name != "nt":
+        return False
+    tp = os.path.join(HERE, "..", "third_party")
+    need = [os.path.join(tp, "dlss", "include", "nvsdk_ngx_vk.h"), os.path.join(tp, "dlss", "lib", "nvsdk_ngx_d.lib"),
+            os.path.join(tp, "dlss", "lib", "nvngx_dlss.dll"),
+            os.path.join(tp, "vulkan-headers", "include", "vulkan", "vulkan_core.h")]
+    if not all(os.path.isfile(p) for p in need):
+        return False
+    imp = os.path.join(wgpu, "lib", "wgpu_native.dll.lib")
+    return os.path.isfile(imp) and b"wgpuTotkCommandEncoderRaw" in open(imp, "rb").read()
+
+
 def gpu_sources():
     """The renderer (gpu/render/) and what it builds on, from suyu (gpu/third_party/suyu): the shader recompiler
     (Maxwell frontend, IR passes, the WGSL backend), surface formats, texture decoders (block linear, ASTC)."""
@@ -680,6 +695,14 @@ def cmd_native(a):
                                               "-I" + os.path.join(wgpu, "include")]
         gdeps = tree_headers_key(GPU) + hashlib.sha1(open(os.path.join(wgpu, "include", "webgpu", "webgpu.h"),
                                                           "rb").read()).hexdigest()
+        # DLSS (gpu/render/rx_dlss.cpp): when third_party has NVIDIA's DLSS SDK files and the Vulkan headers and the
+        # wgpu-native build has the TOTK Vulkan interop (third_party/wgpu-native/build_dlss_deps.py makes all three)
+        if dlss_deps(wgpu):
+            tp = os.path.join(HERE, "..", "third_party")
+            gflags = gflags + ["-DRX_DLSS=1", "-I" + os.path.join(tp, "dlss", "include"),
+                               "-I" + os.path.join(tp, "vulkan-headers", "include")]
+            gdeps += "+dlss"
+            print("DLSS: on (NVIDIA's SDK, the Vulkan headers and the patched wgpu-native are there)")
         for src in gpu_sources():
             name = os.path.relpath(src, GPU).replace(os.sep, "_")[:-4]
             jobs.append((cxx, src, os.path.join(obj_dir, "gpu_" + name + ".o"), gflags, gdeps))
@@ -701,6 +724,12 @@ def cmd_native(a):
     open(rsp, "w").write("\n".join('"%s"' % o.replace("\\", "/") for o in objs))
     libs = ["-luser32", "-lkernel32", "-ldbghelp", "-lwinmm", "-lgdi32", "-lole32", "-lmfplat", "-lmfreadwrite", "-lshell32",
             "-lmfuuid"] if os.name == "nt" else []
+    if wgpu and dlss_deps(wgpu):
+        tp = os.path.join(HERE, "..", "third_party", "dlss", "lib")
+        libs += [os.path.join(tp, "nvsdk_ngx_d.lib"), "-ladvapi32"]
+        dll, dst = os.path.join(tp, "nvngx_dlss.dll"), os.path.join(nat, "nvngx_dlss.dll")
+        if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(dll):
+            shutil.copyfile(dll, dst)
     if wgpu:
         libs.append(os.path.join(wgpu, "lib", "wgpu_native.dll.lib"))
         dll, dst = os.path.join(wgpu, "lib", "wgpu_native.dll"), os.path.join(nat, "wgpu_native.dll")

@@ -12,6 +12,8 @@
 // RX_FSR2_SHARPNESS=<0..1> (default 0.5), RX_FSR2_HOOK_FS=<fragment program hex> (the scale-up draw; default TOTK
 // 1.4.3's), RX_FSR2_JITTER=0 (no jitter, checking), RX_FSR2_JITTER_SIGN=-1 (the other vertical sign).
 #include "rx_internal.h"
+
+extern "C" volatile float hos_render_scale;   // (hos/totk_drs.c: the 3D resolution setting; 0 the game's own)
 #include "rx_fsr2_shaders.h"
 
 #include <cmath>
@@ -133,7 +135,7 @@ struct State {
     uint32_t last_rw = 0, last_rh = 0;   // (the last frame's render size: logged when it changes)
     uint32_t cw = 0, ch = 0;             // the scene's targets' size last frame (draws into them get the jitter)
     Tex prepared, dil_mv[2], dil_depth, lock[2], lock_luma, new_locks, up[2], lum, luma_hist[2], dil_reactive, mv, out,
-        reactive;
+        reactive, depth_copy;   // (depth_copy: the scene's depth as a colour image, for DLSS)
     WGPUTextureView lum_mip4 = nullptr, lum_mip5 = nullptr;
     Tex lanczos, bias, def_reactive, def_exposure, auto_exposure, dummy;
     WGPUBuffer rec_depth = nullptr, spd_atomic = nullptr;
@@ -156,6 +158,7 @@ struct M { inv_cur: mat4x4<f32>, vp_prev: mat4x4<f32>, size: vec4<f32>, dz: vec4
 @group(0) @binding(2) var mv: texture_storage_2d<rg16float, write>;
 @group(0) @binding(3) var objects: texture_2d<f32>;
 @group(0) @binding(4) var reactive: texture_storage_2d<r8unorm, write>;
+@group(0) @binding(5) var depth_out: texture_storage_2d<r32float, write>;
 @compute @workgroup_size(8, 8, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (f32(id.x) >= m.size.x || f32(id.y) >= m.size.y) { return; }
   let q = vec2<i32>(id.xy);
@@ -166,6 +169,7 @@ struct M { inv_cur: mat4x4<f32>, vp_prev: mat4x4<f32>, size: vec4<f32>, dz: vec4
   // (the pixel's unjittered position: the jitter moved the image by size.zw pixels)
   let uv = (vec2<f32>(id.xy) + 0.5 - m.size.zw) / m.size.xy;
   let d = textureLoad(dep, q, 0);
+  textureStore(depth_out, q, vec4<f32>(d, 0.0, 0.0, 0.0));   // (DLSS's depth input: a colour image of it)
   let fy = m.dz.w;
   let ndc = vec4<f32>(uv.x * 2.0 - 1.0, fy * (1.0 - uv.y * 2.0), (d - m.dz.y) / m.dz.x, 1.0);
   var w = m.inv_cur * ndc;
@@ -292,7 +296,12 @@ bool init_pipelines() {
         }
     }
     {
-        WGPUBindGroupLayoutEntry e[5]{};
+        WGPUBindGroupLayoutEntry e[6]{};
+        e[5].binding = 5;
+        e[5].visibility = WGPUShaderStage_Compute;
+        e[5].storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
+        e[5].storageTexture.format = WGPUTextureFormat_R32Float;
+        e[5].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
         e[3].binding = 3;
         e[3].visibility = WGPUShaderStage_Compute;
         e[3].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
@@ -315,7 +324,7 @@ bool init_pipelines() {
         e[2].storageTexture.format = WGPUTextureFormat_RG16Float;
         e[2].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
         WGPUBindGroupLayoutDescriptor bd{};
-        bd.entryCount = 5;
+        bd.entryCount = 6;
         bd.entries = e;
         st.mv_layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
         scope_push();
@@ -379,7 +388,7 @@ bool init_pipelines() {
 void free_sized() {
     for (Tex* t : {&st.prepared, &st.dil_mv[0], &st.dil_mv[1], &st.dil_depth, &st.lock[0], &st.lock[1], &st.lock_luma,
                    &st.new_locks, &st.up[0], &st.up[1], &st.lum, &st.luma_hist[0], &st.luma_hist[1], &st.dil_reactive,
-                   &st.mv, &st.out, &st.reactive})
+                   &st.mv, &st.out, &st.reactive, &st.depth_copy})
         free_tex(*t);
     if (st.lum_mip4) wgpuTextureViewRelease(st.lum_mip4), st.lum_mip4 = nullptr;
     if (st.lum_mip5) wgpuTextureViewRelease(st.lum_mip5), st.lum_mip5 = nullptr;
@@ -406,6 +415,7 @@ void ensure_sized(uint32_t mw, uint32_t mh, uint32_t dw, uint32_t dh) {
     st.dil_reactive = make_tex("FSR2 dilated reactive", WGPUTextureFormat_RG8Unorm, mw, mh);
     st.mv = make_tex("FSR2 motion vectors", WGPUTextureFormat_RG16Float, mw, mh);
     st.reactive = make_tex("FSR2 reactive", WGPUTextureFormat_R8Unorm, mw, mh);
+    st.depth_copy = make_tex("FSR2 depth copy", WGPUTextureFormat_R32Float, mw, mh);
     st.out = make_tex("FSR2 output", WGPUTextureFormat_RGBA16Float, dw, dh);
     const uint32_t lw = std::max(1u, mw / 2), lh = std::max(1u, mh / 2);
     uint32_t mips = 1;
@@ -699,7 +709,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     std::vector<Job> jobs;
     jobs.push_back({st.mv_pipe, st.mv_layout, nullptr,
                     {tex_entry(0, depth_v), buf_entry(1, st.cb_mv[slot], sizeof(MvConstants)), tex_entry(2, st.mv.v),
-                     tex_entry(3, mask_v ? mask_v : st.dummy.v), tex_entry(4, st.reactive.v)},
+                     tex_entry(3, mask_v ? mask_v : st.dummy.v), tex_entry(4, st.reactive.v), tex_entry(5, st.depth_copy.v)},
                     {}, (rw + 7) / 8, (rh + 7) / 8});
     std::vector<WGPUBindGroupEntry> samplers(2);
     samplers[0] = {};
@@ -709,7 +719,8 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     samplers[1].binding = 1;
     samplers[1].sampler = st.linear;
     bool ok = true;
-    for (int p = 0; p < 6 && ok; p++) {
+    const bool use_dlss = dlss_ready();   // (DLSS in FSR 2's place: the motion vectors, then DLSS; rx_dlss.cpp)
+    for (int p = 0; p < 6 && ok && !use_dlss; p++) {
         const Pass& ps = passes[p];
         std::vector<WGPUBindGroupEntry> ge;
         for (int i = 0; i < ps.nbindings; i++) {
@@ -755,7 +766,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     // Once: the whole sequence encoded on an encoder of its own (never submitted) under an error scope, so a
     // mistake (a group that does not fit, a texture read and written at once) turns FSR 2 off and the game's own
     // scale-up runs, instead of the frame's commands being refused every frame
-    if (ok && !st.validated) {
+    if (ok && !st.validated && !use_dlss) {
         scope_push();
         WGPUCommandEncoder te = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
         WGPUComputePassEncoder tp = wgpuCommandEncoderBeginComputePass(te, nullptr);
@@ -808,6 +819,26 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         cp_dispatch(cp, j.gx, j.gy, 1);
     }
     cp_end(cp);
+    if (use_dlss) {
+        // (the mode from the 3D resolution setting: Quality 1.5x, Balanced 1.7x, Performance 2x, Ultra Performance
+        // 3x; the game's own up to 1600x896: Quality)
+        const float rs = hos_render_scale;
+        DlssInputs in{};
+        in.color = scene_color, in.color_v = color_v;
+        in.depth = st.depth_copy.t, in.depth_v = st.depth_copy.v;
+        in.mv = st.mv.t, in.mv_v = st.mv.v;
+        in.mask = scene_mask ? st.reactive.t : nullptr, in.mask_v = scene_mask ? st.reactive.v : nullptr;
+        in.out = st.out.t, in.out_v = st.out.v;
+        in.rw = rw, in.rh = rh, in.mw = st.mw, in.mh = st.mh, in.dw = dw, in.dh = dh;
+        in.jx = c.jitter[0], in.jy = c.jitter[1];
+        in.dt_ms = dt * 1000.0f;
+        in.reset = st.reset;
+        in.quality = rs <= 0 ? 2 : rs >= 0.75f ? 2 : rs >= 0.65f ? 1 : rs >= 0.5f ? 0 : 3;
+        if (!dlss_record(e, in)) {
+            static int lines;
+            if (lines++ < 5) hos_log("rx: DLSS: not recorded this frame (FSR 2 takes over from the next)");
+        }
+    }
     wgpuTextureViewRelease(depth_v);   // (after the recording took its references, not before: it uses them)
     wgpuTextureViewRelease(color_v);
     if (mask_v) wgpuTextureViewRelease(mask_v);

@@ -366,7 +366,8 @@ bool init_device(HWND hwnd) {
 #else
     WGPUInstanceExtras extras{};
     extras.chain.sType = (WGPUSType)WGPUSType_InstanceExtras;
-    const char* be = getenv("RX_BACKEND");
+    dlss_before_instance();   // (RX_DLSS: the instance extensions NGX needs; rx_dlss.cpp)
+    const char* be = dlss_wants_vulkan() && !getenv("RX_BACKEND") ? "vulkan" : getenv("RX_BACKEND");
     extras.backends = !be                           ? WGPUInstanceBackend_Primary
                       : !_stricmp(be, "vulkan")     ? WGPUInstanceBackend_Vulkan
                       : !_stricmp(be, "dx12")       ? WGPUInstanceBackend_DX12
@@ -477,6 +478,9 @@ bool init_device(HWND hwnd) {
         else hos_log("rx: no device: %s", str(message).c_str());
     };
     dcb.userdata1 = &dev.device;
+#if !RX_WEB
+    dlss_before_device(dev.adapter);   // (RX_DLSS: the device extensions NGX needs)
+#endif
     wgpuAdapterRequestDevice(dev.adapter, &dd, dcb);
     for (int i = 0; i < 5000 && !dev.device; i++) {
         wgpuInstanceProcessEvents(dev.instance);
@@ -485,6 +489,9 @@ bool init_device(HWND hwnd) {
     if (!dev.device) return false;
     dev.queue = wgpuDeviceGetQueue(dev.device);
     wgpuDeviceGetLimits(dev.device, &dev.limits);
+#if !RX_WEB
+    dlss_after_device();   // (RX_DLSS: NGX on this device)
+#endif
     // Which formats the device can draw into that plain WebGPU cannot (a 1x1 target of each, made and dropped)
     auto renderable = [](WGPUTextureFormat f) {
         WGPUTextureDescriptor d{};
