@@ -10,7 +10,7 @@
 // RX_NO_PIPELINE_CACHE=1: neither read nor written. Every pipeline in the file is made at a start, the most recently
 // used first, until Windows' commit to spare falls to RX_PIPELINE_CACHE_FREE_MB (10240): each made pipeline holds
 // ~300-400 KB of host memory (wgpu keeps its shader modules' IR, the driver its code; 3783 of them were 1.2 GB of the
-// working set). RX_PIPELINE_CACHE_MAX=<n>: at most n; RX_PIPELINE_CACHE_SESSIONS=<n>: only what the last n sessions
+// working set). RX_PIPELINE_CACHE_MAX=<n>: at most n (default 8000); RX_PIPELINE_CACHE_SESSIONS=<n>: only what the last n sessions
 // drew with ('U' records: the keys each session used); RX_PIPELINE_CACHE_ALL=1: no memory check.
 #if !RX_WEB
 #include <algorithm>
@@ -470,7 +470,10 @@ void native_cache_step() {
     // RX_PIPELINE_CACHE_MAX=<n>: at most n (the most recently used first); otherwise until Windows' commit to spare
     // falls to RX_PIPELINE_CACHE_FREE_MB (10240: the game grows by several GB as it plays, and running out of commit
     // crashes it, see take_stream_memory), checked every 32. RX_PIPELINE_CACHE_ALL=1: no memory check.
-    static const size_t cap = getenv("RX_PIPELINE_CACHE_MAX") ? (size_t)atoi(getenv("RX_PIPELINE_CACHE_MAX")) : SIZE_MAX;
+    // (default 8000: run_mem.log made 22517 of the file's 222093 in 60 s at start and the game grew 7 GB for them,
+    // ~310 KB each, held all session: with the rest of the game that left Windows' commit 372 MB from the crash in
+    // run_vram.log. 8000, the most recently used, cover what the last sessions drew; the others are made when drawn)
+    static const size_t cap = getenv("RX_PIPELINE_CACHE_MAX") ? (size_t)atoi(getenv("RX_PIPELINE_CACHE_MAX")) : 8000;
     static const uint64_t keep_free = (getenv("RX_PIPELINE_CACHE_FREE_MB") ? (uint64_t)atoll(getenv("RX_PIPELINE_CACHE_FREE_MB"))
                                                                             : 10240ull) << 20;
     static const bool no_check = getenv("RX_PIPELINE_CACHE_ALL") && std::strcmp(getenv("RX_PIPELINE_CACHE_ALL"), "0") != 0;
