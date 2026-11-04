@@ -4420,6 +4420,40 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
     if (frame_number % 600 == 150) trim_pipelines();
     if (static const bool often = env_flag("RX_VRAM_LOG"); often ? frame_number % 1200 == 900 : frame_number % 3600 == 900)
         memory_report();
+    // Render targets neither drawn nor sampled for RX_RT_IDLE_FRAMES (3600, a minute at 60 fps) step aside as
+    // spares, as when the game puts another surface at their memory (find_render_target): one drawn at the same
+    // place and shape again takes its old texture back, and spares unused for 10 s more go (below). Without this
+    // every surface the game ever drew stayed: run_bc7.log had 14260 render targets (880 MB) after 18 minutes, and
+    // ~17000 textures alive in all. RX_RT_IDLE_FRAMES=0: kept, as before.
+    if (frame_number % 600 == 300) {
+        static const int64_t idle = getenv("RX_RT_IDLE_FRAMES") ? atoll(getenv("RX_RT_IDLE_FRAMES")) : 3600;
+        if (idle > 0) {
+            int moved = 0;
+            uint64_t bytes = 0;
+            for (auto it = images.begin(); it != images.end();) {
+                Image* im = it->second.get();
+                bool attached = pass_at.depth == im;
+                for (Image* c : pass_at.color) attached |= c == im;
+                if (!im || attached || im->last_use >= frame_number - idle) {
+                    ++it;
+                    continue;
+                }
+                const uint64_t g = it->first;
+                bytes += image_bytes(*im);
+                spare_images.emplace(g, std::move(it->second));
+                it = images.erase(it);
+                note_image_change(g);
+                moved++;
+            }
+            if (moved) {
+                count("rt_retired", moved);
+                static int logged;
+                if (logged++ < 30)
+                    hos_log("rx: %d render targets unused for %lld frames retired (%llu MB; %zu kept)", moved,
+                            (long long)idle, (unsigned long long)(bytes >> 20), images.size());
+            }
+        }
+    }
     if (frame_number % 600 == 0)   // spare render targets not drawn for 10 s go
         for (auto it = spare_images.begin(); it != spare_images.end();)
             it = it->second->last_use < frame_number - 600 ? spare_images.erase(it) : std::next(it);
