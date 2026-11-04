@@ -291,6 +291,15 @@ void dump_pixel_after(const Attachments& at, const char* what) {
         for (const Image* c : at.color) hit |= c && c->guest == only;
         if (!hit) return;
     }
+    // RX_PIXEL_MRT=<n>: only draws into passes with at least n colour targets (TOTK's G-buffer has 4: one setting
+    // that finds it whatever its guest address this run); RX_PIXEL_SLOT=<i>: only that colour target is read
+    static const int mrt = getenv("RX_PIXEL_MRT") ? atoi(getenv("RX_PIXEL_MRT")) : 0;
+    static const int slot_only = getenv("RX_PIXEL_SLOT") ? atoi(getenv("RX_PIXEL_SLOT")) : -1;
+    if (mrt > 0) {
+        int n = 0;
+        for (const Image* c : at.color) n += c != nullptr;
+        if (n < mrt) return;
+    }
     if (!pixel_buffer) {
         WGPUBufferDescriptor bd{};
         bd.size = (uint64_t)kPixelReads * 256;
@@ -300,7 +309,7 @@ void dump_pixel_after(const Attachments& at, const char* what) {
     bool ended = false;
     for (int i = 0; i < 8; i++) {
         const Image* t = at.color[i];
-        if (!t || pixel_reads.size() >= kPixelReads) continue;
+        if (!t || pixel_reads.size() >= kPixelReads || (slot_only >= 0 && i != slot_only)) continue;
         uint8_t probe[4];
         const uint8_t zero[8]{};
         if (!texel(t->format, zero, probe)) continue;
