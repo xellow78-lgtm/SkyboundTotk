@@ -303,6 +303,11 @@ static void stick_max(int32_t stick[4], const int32_t v[4]) {
         if ((v[i] < 0 ? -v[i] : v[i]) > (stick[i] < 0 ? -stick[i] : stick[i])) stick[i] = v[i];
 }
 
+void hos_note_device(int style);   /* buttons.c: the device last played with (1 keyboard and mouse, 2 Xbox ...) */
+#ifndef __EMSCRIPTEN__
+extern volatile int64_t hos_sdl_active_ns;   /* pad_sdl.c */
+#endif
+
 static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     static int64_t next_read, retry[XUSER_MAX_COUNT];
     static int was_connected[XUSER_MAX_COUNT];
@@ -366,6 +371,15 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
             v[i] = (a > 7849 || a < -7849) ? a : 0;
         }
         stick_max(s, v);
+        /* (an XInput pad used: Xbox buttons, unless SDL saw a pad of its own used just now: SDL sees XInput's pads
+           too, and a PlayStation pad mapped to a virtual Xbox one shows in both) */
+#ifndef __EMSCRIPTEN__
+        if ((w || xs.Gamepad.bLeftTrigger > 64 || xs.Gamepad.bRightTrigger > 64 || v[0] || v[1] || v[2] || v[3]) &&
+            now - hos_sdl_active_ns > 100000000)
+#else
+        if (w || v[0] || v[1] || v[2] || v[3])
+#endif
+            hos_note_device(2);
     }
     cached_buttons = b;
     memcpy(cached_stick, s, sizeof s);
@@ -387,13 +401,16 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     pads_read(buttons, stick);
     if (hos_bind_ui_active) return;   /* (the bindings window has the keyboard and mouse) */
     int32_t keys[4] = {0};
+    const uint64_t from_pads = *buttons;
     hos_bind_poll(buttons, keys, mouse_held);   /* (first: whether L, the ability wheel, is held) */
+    if ((*buttons & ~from_pads) || keys[0] || keys[1] || keys[2] || keys[3]) hos_note_device(1);
     stick_max(stick, keys);
     hos_stick_nomouse[0] = stick[2] / 32767.0f;   /* (the right stick without the mouse: totk_mouse_cam.c) */
     hos_stick_nomouse[1] = stick[3] / 32767.0f;
     int32_t mouse[4] = {0};
     const int moused = mouse_stick(&mouse[2], &mouse[3], (int)(*buttons >> B_L & 1));
     if (moused) stick_max(stick, mouse);
+    if (mouse[2] || mouse[3]) hos_note_device(1);
     hos_stick_moused = moused && (stick[2] != (int32_t)(hos_stick_nomouse[0] * 32767.0f) ||
                                   stick[3] != (int32_t)(hos_stick_nomouse[1] * 32767.0f));
 }

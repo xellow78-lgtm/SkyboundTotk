@@ -31,6 +31,7 @@ typedef int32_t (*InstanceIdFn)(void *);
 typedef int32_t (*DeviceInstanceIdFn)(int);
 typedef int (*RumbleFn)(void *, uint16_t, uint16_t, uint32_t);
 typedef const char *(*GetErrorFn)(void);
+typedef int (*GetTypeFn)(void *);
 
 static struct {
     InitFn Init;
@@ -49,6 +50,7 @@ static struct {
     DeviceInstanceIdFn JoystickGetDeviceInstanceID;
     RumbleFn Rumble;
     GetErrorFn GetError;
+    GetTypeFn GetType;   /* (SDL 2.0.12 and later; without it every pad is taken for an Xbox-style one) */
 } sdl;
 
 enum { SDL_INIT_GAMECONTROLLER = 0x2000 };
@@ -59,7 +61,7 @@ enum { AX_LX, AX_LY, AX_RX, AX_RY, AX_LT, AX_RT };
 enum { H_A = 0, H_B, H_X, H_Y, H_LS, H_RS, H_L, H_R, H_ZL, H_ZR, H_PLUS, H_MINUS, H_LEFT, H_UP, H_RIGHT, H_DOWN };
 
 #define MAX_PADS 8
-static struct { void *gc; int32_t id; } pads[MAX_PADS];
+static struct { void *gc; int32_t id; int style; } pads[MAX_PADS];
 static SRWLOCK state_lock = SRWLOCK_INIT;
 static uint64_t state_buttons;
 static int32_t state_stick[4];
@@ -92,8 +94,23 @@ static int load(void) {
     GET(Rumble, "SDL_GameControllerRumble");
     GET(GetError, "SDL_GetError");
 #undef GET
+    *(FARPROC *)&sdl.GetType = GetProcAddress(m, "SDL_GameControllerGetType");
     return 1;
 }
+
+/* The button style a controller has (buttons.c: 2 Xbox, 3 PlayStation, 4 Switch), from SDL's controller type
+   (SDL_GameControllerType: 3 PS3, 4 PS4, 5 Switch Pro, 7 PS5, 11-13 Joy-Cons). Every other pad is drawn as an Xbox
+   one: most PC pads have its layout. */
+static int style_of(void *gc) {
+    const int t = sdl.GetType ? sdl.GetType(gc) : 0;
+    if (t == 3 || t == 4 || t == 7) return 3;
+    if (t == 5 || (t >= 11 && t <= 13)) return 4;
+    return 2;
+}
+void hos_note_device(int style);   /* buttons.c: the device last played with */
+volatile int64_t hos_sdl_active_ns;   /* when an SDL controller was last used (nn_hid.c: XInput's own pads then wait) */
+static volatile LONG scanned;         /* the first look for controllers is done */
+static volatile LONG connected_style; /* the style of the controllers connected (the most specific: 0 none) */
 
 static int32_t stick_value(int16_t v, int flip) {
     int32_t a = v < -32767 ? -32767 : v;
@@ -110,6 +127,7 @@ static DWORD WINAPI pad_main(void *arg) {
     sdl.SetHint("SDL_JOYSTICK_HIDAPI_PS4_RUMBLE", "1");
     if (sdl.Init(SDL_INIT_GAMECONTROLLER) != 0) {
         hos_log("hid: SDL could not start its controller support: %s", sdl.GetError());
+        scanned = 1;
         return 0;
     }
     hos_log("hid: SDL controller support ready (DualSense, DualShock 4, Switch Pro, Xbox and others)");
@@ -140,8 +158,15 @@ static DWORD WINAPI pad_main(void *arg) {
                 if (!gc) continue;
                 pads[slot].gc = gc;
                 pads[slot].id = sdl.JoystickInstanceID(sdl.GetJoystick(gc));
-                hos_log("hid: controller \"%s\" connected (SDL)", sdl.Name(gc));
+                pads[slot].style = style_of(gc);
+                hos_log("hid: controller \"%s\" connected (SDL, %s buttons)", sdl.Name(gc),
+                        pads[slot].style == 3 ? "PlayStation" : pads[slot].style == 4 ? "Switch" : "Xbox");
             }
+            int cs = 0;
+            for (int i = 0; i < MAX_PADS; i++)
+                if (pads[i].gc && pads[i].style > cs) cs = pads[i].style;   /* (PlayStation, Switch over Xbox) */
+            connected_style = cs;
+            scanned = 1;
         }
         uint64_t b = 0;
         int32_t s[4] = {0};
@@ -151,22 +176,30 @@ static DWORD WINAPI pad_main(void *arg) {
             {BTN_LSHOULDER, H_L}, {BTN_RSHOULDER, H_R}, {BTN_START, H_PLUS}, {BTN_BACK, H_MINUS},
             {BTN_LEFT, H_LEFT}, {BTN_UP, H_UP}, {BTN_RIGHT, H_RIGHT}, {BTN_DOWN, H_DOWN}};
         const uint16_t lo = (uint16_t)rumble_low, hi = (uint16_t)rumble_high;
+        int used_style = 0;   /* (the controllers used this poll: the most specific style) */
         for (int i = 0; i < MAX_PADS; i++) {
             void *gc = pads[i].gc;
             if (!gc) continue;
             count++;
+            uint64_t pb = 0;
             for (unsigned k = 0; k < sizeof map / sizeof *map; k++)
-                if (sdl.GetButton(gc, map[k].sdl)) b |= 1ULL << map[k].hid;
-            if (sdl.GetAxis(gc, AX_LT) > 8000) b |= 1ULL << H_ZL;
-            if (sdl.GetAxis(gc, AX_RT) > 8000) b |= 1ULL << H_ZR;
+                if (sdl.GetButton(gc, map[k].sdl)) pb |= 1ULL << map[k].hid;
+            if (sdl.GetAxis(gc, AX_LT) > 8000) pb |= 1ULL << H_ZL;
+            if (sdl.GetAxis(gc, AX_RT) > 8000) pb |= 1ULL << H_ZR;
+            b |= pb;
             const int32_t v[4] = {stick_value(sdl.GetAxis(gc, AX_LX), 0), stick_value(sdl.GetAxis(gc, AX_LY), 1),
                                   stick_value(sdl.GetAxis(gc, AX_RX), 0), stick_value(sdl.GetAxis(gc, AX_RY), 1)};
             for (int k = 0; k < 4; k++)
                 if ((v[k] < 0 ? -v[k] : v[k]) > (s[k] < 0 ? -s[k] : s[k])) s[k] = v[k];
+            if ((pb || v[0] || v[1] || v[2] || v[3]) && pads[i].style > used_style) used_style = pads[i].style;
             if (lo != last_lo || hi != last_hi) sdl.Rumble(gc, lo, hi, lo || hi ? 1000 : 0);
         }
         last_lo = lo;
         last_hi = hi;
+        if (used_style) {
+            hos_sdl_active_ns = now;
+            hos_note_device(used_style);
+        }
         AcquireSRWLockExclusive(&state_lock);
         state_buttons = b;
         memcpy(state_stick, s, sizeof s);
@@ -176,18 +209,31 @@ static DWORD WINAPI pad_main(void *arg) {
     }
 }
 
-/* The controllers' merged state (nn_hid.c): ORs the buttons in, keeps the larger stick deflections; returns how many
-   controllers SDL has open. Starts the SDL thread on the first call. */
-int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
+static void start(void) {
     static volatile LONG started;
     if (!started && !InterlockedExchange(&started, 1)) {
-        if (getenv("HOS_NO_SDL")) return 0;
+        if (getenv("HOS_NO_SDL")) { scanned = 1; return; }
         if (!load()) {
             hos_log("hid: SDL2.dll not found next to the exe: only XInput controllers (Xbox pads) work");
-            return 0;
+            scanned = 1;
+            return;
         }
         CreateThread(NULL, 0, pad_main, NULL, 0, NULL);
     }
+}
+
+/* buttons.c, at the start: the style of the controllers connected (2 Xbox, 3 PlayStation, 4 Switch; 0 none), once
+   SDL has looked (up to wait_ms) */
+int hos_sdl_connected_style(int wait_ms) {
+    start();
+    for (int t = 0; !scanned && t < wait_ms; t += 10) Sleep(10);
+    return (int)connected_style;
+}
+
+/* The controllers' merged state (nn_hid.c): ORs the buttons in, keeps the larger stick deflections; returns how many
+   controllers SDL has open. Starts the SDL thread on the first call. */
+int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
+    start();
     AcquireSRWLockShared(&state_lock);
     const int n = state_count;
     *buttons |= state_buttons;

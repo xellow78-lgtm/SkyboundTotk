@@ -24,6 +24,11 @@
 #include "rx_bcn.h"
 #include "rx_internal.h"
 
+extern "C" {
+int hos_button_hud_style(void);   // hos/buttons.c
+int hos_button_hud(uint64_t hash, uint32_t w, uint32_t h, const uint8_t** mask);
+}
+
 namespace rx {
 namespace {
 
@@ -784,6 +789,27 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
                                                  tiles.width, tiles.height, tiles.depth, block.height, block.depth,
                                                  stride_alignment);
             }
+            // the button guide's keys (R8 masks): drawn for the device played with (hos/buttons.c knows them by
+            // their pixels' hash)
+            if (info.format == PixelFormat::R8_UNORM && info.levels == 1 && copy_layers == 1 && !info.linear &&
+                info.dimension == WGPUTextureDimension_2D && info.size.width == info.size.height &&
+                info.size.width <= 256 && level_data.size() == (size_t)info.size.width * info.size.height) {
+                uint64_t h = 0xcbf29ce484222325ull;
+                for (uint8_t v : level_data) h = (h ^ v) * 0x100000001b3ull;
+                const uint8_t* mask = nullptr;
+                if (hos_button_hud(h, info.size.width, info.size.height, &mask)) {
+                    im->hud_icon = true;
+                    if (mask) std::memcpy(level_data.data(), mask, level_data.size());
+                    static int told;
+                    if (told++ < 16) hos_log("rx: button guide key %ux%u (%016llx) %s", info.size.width,
+                                             info.size.height, (unsigned long long)h, mask ? "drawn for the device" : "as it is");
+                } else if (info.size.width == 108) {   // (RX_LOG_HUD_KEYS=1: the others, to compare with tool.log)
+                    static const bool log_keys = env_flag("RX_LOG_HUD_KEYS");
+                    static int told;
+                    if (log_keys && told++ < 40)
+                        hos_log("rx: R8 108x108 texture (%016llx): not a button guide key", (unsigned long long)h);
+                }
+            }
             const uint8_t* upload = level_data.data();
             uint32_t row_bytes = tiles.width * bpp, rows = tiles.height;
             if (decode_any_compressed) {
@@ -1469,6 +1495,17 @@ void trim_decoded_textures() {
             hos_log("rx: anisotropic filtering: %s", names[l < 0 || l > 4 ? 0 : l]);
         }
         aniso_seen = l;
+    }
+    // (the button guide's style changed: its keys decoded again, at their next use)
+    static int hud_seen = -1;
+    if (const int hs = hos_button_hud_style(); hs != hud_seen) {
+        int n = 0;
+        if (hud_seen >= 0)
+            for (auto& [key, p] : decoded)
+                if (p && p->hud_icon) p->stale = true, p->content_hash ^= 1, n++;
+        if (n) hos_log("rx: button guide: %d keys drawn again (%s)", n,
+                       hs == 1 ? "keyboard and mouse" : hs == 2 ? "Xbox" : hs == 3 ? "PlayStation" : "Switch");
+        hud_seen = hs;
     }
     static const uint64_t budget = [] {
         const char* e = getenv("RX_TEXTURE_BUDGET_MB");

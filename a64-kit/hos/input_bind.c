@@ -143,12 +143,14 @@ void hos_bind_defaults(Bindings *b) {
     b->render_mode = 0;
     b->aniso = 0;
     b->reflex = 0;
+    b->button_icons = 0;
 }
 
-volatile int hos_aniso_level, hos_reflex_mode;
+volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting;
 static void apply_graphics(const Bindings *b) {
     hos_aniso_level = b->aniso;
     hos_reflex_mode = b->reflex;
+    hos_button_icons_setting = b->button_icons;
 }
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -196,6 +198,7 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "render_resolution")) { b->render_mode = atoi(v); continue; }
         if (!_stricmp(k, "anisotropic_filtering")) { b->aniso = atoi(v); continue; }
         if (!_stricmp(k, "nvidia_reflex")) { b->reflex = atoi(v); continue; }
+        if (!_stricmp(k, "button_icons")) { b->button_icons = atoi(v); continue; }
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -218,6 +221,7 @@ static void load(Bindings *b) {
     if (b->render_mode < 0 || b->render_mode >= hos_render_mode_count()) b->render_mode = 0;
     if (b->aniso < 0 || b->aniso > 4) b->aniso = 0;
     if (b->reflex < 0 || b->reflex > 2) b->reflex = 0;
+    if (b->button_icons < 0 || b->button_icons > 4) b->button_icons = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -236,8 +240,9 @@ static void save(const Bindings *b) {
                "# (1129x635), 3 Performance (960x540), 4 Ultra Performance (640x360); FSR 2 scales it up\n"
                "render_resolution = %d\n", b->render_mode);
     fprintf(f, "# anisotropic filtering: 0 the game's own, 1 2x, 2 4x, 3 8x, 4 16x\nanisotropic_filtering = %d\n"
-               "# NVIDIA Reflex: 0 off, 1 on, 2 on + boost (NVIDIA GPUs, Vulkan)\nnvidia_reflex = %d\n\n", b->aniso,
-               b->reflex);
+               "# NVIDIA Reflex: 0 off, 1 on, 2 on + boost (NVIDIA GPUs, Vulkan)\nnvidia_reflex = %d\n"
+               "# button prompts: 0 the device played with, 1 keyboard and mouse, 2 Xbox, 3 PlayStation, 4 Switch\n"
+               "button_icons = %d\n\n", b->aniso, b->reflex, b->button_icons);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)

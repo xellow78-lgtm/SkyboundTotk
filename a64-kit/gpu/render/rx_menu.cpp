@@ -1,6 +1,6 @@
 // The in-game settings menu (F1): drawn by the renderer over the frame, into the window's own image, so it works in
 // fullscreen and looks like part of the game. Three pages: Graphics (3D resolution, anisotropic filtering, NVIDIA
-// Reflex, which upscaler runs), Mouse (the mouse camera and its speeds), Controls (the keyboard and mouse bindings).
+// Reflex, button icons, which upscaler runs), Mouse (the mouse camera and its speeds), Controls (the keyboard and mouse bindings).
 // Every change applies at once and is saved to input.ini (hos/input_bind.c), as the old settings window did.
 //
 // Keyboard: Up / Down a row, Left / Right change it (or the key slot on Controls), Enter: toggle, press a button, or
@@ -49,7 +49,7 @@ const char* const kPageNames[kPages] = {"Graphics", "Mouse", "Controls"};
 
 enum Kind { kOption, kSlider, kToggle, kBinding, kButton, kInfo, kSection };
 enum Id {
-    kRes, kAniso, kReflex, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
+    kRes, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
 };
 
 struct Row {
@@ -64,6 +64,7 @@ struct Row {
 
 const char* const kAnisoNames[5] = {"Game's own", "2x", "4x", "8x", "16x"};
 const char* const kReflexNames[3] = {"Off", "On", "On + Boost"};
+const char* const kButtonNames[5] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Switch"};
 
 // the bindings page: the buttons, the d-pad, the sticks and walk (sections between)
 const int kControlOrder[] = {ACT_A, ACT_B, ACT_X, ACT_Y, ACT_L, ACT_R, ACT_ZL, ACT_ZR, ACT_PLUS, ACT_MINUS, ACT_LS,
@@ -93,6 +94,9 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
                       reflex_available() ? "Less input lag. Boost also keeps the GPU's clocks up."
                                          : "Needs an NVIDIA GPU on Vulkan.");
         rf.enabled = reflex_available();
+        add(kOption, kButtons, "Button icons", kButtonNames[std::clamp(b.button_icons, 0, 4)],
+            b.button_icons ? "Prompts in text change at the next start; the button guide now."
+                           : "The device you play with. Prompts in text: as at the start.");
         add(kInfo, kUpscaler, "Upscaler",
             dlss_ready() ? "NVIDIA DLSS" : scaler ? "AMD FSR 2" : "The game's own",
             "Chosen when the game starts.");
@@ -221,6 +225,7 @@ void change(State& s, const Row& r, int dir) {
     case kRes: b.render_mode = (b.render_mode + dir + hos_render_mode_count()) % hos_render_mode_count(); break;
     case kAniso: b.aniso = (b.aniso + dir + 5) % 5; break;
     case kReflex: b.reflex = (b.reflex + dir + 3) % 3; break;
+    case kButtons: b.button_icons = (b.button_icons + dir + 5) % 5; break;
     case kMouseCam: b.mouse_camera = !b.mouse_camera; break;
     case kInvert: b.mouse_invert_y = !b.mouse_invert_y; break;
     case kSens: b.mouse_sens = std::clamp(b.mouse_sens + step * 0.05, 0.05, 5.0); break;
@@ -251,6 +256,7 @@ void reset_controls(State& s) {
     hos_bind_get(&b);
     hos_bind_defaults(&d);
     d.render_mode = b.render_mode, d.aniso = b.aniso, d.reflex = b.reflex;   // (the graphics settings: kept)
+    d.button_icons = b.button_icons;
     hos_bind_set(&d);
     set_status(s, "Controls and mouse settings are back to the defaults.");
 }

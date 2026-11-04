@@ -28,11 +28,14 @@ typedef struct {
                                               Performance (not a binding, but saved with them: F1 shows it) */
     int aniso;                             /* anisotropic filtering: 0 the game's own, 1 2x, 2 4x, 3 8x, 4 16x */
     int reflex;                            /* NVIDIA Reflex: 0 off, 1 on, 2 on + boost */
+    int button_icons;                      /* the button prompts drawn: 0 for the device played with, 1 keyboard and
+                                              mouse, 2 Xbox, 3 PlayStation, 4 Switch (buttons.c) */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */
 extern volatile int hos_aniso_level;   /* Bindings.aniso */
 extern volatile int hos_reflex_mode;   /* Bindings.reflex */
+extern volatile int hos_button_icons_setting;   /* Bindings.button_icons */
 
 /* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
 int hos_render_mode_count(void);

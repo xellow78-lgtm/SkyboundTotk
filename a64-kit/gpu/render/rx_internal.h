@@ -105,6 +105,7 @@ struct Image {
     uint64_t decoded_seq = 0;               // memory_seq() when it was decoded (0: no tracking: content_hash)
     uint64_t guest_bytes = 0;               // a texture decoded from memory: how much it covers
     bool stale = false;                     // ...and its memory was written since
+    bool hud_icon = false;                  // one of the button guide's keys (hos/buttons.c): drawn for the device
     int64_t last_use = 0;
     std::vector<std::pair<uint64_t, WGPUTextureView>> views;
     uint64_t version = 0;                    // a render target: bumped by each pass that may write it

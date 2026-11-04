@@ -751,6 +751,22 @@ def cmd_native(a):
         dst = os.path.join(nat, "SDL2.dll")
         if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(sdl):
             shutil.copyfile(sdl, dst)
+    # the button icons drawn for the device played with (hos/buttons.c): the game runs tools/button_icons.py with this
+    # Python when its cache is out of date; it needs fontTools and zstd (Python 3.14's own, or zstandard)
+    if os.name == "nt":
+        shutil.copyfile(os.path.join(HERE, "tools", "button_icons.py"), os.path.join(nat, "button_icons.py"))
+        open(os.path.join(nat, "python.txt"), "w").write(sys.executable + "\n")
+        def have(mod):
+            return subprocess.run([sys.executable, "-c", "import " + mod], capture_output=True).returncode == 0
+        need = [] if have("fontTools") else ["fonttools"]
+        if not have("compression.zstd") and not have("zstandard"):
+            need.append("zstandard")
+        if need:
+            print("button icons: installing %s (pip)" % ", ".join(need), flush=True)
+            user = [] if sys.prefix != sys.base_prefix else ["--user"]   # (a virtualenv takes no --user)
+            if subprocess.run([sys.executable, "-m", "pip", "install"] + user + need).returncode:
+                print("button icons: pip failed: the game keeps the Switch's button prompts (pip install %s)"
+                      % " ".join(need))
     # RX_LINK_ORDER=<file>: lifted functions laid out in that order first (hos_prof.c's HOS_PROFILE_ORDER writes one:
     # the sampled functions, hottest first), so the hot code shares pages and cache lines. Default: the port's
     # link order for this game build (versions.txt; TOTK 1.0.0: castle profile, 2966 functions; game threads -1.4% CPU
