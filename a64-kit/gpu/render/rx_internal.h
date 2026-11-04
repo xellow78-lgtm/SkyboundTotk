@@ -423,6 +423,8 @@ void dlss_before_device(WGPUAdapter adapter);
 void dlss_after_device();
 bool dlss_ready();
 bool dlss_record(WGPUCommandEncoder e, const DlssInputs& in);
+/// VRAM pressure: the kept DLSS features other than the one in use are released (made again when needed).
+void dlss_trim();
 /// Raw Vulkan commands at this point of the encoder (wgpu-native's wgpuTotkCommandEncoderRaw, deferred like the
 /// rest): the textures are moved to the given states (wgpu's TextureUses bits) and held with the views until the
 /// replay; cb(VkCommandBuffer, user) runs when the encoder is finished. RX_DLSS builds only.
@@ -777,6 +779,11 @@ extern thread_local bool rx_side_thread;
 /// Textures decoded on the worker since the last call go into the decoded map (render thread, each frame).
 void install_decoded_textures();
 void trim_decoded_textures();
+/// VRAM pressure (rx_core.cpp vram_pressure): the decoded textures not used for `idle_frames`, oldest first, until
+/// `want` bytes are freed. Returns the bytes freed (*count: how many textures).
+uint64_t trim_decoded_textures_for_vram(uint64_t want, int64_t idle_frames, int* count);
+/// This process's graphics-card memory and Windows' budget for it (DXGI; false when unknown).
+bool vram_query(uint64_t* used, uint64_t* budget, uint64_t* shared = nullptr);   // (shared: in system memory)
 uint64_t image_bytes(const Image& im);
 void decoded_texture_stats(size_t* n, uint64_t* bytes);
 size_t buffer_segments();

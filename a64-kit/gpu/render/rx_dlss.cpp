@@ -487,6 +487,20 @@ bool dlss_ready() {
     return s.ready && !s.failed;
 }
 
+void dlss_trim() {
+    State& s = S();
+    if (!s.ready) return;
+    std::lock_guard lk(s.mu);
+    int n = 0;
+    for (auto& sl : s.slots)
+        if (sl.h && sl.h != s.feature) {
+            s.graveyard.push_back({sl.h, s.evaluations});   // (released 16 evaluations later: release_old)
+            sl = State::Slot{};
+            n++;
+        }
+    if (n) hos_log("rx: DLSS: %d kept feature(s) released (VRAM)", n);
+}
+
 bool dlss_record(WGPUCommandEncoder e, const DlssInputs& in) {
     if (!dlss_ready()) return false;
     Call* c = new Call{};
@@ -534,6 +548,7 @@ void dlss_before_device(WGPUAdapter) {}
 void dlss_after_device() {}
 bool dlss_ready() { return false; }
 bool dlss_record(WGPUCommandEncoder, const DlssInputs&) { return false; }
+void dlss_trim() {}
 }   // namespace rx
 
 #endif

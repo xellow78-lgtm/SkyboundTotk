@@ -2272,12 +2272,11 @@ extern "C" volatile LONG64 hos_fs_read_ns, hos_fs_read_bytes;   // hos/nn_fs.c
 /// (DXGI's QueryVideoMemoryInfo: WDDM counts every API's allocations, Vulkan's too). Over the budget, Windows moves
 /// some of it into system memory, and everything that touches it slows down whatever the resolution. Text for the
 /// 5 s fps line; empty when not on Windows or no DXGI.
-static std::string vram_text() {
+bool vram_query(uint64_t* used, uint64_t* budget, uint64_t* shared) {
 #if !RX_WEB && defined(_WIN32)
-    static IDXGIAdapter3* adapter = nullptr;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
+    // (made once, thread safe: the render thread and the submit thread both ask)
+    static IDXGIAdapter3* const adapter = []() -> IDXGIAdapter3* {
+        IDXGIAdapter3* adapter = nullptr;
         HMODULE m = LoadLibraryW(L"dxgi.dll");
         using Create = HRESULT(WINAPI*)(REFIID, void**);
         Create create = m ? reinterpret_cast<Create>(reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory1")))
@@ -2301,21 +2300,66 @@ static std::string vram_text() {
             }
             f->Release();
         }
-        if (!adapter) hos_log("rx: no DXGI adapter: no VRAM numbers in the log");
-    }
-    if (!adapter) return {};
-    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
-    if (FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) ||
-        FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
-        return {};
+        if (!adapter) hos_log("rx: no DXGI adapter: no VRAM numbers, no VRAM pressure handling");
+        return adapter;
+    }();
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+    if (!adapter || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) return false;
+    *used = local.CurrentUsage;
+    *budget = local.Budget;
+    DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal{};
+    if (shared) *shared = SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))
+                              ? nonlocal.CurrentUsage : 0;
+    return true;
+#else
+    (void)used, (void)budget, (void)shared;
+    return false;
+#endif
+}
+
+/// The GPU memory this process uses on the graphics card, against what Windows gives it (DXGI's
+/// QueryVideoMemoryInfo: WDDM counts every API's allocations, Vulkan's too), and in shared system memory. Text for
+/// the 5 s fps line (RX_VRAM_LOG=1).
+static std::string vram_text() {
+#if !RX_WEB && defined(_WIN32)
+    uint64_t used = 0, budget = 0, shared = 0;
+    if (!vram_query(&used, &budget, &shared)) return {};
     char b[160];
-    std::snprintf(b, sizeof b, "; VRAM %llu of %llu MB%s, shared memory %llu MB",
-                  (unsigned long long)(local.CurrentUsage >> 20), (unsigned long long)(local.Budget >> 20),
-                  local.CurrentUsage > local.Budget ? " (OVER)" : "", (unsigned long long)(shared.CurrentUsage >> 20));
+    std::snprintf(b, sizeof b, "; VRAM %llu of %llu MB%s, shared memory %llu MB", (unsigned long long)(used >> 20),
+                  (unsigned long long)(budget >> 20), used > budget ? " (OVER)" : "", (unsigned long long)(shared >> 20));
     return b;
 #else
     return {};
 #endif
+}
+
+/// Over Windows' VRAM budget, the driver moves some of the game's GPU memory into system memory, and every pass that
+/// reads it gets much slower whatever the resolution (seen: the main 3D pass 1 -> 13 ms a frame, 60 -> 28 fps, after
+/// the inventory loaded its textures near the budget, and it stayed so). The decoded-texture cache only trimmed
+/// itself past a fixed 2 GB, so nothing gave memory back. Every 2 s: when this process is within RX_VRAM_MARGIN_MB
+/// (default 600) of the budget, the decoded textures not used for 2 s go, oldest first, until it is ~1 GB under,
+/// and the kept DLSS features not in use. (They come back when needed: a texture is decoded again on its next use.)
+/// RX_VRAM_TRIM=0: off.
+static void vram_pressure() {
+    static const bool off = getenv("RX_VRAM_TRIM") && *getenv("RX_VRAM_TRIM") == '0';
+    static const uint64_t margin = (uint64_t)(getenv("RX_VRAM_MARGIN_MB") ? atoll(getenv("RX_VRAM_MARGIN_MB")) : 600) << 20;
+    static int64_t last_trim = -100000;
+    if (off || frame_number % 120 != 60) return;
+    uint64_t used = 0, budget = 0;
+    if (!vram_query(&used, &budget) || !budget || used + margin <= budget) return;
+    if (frame_number - last_trim < 600 && used <= budget) return;   // (the last trim's frees may not show yet)
+    last_trim = frame_number;
+    const uint64_t target = budget > margin + (400ull << 20) ? budget - margin - (400ull << 20) : 0;
+    const uint64_t want = used > target ? used - target : 0;
+    int n = 0;
+    const uint64_t freed = trim_decoded_textures_for_vram(want, 120, &n);
+    dlss_trim();
+    static int logged;
+    if (logged++ < 60)
+        hos_log("rx: VRAM %llu of %llu MB (%llu MB from the limit): %d decoded textures not used for 2 s released, "
+                "%llu MB",
+                (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20),
+                (unsigned long long)((budget > used ? budget - used : 0) >> 20), n, (unsigned long long)(freed >> 20));
 }
 
 /// A present that came long after the one before (RX_STALL_MS, default 100): what the renderer did in between, from
@@ -4353,6 +4397,7 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
         frame_number++;
     }
     trim_decoded_textures();
+    vram_pressure();
     if (frame_number % 600 == 300) retire_unused_segments();
     if (frame_number % 600 == 450) reset_idle_stream_memory();
     if (frame_number % 600 == 150) trim_pipelines();

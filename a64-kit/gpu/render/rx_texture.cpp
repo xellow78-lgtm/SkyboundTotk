@@ -1511,6 +1511,30 @@ void trim_decoded_textures() {
     }
 }
 
+uint64_t trim_decoded_textures_for_vram(uint64_t want, int64_t idle_frames, int* count_out) {
+    std::vector<std::pair<int64_t, uint64_t>> idle;
+    for (const auto& [key, p] : decoded)
+        if (p && p->last_use < frame_number - idle_frames) idle.emplace_back(p->last_use, key);
+    std::sort(idle.begin(), idle.end());
+    uint64_t freed = 0;
+    int n = 0;
+    for (const auto& [use, key] : idle) {
+        if (freed >= want) break;
+        auto it = decoded.find(key);
+        if (it == decoded.end() || !it->second) continue;
+        freed += image_bytes(*it->second);
+        forget(it->second.get());
+        decoded.erase(it);
+        n++;
+    }
+    if (n) {
+        decoded_generation++;
+        count("tex_trimmed_vram", n);
+    }
+    if (count_out) *count_out = n;
+    return freed;
+}
+
 void textures_written(uint64_t guest, uint64_t size) {
     if (decoded_by_bucket.empty() || !size) return;
     for (uint64_t b = guest >> kBucketShift; b <= (guest + size - 1) >> kBucketShift; b++) {
