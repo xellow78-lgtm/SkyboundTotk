@@ -10,9 +10,14 @@
 // How: NGX wants the Vulkan instance / device extensions it needs before they are made (dlss_before_instance,
 // dlss_before_device), then the device (dlss_after_device: NGX init, DLSS available?). Each frame dlss_record puts a
 // raw command into the frame's encoder (wgpuTotkCommandEncoderRaw): wgpu moves the inputs to the sampled layout and
-// the output to the storage one, then, when the encoder is finished, the callback creates the DLSS feature (once,
-// and again when the sizes or the mode change) and evaluates it on the raw VkCommandBuffer. DLSS puts the images
-// back in the states it got them in.
+// the output to the storage one, then, when the encoder is finished, the callback evaluates DLSS on the raw
+// VkCommandBuffer. DLSS puts the images back in the states it got them in.
+//
+// The feature (NGX's network for a mode, an output size and a render size): a mode takes render sizes in its
+// "dynamic" range only (NGX says which: about 50%..100% of the output for Quality / Balanced / Performance at
+// 1080p; none for Ultra Performance), so a feature is made at the largest render size when the game's size is in
+// that range, else at exactly the game's size (the menus' 800x448, Ultra Performance's 640x360). Up to 4 are kept
+// (each one made is a hitch of up to a few seconds); 30 failures in a row turn DLSS off, FSR 2 takes over.
 //
 // RX_DLSS_PRESET=<0..> (a render preset for every mode; default NGX's), RX_DLSS_MASK=0 (no bias mask from Link's
 // G-buffer marks), RX_DLSS_JX / RX_DLSS_JY / RX_DLSS_MVX / RX_DLSS_MVY = -1 (a sign, checking), RX_DLSS_LOG=1 (NGX's
@@ -33,8 +38,13 @@
 #include <nvsdk_ngx_helpers_vk.h>
 #include <nvsdk_ngx_vk.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cwchar>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 // wgpu-native's TOTK exports (totk-src/wgpu-native/src/totk_vk.rs)
 extern "C" {
@@ -60,14 +70,33 @@ constexpr uint32_t kResource = 1u << 4, kStorageRW = 1u << 10;   // (wgpu's Text
 const char* const kProjectId = "6b0f3c52-8d1e-4a77-9c2b-5e4f7a1d9038";
 
 struct State {
-    bool wanted = false, extensions_asked = false, ready = false, failed = false;
+    bool wanted = false, extensions_asked = false, ready = false;
+    std::atomic<bool> failed{false};
     WGPUTotkVulkanHandles vk{};
     NVSDK_NGX_Parameter* params = nullptr;
+    // the features made (kept: each one made again is a hitch), the one in use is `feature` with its creation sizes
+    struct Slot {
+        NVSDK_NGX_Handle* h = nullptr;
+        uint32_t w = 0, h_ = 0, dw = 0, dh = 0;
+        int quality = -1;
+        int64_t used = 0;
+    };
+    static constexpr int kSlots = 4;
+    Slot slots[kSlots];
+    std::vector<std::pair<NVSDK_NGX_Handle*, int64_t>> graveyard;   // (released later: release_old)
     NVSDK_NGX_Handle* feature = nullptr;
-    uint32_t fw = 0, fh = 0, fdw = 0, fdh = 0;   // the feature's creation sizes
+    uint32_t fw = 0, fh = 0, fdw = 0, fdh = 0;
     int fquality = -1;
     std::mutex mu;   // (NGX is not thread safe: the callbacks run where encoders are finished)
-    int64_t evaluations = 0, errors = 0;
+    int64_t evaluations = 0, errors = 0, creations = 0;
+    int failures_in_a_row = 0;
+    // each mode's render sizes for an output size (NGX_DLSS_GET_OPTIMAL_SETTINGS), asked once per output size
+    struct Range {
+        bool known = false, ok = false;
+        uint32_t opt_w, opt_h, min_w, min_h, max_w, max_h;
+    };
+    uint32_t range_dw = 0, range_dh = 0;
+    Range ranges[6];
 };
 State& S() {
     static State s;
@@ -165,46 +194,165 @@ const char* result_text(NVSDK_NGX_Result r) {
     return b;
 }
 
+// the render sizes NGX takes for a mode at this output size (its "dynamic" range: a feature of that mode takes any
+// render size in it; a mode without one (Ultra Performance, seen: min = max) takes only the size it was made for)
+const State::Range& range(State& s, uint32_t dw, uint32_t dh, int quality) {
+    static const State::Range none{};
+    if (quality < 0 || quality > 5) return none;
+    if (s.range_dw != dw || s.range_dh != dh) {
+        for (auto& r : s.ranges) r = State::Range{};
+        s.range_dw = dw, s.range_dh = dh;
+    }
+    State::Range& r = s.ranges[quality];
+    if (r.known) return r;
+    r.known = true;
+    // (what NVIDIA's NGX_DLSS_GET_OPTIMAL_SETTINGS in nvsdk_ngx_helpers.h does; that header pulls in the D3D and
+    // CUDA ones, not fetched here)
+    NVSDK_NGX_Result res = NVSDK_NGX_Result_FAIL_OutOfDate;
+    void* cb = nullptr;
+    NVSDK_NGX_Parameter_GetVoidPointer(s.params, NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &cb);
+    if (cb) {
+        NVSDK_NGX_Parameter_SetUI(s.params, NVSDK_NGX_Parameter_Width, dw);
+        NVSDK_NGX_Parameter_SetUI(s.params, NVSDK_NGX_Parameter_Height, dh);
+        NVSDK_NGX_Parameter_SetI(s.params, NVSDK_NGX_Parameter_PerfQualityValue, quality);
+        NVSDK_NGX_Parameter_SetI(s.params, NVSDK_NGX_Parameter_RTXValue, 0);
+        res = reinterpret_cast<PFN_NVSDK_NGX_DLSS_GetOptimalSettingsCallback>(cb)(s.params);
+    }
+    if (NVSDK_NGX_SUCCEED(res)) {
+        NVSDK_NGX_Parameter_GetUI(s.params, NVSDK_NGX_Parameter_OutWidth, &r.opt_w);
+        NVSDK_NGX_Parameter_GetUI(s.params, NVSDK_NGX_Parameter_OutHeight, &r.opt_h);
+        r.min_w = r.max_w = r.opt_w, r.min_h = r.max_h = r.opt_h;   // (older DLSS: no dynamic range given)
+        NVSDK_NGX_Parameter_GetUI(s.params, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width, &r.max_w);
+        NVSDK_NGX_Parameter_GetUI(s.params, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height, &r.max_h);
+        NVSDK_NGX_Parameter_GetUI(s.params, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, &r.min_w);
+        NVSDK_NGX_Parameter_GetUI(s.params, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, &r.min_h);
+    }
+    r.ok = NVSDK_NGX_SUCCEED(res) && r.max_w && r.max_h;
+    if (r.ok)
+        hos_log("rx: DLSS: mode %d at %ux%u: renders at %ux%u, takes %ux%u .. %ux%u", quality, dw, dh, r.opt_w, r.opt_h,
+                r.min_w, r.min_h, r.max_w, r.max_h);
+    else
+        hos_log("rx: DLSS: mode %d at %ux%u: NGX gave no render sizes (%s)", quality, dw, dh, result_text(res));
+    return r;
+}
+
+// Can a feature of this mode made at (cw, ch) take a render size of (rw, rh)? Its own size always (seen: 800x448 in
+// a Quality feature made at 800x448); otherwise the mode's dynamic range. (8 pixels of slack under the minimum: the
+// scene is a multiple of 8 high, and 960x536 was taken by a range starting at 960x540 in the last log.)
+// (cw, ch) = (0, 0): would a feature made for the dynamic range take it. One made at a size outside the range (for
+// exactly that size) takes only that size.
+bool takes(const State::Range& r, uint32_t cw, uint32_t ch, uint32_t rw, uint32_t rh) {
+    if (rw == cw && rh == ch) return true;
+    if (!r.ok || (r.min_w == r.max_w && r.min_h == r.max_h)) return false;
+    auto in = [&](uint32_t w, uint32_t h) { return w + 8 >= r.min_w && h + 8 >= r.min_h && w <= r.max_w && h <= r.max_h; };
+    return (!cw || in(cw, ch)) && in(rw, rh);
+}
+
+// A feature out of use is released some evaluations later (the GPU may still be running a frame that uses it; a
+// frame in flight is long done 16 evaluations later)
+void release_old(State& s, bool all) {
+    auto& g = s.graveyard;
+    for (size_t i = 0; i < g.size();) {
+        if (all || s.evaluations > g[i].second + 16) {
+            NVSDK_NGX_VULKAN_ReleaseFeature(g[i].first);
+            g[i] = g.back();
+            g.pop_back();
+        } else {
+            i++;
+        }
+    }
+}
+
+// A feature made at (cw, ch) for this call's output and mode into use: one kept from before, else a new one (in the
+// least recently used slot). `made`: a new one or another kept one (its history is not this frame's: reset).
+bool create(State& s, VkCommandBuffer cmd, uint32_t cw, uint32_t ch, const Call* c) {
+    State::Slot* victim = &s.slots[0];
+    for (auto& sl : s.slots) {
+        if (sl.h && sl.w == cw && sl.h_ == ch && sl.dw == c->dw && sl.dh == c->dh && sl.quality == c->quality) {
+            sl.used = s.evaluations;
+            s.feature = sl.h;
+            s.fw = cw, s.fh = ch, s.fdw = c->dw, s.fdh = c->dh, s.fquality = c->quality;
+            return true;
+        }
+        if (!sl.h || (victim->h && sl.used < victim->used)) victim = &sl;
+    }
+    if (victim->h) {
+        if (victim->h == s.feature) s.feature = nullptr;
+        s.graveyard.push_back({victim->h, s.evaluations});
+        *victim = State::Slot{};
+    }
+    s.feature = nullptr;
+    NVSDK_NGX_DLSS_Create_Params cp{};
+    cp.Feature.InWidth = cw;
+    cp.Feature.InHeight = ch;
+    cp.Feature.InTargetWidth = c->dw;
+    cp.Feature.InTargetHeight = c->dh;
+    cp.Feature.InPerfQualityValue = static_cast<NVSDK_NGX_PerfQuality_Value>(c->quality);
+    cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+                              NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    static const char* preset = getenv("RX_DLSS_PRESET");
+    if (preset) {
+        const unsigned p = static_cast<unsigned>(std::atoi(preset));
+        for (auto key : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
+                         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+                         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance})
+            NVSDK_NGX_Parameter_SetUI(s.params, key, p);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &s.feature, s.params, &cp);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (NVSDK_NGX_FAILED(r)) {
+        hos_log("rx: DLSS: the feature was not made (%ux%u -> %ux%u, mode %d): %s", cw, ch, c->dw, c->dh, c->quality,
+                result_text(r));
+        s.feature = nullptr;
+        s.fw = s.fh = 0;
+        return false;
+    }
+    s.fw = cw, s.fh = ch, s.fdw = c->dw, s.fdh = c->dh, s.fquality = c->quality;
+    victim->h = s.feature, victim->w = cw, victim->h_ = ch, victim->dw = c->dw, victim->dh = c->dh;
+    victim->quality = c->quality, victim->used = s.evaluations;
+    s.creations++;
+    if (s.creations <= 40 || s.creations % 100 == 0)
+        hos_log("rx: DLSS: feature made (#%lld, %.0f ms): %ux%u -> %ux%u, mode %d", (long long)s.creations, ms, cw, ch,
+                c->dw, c->dh, c->quality);
+    return true;
+}
+
 void evaluate(uint64_t cmd_raw, void* user) {
     Call* c = static_cast<Call*>(user);
     State& s = S();
     std::lock_guard lk(s.mu);
+    if (s.failed) {
+        delete c;
+        return;
+    }
     VkCommandBuffer cmd = reinterpret_cast<VkCommandBuffer>(static_cast<uintptr_t>(cmd_raw));
-    // the feature: made for the largest render size and this output size and mode; again when they change
-    if (!s.feature || s.fw != c->mw || s.fh != c->mh || s.fdw != c->dw || s.fdh != c->dh || s.fquality != c->quality) {
-        if (s.feature) {
-            NVSDK_NGX_VULKAN_ReleaseFeature(s.feature);
-            s.feature = nullptr;
+    release_old(s, false);
+    // The feature: made once for the mode and output size and kept while the render size stays in what it takes
+    // (the game's DRS moving inside the mode's dynamic range: no new feature). Made again (each one is a hitch:
+    // NGX builds its network) when the mode or the output changes, or the render size leaves that: at the mode's
+    // largest size if the new size is in its dynamic range, else at exactly the render size.
+    const State::Range& rg = range(s, c->dw, c->dh, c->quality);
+    const bool same = s.feature && s.fdw == c->dw && s.fdh == c->dh && s.fquality == c->quality;
+    bool fresh = false;
+    if (!same || !takes(rg, s.fw, s.fh, c->rw, c->rh)) {
+        uint32_t cw = c->rw, ch = c->rh;
+        if (takes(rg, 0, 0, c->rw, c->rh)) {
+            cw = std::min(std::max(c->mw, c->rw), rg.max_w);
+            ch = std::min(std::max(c->mh, c->rh), rg.max_h);
         }
-        NVSDK_NGX_DLSS_Create_Params cp{};
-        cp.Feature.InWidth = c->mw;
-        cp.Feature.InHeight = c->mh;
-        cp.Feature.InTargetWidth = c->dw;
-        cp.Feature.InTargetHeight = c->dh;
-        cp.Feature.InPerfQualityValue = static_cast<NVSDK_NGX_PerfQuality_Value>(c->quality);
-        cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                                  NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-        static const char* preset = getenv("RX_DLSS_PRESET");
-        if (preset) {
-            const unsigned p = static_cast<unsigned>(std::atoi(preset));
-            for (auto key : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
-                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
-                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
-                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance})
-                NVSDK_NGX_Parameter_SetUI(s.params, key, p);
-        }
-        const NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &s.feature, s.params, &cp);
-        if (NVSDK_NGX_FAILED(r)) {
-            hos_log("rx: DLSS: the feature was not made (%ux%u -> %ux%u, mode %d): %s; DLSS off", c->mw, c->mh, c->dw, c->dh,
-                    c->quality, result_text(r));
-            s.feature = nullptr;
-            s.failed = true;
+        if (s.fw == cw && s.fh == ch && same) {
+            // (in use already)
+        } else if (!create(s, cmd, cw, ch, c)) {
+            if (++s.failures_in_a_row >= 30) {
+                hos_log("rx: DLSS: 30 failures in a row: DLSS off, FSR 2 from here");
+                s.failed = true;
+            }
             delete c;
             return;
         }
-        s.fw = c->mw, s.fh = c->mh, s.fdw = c->dw, s.fdh = c->dh, s.fquality = c->quality;
-        hos_log("rx: DLSS: feature made: up to %ux%u -> %ux%u, mode %d", c->mw, c->mh, c->dw, c->dh, c->quality);
-        c->reset = 1;
+        fresh = true;
     }
     NVSDK_NGX_VK_DLSS_Eval_Params e{};
     e.Feature.pInColor = &c->color;
@@ -217,16 +365,32 @@ void evaluate(uint64_t cmd_raw, void* user) {
     e.InJitterOffsetY = c->jy;
     e.InRenderSubrectDimensions.Width = c->rw;
     e.InRenderSubrectDimensions.Height = c->rh;
-    e.InReset = c->reset;
+    e.InReset = (c->reset || fresh) ? 1 : 0;
     e.InMVScaleX = c->mvx;
     e.InMVScaleY = c->mvy;
     e.InFrameTimeDeltaInMsec = c->dt_ms;
-    const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &e);
+    NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &e);
+    if (NVSDK_NGX_FAILED(r) && (s.fw != c->rw || s.fh != c->rh)) {
+        // NGX did not take this render size after all: a feature made for exactly it (that one it takes)
+        if (s.errors < 40) hos_log("rx: DLSS: %ux%u not taken by the feature made at %ux%u (%s): one made for it", c->rw,
+                                   c->rh, s.fw, s.fh, result_text(r));
+        if (create(s, cmd, c->rw, c->rh, c)) {
+            e.InReset = 1;
+            r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &e);
+        }
+    }
     s.evaluations++;
     if (NVSDK_NGX_FAILED(r)) {
-        if (s.errors++ < 20) hos_log("rx: DLSS: evaluation failed: %s", result_text(r));
-    } else if (s.evaluations == 1) {
-        hos_log("rx: DLSS: first evaluation: %ux%u -> %ux%u", c->rw, c->rh, c->dw, c->dh);
+        if (s.errors++ < 40 || s.errors % 500 == 0)
+            hos_log("rx: DLSS: evaluation failed (%lld so far): %ux%u -> %ux%u, mode %d: %s", (long long)s.errors, c->rw,
+                    c->rh, c->dw, c->dh, c->quality, result_text(r));
+        if (++s.failures_in_a_row >= 30) {
+            hos_log("rx: DLSS: 30 failures in a row: DLSS off, FSR 2 from here");
+            s.failed = true;
+        }
+    } else {
+        s.failures_in_a_row = 0;
+        if (s.evaluations == 1) hos_log("rx: DLSS: first evaluation: %ux%u -> %ux%u", c->rw, c->rh, c->dw, c->dh);
     }
     delete c;
 }

@@ -142,6 +142,7 @@ struct State {
     WGPUBuffer cb[kRing] = {}, cb_spd[kRing] = {}, cb_rcas[kRing] = {}, cb_mv[kRing] = {};
     int64_t dispatches = 0;   // (FSR frames: the ping-pong side and the ring slot)
     bool reset = true;
+    bool last_dlss = false;
     float pre_exposure = 1;
     // jitter: this frame's (pixels), set at the first jittered draw of a frame
     int64_t jitter_frame = -1;
@@ -598,6 +599,11 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     st.last_ns = now;
     st.phase_count = std::max(1, (int)(8.0f * std::pow((float)dw / (float)rw, 2.0f)));
 
+    // DLSS in FSR 2's place (rx_dlss.cpp: the motion vectors, then DLSS), unless it is not there or turned itself
+    // off: then FSR 2, from a fresh history (its own was not kept while DLSS ran)
+    const bool use_dlss = dlss_ready();
+    if (use_dlss != st.last_dlss) st.reset = true;
+    st.last_dlss = use_dlss;
     // ---- constants ----
     const float near_ = cur.v[56], far_ = cur.v[57];
     const float q = far_ / (near_ - far_);
@@ -719,7 +725,6 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     samplers[1].binding = 1;
     samplers[1].sampler = st.linear;
     bool ok = true;
-    const bool use_dlss = dlss_ready();   // (DLSS in FSR 2's place: the motion vectors, then DLSS; rx_dlss.cpp)
     for (int p = 0; p < 6 && ok && !use_dlss; p++) {
         const Pass& ps = passes[p];
         std::vector<WGPUBindGroupEntry> ge;
