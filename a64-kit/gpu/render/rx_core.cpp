@@ -1320,6 +1320,20 @@ void memory_report() {
                 (unsigned long long)(ms.ullTotalPageFile >> 20), (unsigned long long)(ms.ullAvailPageFile >> 20),
                 (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20));
 #endif
+    // wgpu's live objects by kind (a count growing without end is a leak: Windows' commit ran out at 19 GB private
+    // in run_vram.log, and the game crashed, 0xC0000409)
+#if !RX_WEB
+    if (dev.instance) {
+        WGPUGlobalReport r{};
+        wgpuGenerateReport(dev.instance, &r);
+        const WGPUHubReport& h = r.hub;
+        auto n = [](const WGPURegistryReport& x) { return (unsigned long long)x.numAllocated; };
+        hos_log("mem: wgpu objects: %llu buffers, %llu textures, %llu views, %llu bind groups, %llu samplers, "
+                "%llu render + %llu compute pipelines, %llu shader modules, %llu command buffers, %llu query sets",
+                n(h.buffers), n(h.textures), n(h.textureViews), n(h.bindGroups), n(h.samplers), n(h.renderPipelines),
+                n(h.computePipelines), n(h.shaderModules), n(h.commandBuffers), n(h.querySets));
+    }
+#endif
     hos_memory_map_log();
 }
 
@@ -2336,9 +2350,10 @@ static std::string vram_text() {
 /// Over Windows' VRAM budget, the driver moves some of the game's GPU memory into system memory, and every pass that
 /// reads it gets much slower whatever the resolution (seen: the main 3D pass 1 -> 13 ms a frame, 60 -> 28 fps, after
 /// the inventory loaded its textures near the budget, and it stayed so). The decoded-texture cache only trimmed
-/// itself past a fixed 2 GB, so nothing gave memory back. Every 2 s: when this process is within RX_VRAM_MARGIN_MB
-/// (default 600) of the budget, the decoded textures not used for 2 s go, oldest first, until it is ~1 GB under,
-/// and the kept DLSS features not in use. (They come back when needed: a texture is decoded again on its next use.)
+/// itself past a fixed 2 GB, so nothing gave memory back. At most every 10 s: when this process is within
+/// RX_VRAM_MARGIN_MB (default 600) of the budget, the decoded textures not used for 30 s go, oldest first, until
+/// it is ~1 GB under, and the kept DLSS features not in use. (run_vram.log: what is freed is not always given back
+/// to Windows; wgpu keeps its memory blocks. Not the whole answer.) (They come back when needed: a texture is decoded again on its next use.)
 /// RX_VRAM_TRIM=0: off.
 static void vram_pressure() {
     static const bool off = getenv("RX_VRAM_TRIM") && *getenv("RX_VRAM_TRIM") == '0';
@@ -2347,16 +2362,18 @@ static void vram_pressure() {
     if (off || frame_number % 120 != 60) return;
     uint64_t used = 0, budget = 0;
     if (!vram_query(&used, &budget) || !budget || used + margin <= budget) return;
-    if (frame_number - last_trim < 600 && used <= budget) return;   // (the last trim's frees may not show yet)
+    if (frame_number - last_trim < 600) return;   // (the last trim's frees may not show yet)
     last_trim = frame_number;
     const uint64_t target = budget > margin + (400ull << 20) ? budget - margin - (400ull << 20) : 0;
     const uint64_t want = used > target ? used - target : 0;
     int n = 0;
-    const uint64_t freed = trim_decoded_textures_for_vram(want, 120, &n);
+    // (unused for 30 s: 2 s, the first try, freed textures the game drew again moments later; decoding them again
+    // stuttered, and the memory did not come back to Windows anyway)
+    const uint64_t freed = trim_decoded_textures_for_vram(want, 1800, &n);
     dlss_trim();
     static int logged;
-    if (logged++ < 60)
-        hos_log("rx: VRAM %llu of %llu MB (%llu MB from the limit): %d decoded textures not used for 2 s released, "
+    if (n && logged++ < 60)
+        hos_log("rx: VRAM %llu of %llu MB (%llu MB from the limit): %d decoded textures not used for 30 s released, "
                 "%llu MB",
                 (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20),
                 (unsigned long long)((budget > used ? budget - used : 0) >> 20), n, (unsigned long long)(freed >> 20));
@@ -4401,7 +4418,8 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
     if (frame_number % 600 == 300) retire_unused_segments();
     if (frame_number % 600 == 450) reset_idle_stream_memory();
     if (frame_number % 600 == 150) trim_pipelines();
-    if (frame_number % 3600 == 900) memory_report();
+    if (static const bool often = env_flag("RX_VRAM_LOG"); often ? frame_number % 1200 == 900 : frame_number % 3600 == 900)
+        memory_report();
     if (frame_number % 600 == 0)   // spare render targets not drawn for 10 s go
         for (auto it = spare_images.begin(); it != spare_images.end();)
             it = it->second->last_use < frame_number - 600 ? spare_images.erase(it) : std::next(it);
