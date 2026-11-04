@@ -517,6 +517,10 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     const uint32_t dw = at.width, dh = at.height;
     st.cw = mw, st.ch = mh;
     const uint32_t rw = (uint32_t)cur.width, rh = (uint32_t)cur.height;
+    // (only a scale-up: the second shader also copies the scene at its own size, into targets the scene's size,
+    // and FSR 2 there made it resize its resources twice a frame: 250,000 times in a 70-minute run, until the GPU
+    // ran out of memory; run_quality.log 2026-11-03 20:44)
+    if (dw <= mw && dh <= mh) return false;
     if (!rw || !rh || rw > mw || rh > mh || wgpuTextureGetWidth(scene_depth) < rw || dw < rw) {
         static int lines;
         if (lines++ < 50)
