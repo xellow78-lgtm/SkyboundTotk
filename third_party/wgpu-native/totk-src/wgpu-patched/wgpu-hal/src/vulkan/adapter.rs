@@ -2855,6 +2855,12 @@ impl super::Adapter {
             })
             .collect::<Vec<_>>();
 
+        // (TOTK port) VK_KHR_present_id (asked for with Reflex): its feature on, so presents can carry an ID
+        let mut totk_present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        if enabled_extensions.contains(&khr::present_id::NAME) {
+            pre_info = pre_info.push_next(&mut totk_present_id);
+        }
+
         let pre_info = pre_info
             .queue_create_infos(&family_infos)
             .enabled_extension_names(&str_pointers);

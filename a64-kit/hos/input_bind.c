@@ -141,6 +141,14 @@ void hos_bind_defaults(Bindings *b) {
     b->mouse_pitch = 1.0;
     b->mouse_hold = 1.0;
     b->render_mode = 0;
+    b->aniso = 0;
+    b->reflex = 0;
+}
+
+volatile int hos_aniso_level, hos_reflex_mode;
+static void apply_graphics(const Bindings *b) {
+    hos_aniso_level = b->aniso;
+    hos_reflex_mode = b->reflex;
 }
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -186,6 +194,8 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "mouse_vertical_speed")) { b->mouse_pitch = atof(v); continue; }
         if (!_stricmp(k, "mouse_ultrahand_holding_speed")) { b->mouse_hold = atof(v); continue; }
         if (!_stricmp(k, "render_resolution")) { b->render_mode = atoi(v); continue; }
+        if (!_stricmp(k, "anisotropic_filtering")) { b->aniso = atoi(v); continue; }
+        if (!_stricmp(k, "nvidia_reflex")) { b->reflex = atoi(v); continue; }
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -206,6 +216,8 @@ static void load(Bindings *b) {
     if (!(b->mouse_pitch >= 0.25 && b->mouse_pitch <= 2.5)) b->mouse_pitch = 1.0;
     if (!(b->mouse_hold >= 0.25 && b->mouse_hold <= 4)) b->mouse_hold = 1.0;
     if (b->render_mode < 0 || b->render_mode >= hos_render_mode_count()) b->render_mode = 0;
+    if (b->aniso < 0 || b->aniso > 4) b->aniso = 0;
+    if (b->reflex < 0 || b->reflex > 2) b->reflex = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -222,7 +234,10 @@ static void save(const Bindings *b) {
                b->mouse_sens, b->mouse_pitch, b->mouse_hold, b->mouse_invert_y, b->walk_scale);
     fprintf(f, "# 3D resolution: 0 the game's own (dynamic, up to 1600x896), 1 Quality (1280x720), 2 Balanced\n"
                "# (1129x635), 3 Performance (960x540), 4 Ultra Performance (640x360); FSR 2 scales it up\n"
-               "render_resolution = %d\n\n", b->render_mode);
+               "render_resolution = %d\n", b->render_mode);
+    fprintf(f, "# anisotropic filtering: 0 the game's own, 1 2x, 2 4x, 3 8x, 4 16x\nanisotropic_filtering = %d\n"
+               "# NVIDIA Reflex: 0 off, 1 on, 2 on + boost (NVIDIA GPUs, Vulkan)\nnvidia_reflex = %d\n\n", b->aniso,
+               b->reflex);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)
@@ -235,7 +250,7 @@ static void save(const Bindings *b) {
 static void ensure_loaded(void) {
     if (loaded) return;
     AcquireSRWLockExclusive(&lock);
-    if (!loaded) { load(&cur); loaded = 1; }
+    if (!loaded) { load(&cur); apply_graphics(&cur); loaded = 1; }
     ReleaseSRWLockExclusive(&lock);
 }
 
@@ -252,6 +267,7 @@ void hos_bind_set(const Bindings *in) {
     cur = *in;
     ReleaseSRWLockExclusive(&lock);
     hos_render_mode_apply(in->render_mode);
+    apply_graphics(in);
     save(in);
     hos_log("input: bindings saved");
 }

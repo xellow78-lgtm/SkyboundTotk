@@ -1,0 +1,147 @@
+--- a/wgpu-hal/src/vulkan/mod.rs
++++ b/wgpu-hal/src/vulkan/mod.rs
+@@ -62,6 +62,46 @@
+ pub static TOTK_EXTRA_INSTANCE_EXTENSIONS: Mutex<Vec<&'static CStr>> = Mutex::new(Vec::new());
+ pub static TOTK_EXTRA_DEVICE_EXTENSIONS: Mutex<Vec<&'static CStr>> = Mutex::new(Vec::new());
+ 
++/// (TOTK port) NVIDIA Reflex through VK_NV_low_latency2: swapchains made while `wanted` is set (and the device has the
++/// extension) are made with low latency mode enabled; the sleep mode asked for is set on each new one. The swapchain
++/// in use (its handle: null while there is none) and the extension's functions, under one lock with its creation and
++/// destruction, for wgpu-native's wgpuTotkReflex* calls from any thread.
++pub struct TotkLowLatency {
++    pub wanted: bool,
++    pub swapchain: vk::SwapchainKHR,
++    pub functions: Option<ash::nv::low_latency2::Device>,
++    /// (low latency mode, boost, minimum interval in microseconds: 0 none), set by wgpuTotkReflexSetMode
++    pub mode: Option<(bool, bool, u32)>,
++}
++pub static TOTK_LOW_LATENCY: Mutex<TotkLowLatency> = Mutex::new(TotkLowLatency {
++    wanted: false,
++    swapchain: vk::SwapchainKHR::null(),
++    functions: None,
++    mode: None,
++});
++/// (TOTK port) The present ID the next present carries (VK_KHR_present_id, when the device has it; 0: none). Taken
++/// by that present. Reflex's markers name frames by it.
++pub static TOTK_NEXT_PRESENT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++
++impl TotkLowLatency {
++    /// The sleep mode asked for, on the swapchain in use (none: nothing)
++    pub fn apply(&self) {
++        let (Some(f), Some((on, boost, interval))) = (self.functions.as_ref(), self.mode) else {
++            return;
++        };
++        if self.swapchain == vk::SwapchainKHR::null() {
++            return;
++        }
++        let info = vk::LatencySleepModeInfoNV::default()
++            .low_latency_mode(on)
++            .low_latency_boost(boost)
++            .minimum_interval_us(interval);
++        if let Err(e) = unsafe { f.set_latency_sleep_mode(self.swapchain, Some(&info)) } {
++            log::warn!("(TOTK) vkSetLatencySleepModeNV: {e:?}");
++        }
++    }
++}
++
+ use crate::vulkan::semaphore_list::{SemaphoreListMode, SemaphoreType};
+ 
+ const MAX_TOTAL_ATTACHMENTS: usize = crate::MAX_COLOR_ATTACHMENTS * 2 + 1;
+--- a/wgpu-hal/src/vulkan/adapter.rs
++++ b/wgpu-hal/src/vulkan/adapter.rs
+@@ -2855,6 +2855,12 @@
+             })
+             .collect::<Vec<_>>();
+ 
++        // (TOTK port) VK_KHR_present_id (asked for with Reflex): its feature on, so presents can carry an ID
++        let mut totk_present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
++        if enabled_extensions.contains(&khr::present_id::NAME) {
++            pre_info = pre_info.push_next(&mut totk_present_id);
++        }
++
+         let pre_info = pre_info
+             .queue_create_infos(&family_infos)
+             .enabled_extension_names(&str_pointers);
+--- a/wgpu-hal/src/vulkan/swapchain/native.rs
++++ b/wgpu-hal/src/vulkan/swapchain/native.rs
+@@ -3,7 +3,7 @@
+ use alloc::{boxed::Box, sync::Arc, vec::Vec};
+ use core::any::Any;
+ 
+-use ash::{khr, vk};
++use ash::{khr, nv, vk};
+ use parking_lot::{Mutex, MutexGuard};
+ 
+ use crate::vulkan::{
+@@ -211,6 +211,18 @@
+             info = info.push_next(&mut format_list_info);
+         }
+ 
++        // (TOTK port) Reflex: low latency mode on the swapchain (VK_NV_low_latency2), under the lock its users take
++        let mut low_latency = crate::vulkan::TOTK_LOW_LATENCY.lock();
++        let latency_on = low_latency.wanted
++            && device
++                .shared
++                .enabled_extensions
++                .contains(&nv::low_latency2::NAME);
++        let mut latency_info = vk::SwapchainLatencyCreateInfoNV::default().latency_mode_enable(true);
++        if latency_on {
++            info = info.push_next(&mut latency_info);
++        }
++
+         let result = {
+             profiling::scope!("vkCreateSwapchainKHR");
+             unsafe { functor.create_swapchain(&info, None) }
+@@ -218,8 +230,22 @@
+ 
+         // doing this before bailing out with error
+         if old_swapchain != vk::SwapchainKHR::null() {
++            if low_latency.swapchain == old_swapchain {
++                low_latency.swapchain = vk::SwapchainKHR::null();
++            }
+             unsafe { functor.destroy_swapchain(old_swapchain, None) }
+         }
++        if latency_on {
++            if let Ok(raw) = result {
++                if low_latency.functions.is_none() {
++                    low_latency.functions =
++                        Some(nv::low_latency2::Device::new(&self.instance.raw, &device.shared.raw));
++                }
++                low_latency.swapchain = raw;
++                low_latency.apply();
++            }
++        }
++        drop(low_latency);
+ 
+         let raw = match result {
+             Ok(swapchain) => swapchain,
+@@ -375,7 +401,12 @@
+     }
+ 
+     unsafe fn delete_swapchain(self: Box<Self>) {
++        let mut low_latency = crate::vulkan::TOTK_LOW_LATENCY.lock();   // (TOTK port: not in use any more)
++        if low_latency.swapchain == self.raw {
++            low_latency.swapchain = vk::SwapchainKHR::null();
++        }
+         unsafe { self.functor.destroy_swapchain(self.raw, None) };
++        drop(low_latency);
+     }
+ 
+     unsafe fn acquire(
+@@ -559,6 +590,16 @@
+             .image_indices(&image_indices)
+             .wait_semaphores(&wait_semaphores);
+ 
++        // (TOTK port) the present ID asked for (Reflex's frame), when the device has VK_KHR_present_id
++        let totk_id = crate::vulkan::TOTK_NEXT_PRESENT_ID.swap(0, core::sync::atomic::Ordering::Relaxed);
++        let totk_ids = [totk_id];
++        let mut totk_present_id = vk::PresentIdKHR::default().present_ids(&totk_ids);
++        let vk_info = if totk_id != 0 && self.device.enabled_extensions.contains(&khr::present_id::NAME) {
++            vk_info.push_next(&mut totk_present_id)
++        } else {
++            vk_info
++        };
++
+         let mut display_timing;
+         let present_times;
+         let vk_info = if let Some(present_time) = self.next_present_time.take() {

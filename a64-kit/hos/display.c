@@ -6,7 +6,8 @@
    HOS_WINDOW_NOACTIVATE=1: the window opens behind the one in front (test runs do not take the keyboard).
    Mouse: a click in the window captures the mouse (hidden, kept in the window) and its motion turns the camera
    (nn_hid.c reads it as the right stick); Esc or leaving the window releases it. While captured, its buttons and
-   wheel are what the bindings say (input_bind.c). F1: the keyboard and mouse bindings window (input_bind_ui.c). */
+   wheel are what the bindings say (input_bind.c). F1: the settings menu, drawn by the renderer (rx_menu.cpp; without
+   the renderer, the old settings window: input_bind_ui.c). */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,9 +193,65 @@ static void update_title(void) {
     last_draws = d;
 }
 
+/* The settings menu (F1, drawn by the renderer: rx_menu.cpp) has the keyboard and mouse while open: the game's
+   bindings window (input_bind_ui.c) only when the renderer cannot draw it. */
+enum { TIMER_MENU = 2 };
+static int menu_input(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    if (!renderer || !rx_menu_is_open()) return 0;
+    switch (msg) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if (wp == VK_F11 || wp == VK_F12) return 0;   /* (fullscreen and the frame dump still work) */
+        if (msg == WM_SYSKEYDOWN && wp == VK_F4) return 0;   /* (Alt+F4 still closes the game) */
+        rx_menu_key((int)wp);
+        return 1;
+    case WM_MOUSEMOVE: rx_menu_mouse((short)LOWORD(lp), (short)HIWORD(lp), 0, 0); return 1;
+    case WM_LBUTTONDOWN: SetCapture(w); rx_menu_mouse((short)LOWORD(lp), (short)HIWORD(lp), 1, 1); return 1;
+    case WM_LBUTTONUP: ReleaseCapture(); rx_menu_mouse((short)LOWORD(lp), (short)HIWORD(lp), 1, 0); return 1;
+    case WM_MOUSEWHEEL: {
+        static int rest;
+        rest += (short)HIWORD(wp);
+        const int notches = rest / WHEEL_DELTA;
+        rest -= notches * WHEEL_DELTA;
+        if (notches) rx_menu_wheel(notches);
+        return 1;
+    }
+    case WM_CHAR:
+    case WM_SYSCHAR:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+        return 1;   /* (read by the menu's key polling when it waits for a binding) */
+    }
+    return 0;
+}
+
+static void menu_toggle(HWND w) {
+    mouse_capture(w, 0);
+    if (renderer && rx_menu_toggle()) {
+        if (rx_menu_is_open()) SetTimer(w, TIMER_MENU, 15, NULL);
+        else KillTimer(w, TIMER_MENU);
+        hos_log("input: settings menu %s", rx_menu_is_open() ? "open" : "closed");
+        return;
+    }
+    hos_bind_ui_toggle(w);
+}
+
 static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    if (menu_input(w, msg, wp, lp)) {
+        if (!rx_menu_is_open()) KillTimer(w, TIMER_MENU);   /* (Esc or the close button closed it) */
+        return 0;
+    }
     switch (msg) {
     case WM_TIMER:
+        if (wp == TIMER_MENU) {
+            if (renderer && rx_menu_is_open()) rx_menu_tick();
+            else KillTimer(w, TIMER_MENU);
+            return 0;
+        }
         if (!renderer) {
             grab();
             InvalidateRect(w, NULL, FALSE);
@@ -371,8 +428,7 @@ static DWORD WINAPI display_main(void *p) {
     MSG m;
     while (GetMessageA(&m, NULL, 0, 0) > 0) {
         if (m.message == WM_KEYDOWN && m.wParam == VK_F1 && !(m.lParam & (1 << 30))) {   /* (either window) */
-            mouse_capture(hwnd, 0);
-            hos_bind_ui_toggle(hwnd);
+            menu_toggle(hwnd);
             continue;
         }
         TranslateMessage(&m);

@@ -201,3 +201,117 @@ pub unsafe extern "C" fn wgpuTotkCommandEncoderRaw(
         );
     }
 }
+
+// ---- NVIDIA Reflex (VK_NV_low_latency2) ----
+// The swapchain and the extension's functions live in wgpu-hal (TOTK_LOW_LATENCY), with the swapchain's creation and
+// destruction under the same lock. Ask for the device extensions VK_NV_low_latency2 and VK_KHR_present_id
+// (wgpuTotkAddVulkanExtensions) before the device is made, and call wgpuTotkReflexWanted(true) before the surface is
+// configured: swapchains are then made with low latency mode enabled.
+
+/// Swapchains made from now on get low latency mode enabled (where the device has VK_NV_low_latency2).
+#[no_mangle]
+pub extern "C" fn wgpuTotkReflexWanted(wanted: bool) {
+    hal::vulkan::TOTK_LOW_LATENCY.lock().wanted = wanted;
+}
+
+/// Whether the device has VK_NV_low_latency2 enabled (and so Reflex can work once a swapchain is made).
+#[no_mangle]
+pub unsafe extern "C" fn wgpuTotkReflexAvailable(device: native::WGPUDevice) -> bool {
+    let Some(device) = device.as_ref() else {
+        return false;
+    };
+    let Some(hal_device) = device.context.device_as_hal::<Vk>(device.id) else {
+        return false;
+    };
+    hal_device
+        .enabled_device_extensions()
+        .contains(&ash::nv::low_latency2::NAME)
+}
+
+/// The sleep mode: low latency on / off, boost, a minimum frame interval in microseconds (0: none). Applied now if a
+/// swapchain is in use, and to each one made after.
+#[no_mangle]
+pub extern "C" fn wgpuTotkReflexSetMode(on: bool, boost: bool, minimum_interval_us: u32) {
+    let mut ll = hal::vulkan::TOTK_LOW_LATENCY.lock();
+    ll.mode = Some((on, boost, minimum_interval_us));
+    ll.apply();
+}
+
+/// Reflex's sleep, at the start of a frame's simulation: the driver says when to begin (it signals the timeline
+/// semaphore with the value given), and this waits for that (up to `timeout_ns`). False if there is no swapchain with
+/// low latency mode, or the wait timed out.
+#[no_mangle]
+pub unsafe extern "C" fn wgpuTotkReflexSleep(device: native::WGPUDevice, timeout_ns: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEMAPHORE: AtomicU64 = AtomicU64::new(0);
+    static VALUE: AtomicU64 = AtomicU64::new(0);
+    let Some(device) = device.as_ref() else {
+        return false;
+    };
+    let Some(hal_device) = device.context.device_as_hal::<Vk>(device.id) else {
+        return false;
+    };
+    let raw = hal_device.raw_device();
+    let mut semaphore = <ash::vk::Semaphore as ash::vk::Handle>::from_raw(SEMAPHORE.load(Ordering::Acquire));
+    if semaphore == ash::vk::Semaphore::null() {
+        let mut type_info = ash::vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(ash::vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let info = ash::vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+        match raw.create_semaphore(&info, None) {
+            Ok(s) => {
+                semaphore = s;
+                SEMAPHORE.store(ash::vk::Handle::as_raw(s), Ordering::Release);
+            }
+            Err(e) => {
+                log::warn!("wgpuTotkReflexSleep: no timeline semaphore: {e:?}");
+                return false;
+            }
+        }
+    }
+    let value = VALUE.fetch_add(1, Ordering::AcqRel) + 1;
+    {
+        let ll = hal::vulkan::TOTK_LOW_LATENCY.lock();
+        let Some(f) = ll.functions.as_ref() else {
+            return false;
+        };
+        if ll.swapchain == ash::vk::SwapchainKHR::null() {
+            return false;
+        }
+        let info = ash::vk::LatencySleepInfoNV::default()
+            .signal_semaphore(semaphore)
+            .value(value);
+        if f.latency_sleep(ll.swapchain, &info).is_err() {
+            return false;
+        }
+    }
+    let semaphores = [semaphore];
+    let values = [value];
+    let wait = ash::vk::SemaphoreWaitInfo::default()
+        .semaphores(&semaphores)
+        .values(&values);
+    raw.wait_semaphores(&wait, timeout_ns).is_ok()
+}
+
+/// A Reflex marker (VkLatencyMarkerNV: 0 simulation start, 1 simulation end, 2 render submit start, 3 render submit
+/// end, 4 present start, 5 present end, 6 input sample) for the frame with that present ID.
+#[no_mangle]
+pub extern "C" fn wgpuTotkReflexMarker(marker: u32, present_id: u64) {
+    let ll = hal::vulkan::TOTK_LOW_LATENCY.lock();
+    let Some(f) = ll.functions.as_ref() else {
+        return;
+    };
+    if ll.swapchain == ash::vk::SwapchainKHR::null() {
+        return;
+    }
+    let info = ash::vk::SetLatencyMarkerInfoNV::default()
+        .present_id(present_id)
+        .marker(ash::vk::LatencyMarkerNV::from_raw(marker as i32));
+    unsafe { f.set_latency_marker(ll.swapchain, &info) };
+}
+
+/// The present ID the next present carries (VK_KHR_present_id, where enabled).
+#[no_mangle]
+pub extern "C" fn wgpuTotkSetNextPresentId(present_id: u64) {
+    hal::vulkan::TOTK_NEXT_PRESENT_ID.store(present_id, std::sync::atomic::Ordering::Relaxed);
+}

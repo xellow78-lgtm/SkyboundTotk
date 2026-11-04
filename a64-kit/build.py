@@ -703,6 +703,15 @@ def cmd_native(a):
                                "-I" + os.path.join(tp, "vulkan-headers", "include")]
             gdeps += "+dlss"
             print("DLSS: on (NVIDIA's SDK, the Vulkan headers and the patched wgpu-native are there)")
+        # NVIDIA Reflex (gpu/render/rx_reflex.cpp): when the wgpu-native build has the TOTK Reflex calls
+        # (third_party/wgpu-native/build_dlss_deps.py, after totk-src got them: setup_dlss.bat again)
+        imp = os.path.join(wgpu, "lib", "wgpu_native.dll.lib")
+        if os.name == "nt" and os.path.isfile(imp) and b"wgpuTotkReflexSleep" in open(imp, "rb").read():
+            gflags = gflags + ["-DRX_REFLEX=1"]
+            gdeps += "+reflex"
+            print("NVIDIA Reflex: on (the patched wgpu-native has it)")
+        else:
+            print("NVIDIA Reflex: off (wgpu_native.dll without wgpuTotkReflex*: setup_dlss.bat builds one)")
         for src in gpu_sources():
             name = os.path.relpath(src, GPU).replace(os.sep, "_")[:-4]
             jobs.append((cxx, src, os.path.join(obj_dir, "gpu_" + name + ".o"), gflags, gdeps))

@@ -62,6 +62,46 @@ use semaphore_list::SemaphoreList;
 pub static TOTK_EXTRA_INSTANCE_EXTENSIONS: Mutex<Vec<&'static CStr>> = Mutex::new(Vec::new());
 pub static TOTK_EXTRA_DEVICE_EXTENSIONS: Mutex<Vec<&'static CStr>> = Mutex::new(Vec::new());
 
+/// (TOTK port) NVIDIA Reflex through VK_NV_low_latency2: swapchains made while `wanted` is set (and the device has the
+/// extension) are made with low latency mode enabled; the sleep mode asked for is set on each new one. The swapchain
+/// in use (its handle: null while there is none) and the extension's functions, under one lock with its creation and
+/// destruction, for wgpu-native's wgpuTotkReflex* calls from any thread.
+pub struct TotkLowLatency {
+    pub wanted: bool,
+    pub swapchain: vk::SwapchainKHR,
+    pub functions: Option<ash::nv::low_latency2::Device>,
+    /// (low latency mode, boost, minimum interval in microseconds: 0 none), set by wgpuTotkReflexSetMode
+    pub mode: Option<(bool, bool, u32)>,
+}
+pub static TOTK_LOW_LATENCY: Mutex<TotkLowLatency> = Mutex::new(TotkLowLatency {
+    wanted: false,
+    swapchain: vk::SwapchainKHR::null(),
+    functions: None,
+    mode: None,
+});
+/// (TOTK port) The present ID the next present carries (VK_KHR_present_id, when the device has it; 0: none). Taken
+/// by that present. Reflex's markers name frames by it.
+pub static TOTK_NEXT_PRESENT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+impl TotkLowLatency {
+    /// The sleep mode asked for, on the swapchain in use (none: nothing)
+    pub fn apply(&self) {
+        let (Some(f), Some((on, boost, interval))) = (self.functions.as_ref(), self.mode) else {
+            return;
+        };
+        if self.swapchain == vk::SwapchainKHR::null() {
+            return;
+        }
+        let info = vk::LatencySleepModeInfoNV::default()
+            .low_latency_mode(on)
+            .low_latency_boost(boost)
+            .minimum_interval_us(interval);
+        if let Err(e) = unsafe { f.set_latency_sleep_mode(self.swapchain, Some(&info)) } {
+            log::warn!("(TOTK) vkSetLatencySleepModeNV: {e:?}");
+        }
+    }
+}
+
 use crate::vulkan::semaphore_list::{SemaphoreListMode, SemaphoreType};
 
 const MAX_TOTAL_ATTACHMENTS: usize = crate::MAX_COLOR_ATTACHMENTS * 2 + 1;

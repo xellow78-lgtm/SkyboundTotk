@@ -24,6 +24,9 @@ bool wgpuDevicePoll(WGPUDevice device, bool wait, const void* submission);   // 
 #define RX_WEB 0
 #include <webgpu/wgpu.h>
 #endif
+#ifndef RX_REFLEX
+#define RX_REFLEX 0   // (build.py: 1 when wgpu_native has the TOTK Reflex calls, wgpuTotkReflex*: rx_reflex.cpp)
+#endif
 #ifndef RX_WEB_MT
 #define RX_WEB_MT 0   // (the threaded web build: rx_web_mt.h)
 #endif
@@ -425,6 +428,22 @@ bool dlss_ready();
 bool dlss_record(WGPUCommandEncoder e, const DlssInputs& in);
 /// VRAM pressure: the kept DLSS features other than the one in use are released (made again when needed).
 void dlss_trim();
+
+/// NVIDIA Reflex (rx_reflex.cpp): the Vulkan extensions asked for before the device, availability after; the game's
+/// frame thread around its present (the sleep is after it), the NVN replay thread per job, the submit thread around
+/// the swapchain present (begin returns the frame's present ID for end).
+void reflex_before_device();
+void reflex_after_device();
+bool reflex_available();
+void reflex_game_present_begin();
+void reflex_game_present_end();
+void reflex_replay_job(bool present);
+uint64_t reflex_present_begin();
+void reflex_present_end(uint64_t present_id);
+
+/// The settings menu (rx_menu.cpp): drawn over the window's image when open, before the present's commands finish.
+bool menu_open();
+void menu_draw(WGPUCommandEncoder e, WGPUTextureView target, WGPUTextureFormat format, uint32_t w, uint32_t h);
 /// Raw Vulkan commands at this point of the encoder (wgpu-native's wgpuTotkCommandEncoderRaw, deferred like the
 /// rest): the textures are moved to the given states (wgpu's TextureUses bits) and held with the views until the
 /// replay; cb(VkCommandBuffer, user) runs when the encoder is finished. RX_DLSS builds only.

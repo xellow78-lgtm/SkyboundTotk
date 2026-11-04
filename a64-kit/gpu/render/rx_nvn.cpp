@@ -1170,6 +1170,7 @@ void replay_main() {
             j = std::move(jobs.front());
             jobs.pop_front();
         }
+        reflex_replay_job(j.present);   // (NVIDIA Reflex's render submit markers, rx_reflex.cpp)
         if (j.present) run_present(j.present_guest, j.present_w, j.present_h);
         else run_submit(j.handles.data(), j.handles.size(), j.scan);
         {
@@ -1323,7 +1324,9 @@ void rx_nvn_present(const nvn_tex* t, const int crop[4]) {
     j.present_guest = guest;
     j.present_w = t->d.width;
     j.present_h = t->d.height;
+    rx::reflex_game_present_begin();   // (NVIDIA Reflex: the frame's simulation ends; rx_reflex.cpp)
     push_job(std::move(j));
+    rx::reflex_game_present_end();     // (...and the next one starts, after Reflex's sleep)
 }
 void rx_nvn_register_texture(int id, const nvn_tex* t, const nvn_view* v) {
     if (t) nvn_register_texture(id, *t, v);

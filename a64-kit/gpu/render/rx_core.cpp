@@ -370,7 +370,10 @@ bool init_device(HWND hwnd) {
     WGPUInstanceExtras extras{};
     extras.chain.sType = (WGPUSType)WGPUSType_InstanceExtras;
     dlss_before_instance();   // (RX_DLSS: the instance extensions NGX needs; rx_dlss.cpp)
-    const char* be = dlss_wants_vulkan() && !getenv("RX_BACKEND") ? "vulkan" : getenv("RX_BACKEND");
+    // (Vulkan for DLSS, and in a build with Reflex (it is Vulkan's VK_NV_low_latency2) unless RX_NO_REFLEX; RX_BACKEND
+    // chooses otherwise)
+    const char* be = (dlss_wants_vulkan() || (RX_REFLEX && !getenv("RX_NO_REFLEX"))) && !getenv("RX_BACKEND")
+                         ? "vulkan" : getenv("RX_BACKEND");
     extras.backends = !be                           ? WGPUInstanceBackend_Primary
                       : !_stricmp(be, "vulkan")     ? WGPUInstanceBackend_Vulkan
                       : !_stricmp(be, "dx12")       ? WGPUInstanceBackend_DX12
@@ -483,6 +486,7 @@ bool init_device(HWND hwnd) {
     dcb.userdata1 = &dev.device;
 #if !RX_WEB
     dlss_before_device(dev.adapter);   // (RX_DLSS: the device extensions NGX needs)
+    reflex_before_device();            // (NVIDIA Reflex's, rx_reflex.cpp)
 #endif
     wgpuAdapterRequestDevice(dev.adapter, &dd, dcb);
     for (int i = 0; i < 5000 && !dev.device; i++) {
@@ -494,6 +498,7 @@ bool init_device(HWND hwnd) {
     wgpuDeviceGetLimits(dev.device, &dev.limits);
 #if !RX_WEB
     dlss_after_device();   // (RX_DLSS: NGX on this device)
+    reflex_after_device();
 #endif
     // Which formats the device can draw into that plain WebGPU cannot (a 1x1 target of each, made and dropped)
     auto renderable = [](WGPUTextureFormat f) {
@@ -2528,6 +2533,7 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
         wgpuRenderPassEncoderEnd(p);
         wgpuRenderPassEncoderRelease(p);
     }
+    if (menu_open()) menu_draw(e, target, surface_format, surface_w, surface_h);   // (F1: rx_menu.cpp)
     WGPUCommandBuffer cb = wgpuCommandEncoderFinish(e, nullptr);
     wgpuQueueSubmit(dev.queue, 1, &cb);
     wgpuCommandBufferRelease(cb);
@@ -2537,7 +2543,9 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
     rx_web_present();   // (the page counts frames)
     rx_web_yield();     // (back to the event loop: the browser shows the canvas and runs WebGPU's callbacks)
 #else
+    const uint64_t present_id = reflex_present_begin();
     wgpuSurfacePresent(surface);
+    reflex_present_end(present_id);
 #endif
     present_pacing();
     wgpuTextureViewRelease(target);

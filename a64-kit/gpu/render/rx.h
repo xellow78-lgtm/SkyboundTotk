@@ -51,6 +51,17 @@ void rx_memory_written(uint64_t gpu_va, uint64_t size);
 /* The game queued a window buffer for display: guest address, size in pixels. Returns 1 when the renderer drew
    that buffer and presented it. */
 int rx_present(uint64_t guest_address, uint32_t width, uint32_t height);
+/* The in-game settings menu (rx_menu.cpp, F1), from the window's thread: toggle (0: no menu here, e.g. its pipeline
+   was not made: use the old settings window), whether it is open, a key pressed (a virtual-key code), the mouse
+   (client pixels; button 0 a move, 1 the left button, down or up), the wheel (notches), and a tick (~60 a second
+   while open: a key for a binding being waited for). While open, hos_bind_ui_active is set. */
+int rx_menu_toggle(void);
+int rx_menu_is_open(void);
+void rx_menu_key(int vk);
+void rx_menu_mouse(int x, int y, int button, int down);
+void rx_menu_wheel(int notches);
+void rx_menu_tick(void);
+
 /* What the window title shows: "<adapter> (<backend>)". */
 const char *rx_describe(void);
 /* Draws done / skipped (unsupported state) since the start. */

@@ -316,6 +316,17 @@ void swizzle_rgba8(const TICEntry& t, uint8_t* p, size_t pixels) {
 
 std::unordered_map<uint64_t, std::unique_ptr<Image>> decoded;   // by TIC contents
 uint64_t decoded_generation;   // bumped whenever the decoded-texture map changes
+// The anisotropic filtering setting (hos/input_bind.c, the F1 menu): 0 the game's own, else 2/4/8/16 at least, on
+// every filtering, non-comparison sampler whose minification and magnification are linear (its mipmaps made linear:
+// WebGPU takes anisotropy only with all three linear). sampler_generation is bumped when it changes: the samplers
+// are made again (their keys hold it) and the texture memos holding old ones are refreshed.
+extern "C" volatile int hos_aniso_level;
+uint64_t sampler_generation = 1;
+static uint16_t user_aniso() {
+    static const uint16_t v[5] = {0, 2, 4, 8, 16};
+    const int l = hos_aniso_level;
+    return v[l < 0 || l > 4 ? 0 : l];
+}
 // The same, by the 1 MB pieces of guest memory each covers (textures_written runs per written page: a walk back
 // over every texture within the largest one's size was ~4% of the GPU thread)
 constexpr uint64_t kBucketShift = 20;
@@ -1167,7 +1178,7 @@ WGPUCompareFunction compare_function(Tegra::Texture::DepthCompareFunc f) {
 
 /// mode: 0 filtering as the header says, 1 never filtering (unfilterable textures), 2 comparison
 WGPUSampler sampler_for(const TSCEntry& tsc, int mode) {
-    const uint64_t key = hash_bytes(&tsc, sizeof tsc, (uint64_t)mode);
+    const uint64_t key = hash_bytes(&tsc, sizeof tsc, (uint64_t)mode ^ (uint64_t)user_aniso() << 8);
     auto it = samplers.find(key);
     if (it != samplers.end()) {
         if (mode == 1 && !nonfiltering_samplers.count(it->second))
@@ -1195,6 +1206,11 @@ WGPUSampler sampler_for(const TSCEntry& tsc, int mode) {
     const bool all_linear = d.magFilter == WGPUFilterMode_Linear && d.minFilter == WGPUFilterMode_Linear &&
                             d.mipmapFilter == WGPUMipmapFilterMode_Linear;
     d.maxAnisotropy = all_linear ? aniso[tsc.max_anisotropy & 7] : 1;
+    if (const uint16_t ua = user_aniso(); ua > 1 && mode == 0 && d.magFilter == WGPUFilterMode_Linear &&
+                                          d.minFilter == WGPUFilterMode_Linear && tsc.mipmap_filter != M::None) {
+        d.mipmapFilter = WGPUMipmapFilterMode_Linear;
+        d.maxAnisotropy = std::max(d.maxAnisotropy, ua);
+    }
     WGPUSampler s = wgpuDeviceCreateSampler(dev.device, &d);
     samplers[key] = s;
     if (mode == 1) nonfiltering_samplers.insert(s);
@@ -1444,6 +1460,16 @@ void decoded_texture_stats(size_t* n, uint64_t* bytes) {
 }
 
 void trim_decoded_textures() {
+    // (each frame, the render thread: the anisotropic filtering setting changed: samplers made again)
+    static int aniso_seen = -1;
+    if (const int l = hos_aniso_level; l != aniso_seen) {
+        if (aniso_seen >= 0) {
+            sampler_generation++;
+            static const char* const names[5] = {"the game's own", "2x", "4x", "8x", "16x"};
+            hos_log("rx: anisotropic filtering: %s", names[l < 0 || l > 4 ? 0 : l]);
+        }
+        aniso_seen = l;
+    }
     static const uint64_t budget = [] {
         const char* e = getenv("RX_TEXTURE_BUDGET_MB");
         return (uint64_t)(e && atoi(e) > 0 ? atoi(e) : RX_WEB ? 640 : 2048) << 20;
@@ -1699,7 +1725,7 @@ BoundTexture texture_for_handle(const Regs& r, uint32_t raw, const Shader::Textu
         else f.fkey = 0;
     }
     struct Memo {
-        uint64_t key = 0, frame = ~0ull, decoded = 0, guest = 0;
+        uint64_t key = 0, frame = ~0ull, decoded = 0, guest = 0, sgen = 0;
         long maps = 0;             // the GPU mappings' generation (guest = the texture's VA translated then)
         Image* src = nullptr;      // a decoded texture (its stale flag), or null
         uint64_t src_id = 0, tic_key = 0;   // ...its id, and its key in the decoded map
@@ -1711,7 +1737,7 @@ BoundTexture texture_for_handle(const Regs& r, uint32_t raw, const Shader::Textu
     };
     static Memo memo[8192];
     Memo& m = memo[key & 8191];
-    if (m.key == key && m.decoded != decoded_generation && m.maps == maps_generation) {
+    if (m.key == key && m.decoded != decoded_generation && m.maps == maps_generation && m.sgen == sampler_generation) {
         // a texture was decoded or dropped since: that touches this binding only if it was its own (one texture the
         // CPU rewrites every frame used to drop every memo entry every frame)
         bool same = true;
@@ -1722,7 +1748,7 @@ BoundTexture texture_for_handle(const Regs& r, uint32_t raw, const Shader::Textu
         }
         if (same) m.decoded = decoded_generation;
     }
-    if (m.key == key && m.decoded == decoded_generation && m.maps == maps_generation) {
+    if (m.key == key && m.decoded == decoded_generation && m.maps == maps_generation && m.sgen == sampler_generation) {
         Image* at = m.guest ? image_at(m.guest) : nullptr;
         // a later frame: what the uncached path does once a frame (a decoded texture without write tracking
         // checks its memory's samples; images in use are stamped so they are not dropped)
@@ -1769,6 +1795,7 @@ BoundTexture texture_for_handle(const Regs& r, uint32_t raw, const Shader::Textu
     m.frame = (uint64_t)frame_number;
     m.decoded = decoded_generation;
     m.maps = maps_generation;
+    m.sgen = sampler_generation;
     m.guest = va ? hos_gpu_translate(va) : 0;
     Image* at = m.guest ? image_at(m.guest) : nullptr;
     m.at_id = at ? at->id : 0;
@@ -1990,7 +2017,7 @@ WGPUCompareFunction nvn_compare_function(uint8_t f) {
 /// mode: 0 filtering as the sampler says, 1 never filtering (unfilterable textures), 2 comparison
 WGPUSampler nvn_sampler(const nvn_samp_par& p, int mode) {
     static std::unordered_map<uint64_t, WGPUSampler> cache;
-    const uint64_t key = hash_bytes(&p, sizeof p, 0x5a1d0 + (uint64_t)mode);
+    const uint64_t key = hash_bytes(&p, sizeof p, 0x5a1d0 + (uint64_t)mode + ((uint64_t)user_aniso() << 8));
     if (auto it = cache.find(key); it != cache.end()) return it->second;
     WGPUSamplerDescriptor d{};
     d.addressModeU = nvn_address_mode(p.ws);
@@ -2011,6 +2038,11 @@ WGPUSampler nvn_sampler(const nvn_samp_par& p, int mode) {
     const bool all_linear = d.magFilter == WGPUFilterMode_Linear && d.minFilter == WGPUFilterMode_Linear &&
                             d.mipmapFilter == WGPUMipmapFilterMode_Linear;
     d.maxAnisotropy = all_linear ? (uint16_t)std::clamp(p.aniso, 1.0f, 16.0f) : 1;
+    if (const uint16_t ua = user_aniso(); ua > 1 && mode == 0 && d.magFilter == WGPUFilterMode_Linear &&
+                                          d.minFilter == WGPUFilterMode_Linear && mips) {
+        d.mipmapFilter = WGPUMipmapFilterMode_Linear;
+        d.maxAnisotropy = std::max(d.maxAnisotropy, ua);
+    }
     if (p.reduction) log_limited("nvn_reduction", 4, "rx: NVN min/max sampler reduction: averaged");
     WGPUSampler s = wgpuDeviceCreateSampler(dev.device, &d);
     cache[key] = s;
@@ -2289,7 +2321,7 @@ BoundTexture nvn_texture(const NvnState& s, uint64_t tex_handle, uint64_t samp_h
     NvnTexResolved res;
     if (no_memo || frame_dump_active()) return nvn_texture_resolve(s, tex_handle, samp_handle, desc, res);
     struct Memo {
-        uint64_t tex = 0, samp = 0, frame = ~0ull, decoded = 0, images = 0, guest = 0, at_id = 0;
+        uint64_t tex = 0, samp = 0, frame = ~0ull, decoded = 0, images = 0, guest = 0, at_id = 0, sgen = 0;
         uint64_t src_checked = ~0ull;   // (decoded_generation when src was last found in the map)
         uint32_t dkey = 0, tver = 0, sver = 0;
         uint64_t dec_key = 0;
@@ -2310,7 +2342,7 @@ BoundTexture nvn_texture(const NvnState& s, uint64_t tex_handle, uint64_t samp_h
     // (decoded or rendered) is checked on its own: a decoded one is still the decode of its key and not stale, the image
     // at the texture's memory is the same one (both below). A binding without one (a dummy) holds within the frame
     // while no texture was decoded or dropped and no image moved, as before.
-    bool ok = m.valid && m.tex == tex_handle && m.samp == samp_handle && m.dkey == dkey &&
+    bool ok = m.valid && m.tex == tex_handle && m.samp == samp_handle && m.dkey == dkey && m.sgen == sampler_generation &&
               m.tver == nvn_texture_version(tid) && m.sver == nvn_sampler_version(sid);
     if (ok && (!m.used || m.per_frame || frame_only))
         ok = m.frame == (uint64_t)frame_number && (m.used || (m.decoded == decoded_generation && m.images == images_generation()));
@@ -2341,7 +2373,7 @@ BoundTexture nvn_texture(const NvnState& s, uint64_t tex_handle, uint64_t samp_h
     m.per_frame = nvn_texture_follows_storage(tid) || (res.src && !res.src->decoded_seq);
     Image* at = res.guest ? image_at(res.guest) : nullptr;
     m.tex = tex_handle, m.samp = samp_handle, m.dkey = dkey, m.frame = (uint64_t)frame_number;
-    m.decoded = decoded_generation, m.images = images_generation();
+    m.decoded = decoded_generation, m.images = images_generation(), m.sgen = sampler_generation;
     m.guest = res.guest, m.at_id = at ? at->id : 0, m.at_rendered = at && at->rendered;
     m.src = res.src, m.assembled = res.assembled, m.info = res.info, m.b = b;
     m.src_checked = ~0ull;
