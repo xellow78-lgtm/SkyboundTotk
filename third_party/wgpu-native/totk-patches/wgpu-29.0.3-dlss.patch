@@ -1,0 +1,173 @@
+diff --git a/wgpu-core/src/command/encoder_command.rs b/wgpu-core/src/command/encoder_command.rs
+index 2dfe245..758f74d 100644
+--- a/wgpu-core/src/command/encoder_command.rs
++++ b/wgpu-core/src/command/encoder_command.rs
+@@ -181,6 +181,30 @@ pub enum Command<R: ReferenceType> {
+         buffer_transitions: Vec<wgt::BufferTransition<R::Buffer>>,
+         texture_transitions: Vec<wgt::TextureTransition<R::Texture>>,
+     },
++    /// (TOTK port) Raw HAL commands in the middle of a wgpu encoder: the textures are transitioned to the given
++    /// states first (as `TransitionResources`), then `call` records on the open raw encoder. Whatever `call` records
++    /// must leave the textures in those states (e.g. DLSS, which "always transitions buffers back").
++    #[cfg_attr(feature = "serde", serde(skip))]
++    TotkRaw {
++        texture_transitions: Vec<wgt::TextureTransition<R::Texture>>,
++        call: TotkRawCall,
++    },
++}
++
++/// (TOTK port) The raw recording of a [`Command::TotkRaw`]: called once, with the open HAL encoder, when the
++/// command buffer is encoded (at `finish`).
++#[derive(Clone)]
++pub struct TotkRawCall(pub Arc<dyn Fn(&mut dyn hal::DynCommandEncoder) + Send + Sync>);
++impl core::fmt::Debug for TotkRawCall {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.write_str("TotkRawCall")
++    }
++}
++#[cfg(feature = "serde")]
++impl Default for TotkRawCall {
++    fn default() -> Self {
++        Self(Arc::new(|_| {}))
++    }
+ }
+ 
+ pub type ArcCommand = Command<ArcReferences>;
+diff --git a/wgpu-core/src/command/mod.rs b/wgpu-core/src/command/mod.rs
+index 9160cdb..4e01419 100644
+--- a/wgpu-core/src/command/mod.rs
++++ b/wgpu-core/src/command/mod.rs
+@@ -54,7 +54,7 @@ pub use self::{
+     },
+     compute_command::ArcComputeCommand,
+     draw::{DrawError, Rect, RenderCommandError},
+-    encoder_command::{ArcCommand, ArcReferences, Command, IdReferences, ReferenceType},
++    encoder_command::{ArcCommand, ArcReferences, Command, IdReferences, ReferenceType, TotkRawCall},
+     query::{QueryError, QueryUseError, ResolveError, SimplifiedQueryType},
+     render::{
+         ArcRenderPassColorAttachment, AttachmentError, AttachmentErrorLocation,
+@@ -1200,6 +1200,17 @@ impl CommandEncoder {
+                             texture_transitions,
+                         )?;
+                     }
++                    ArcCommand::TotkRaw {
++                        texture_transitions,
++                        call,
++                    } => {
++                        transition_resources::transition_resources(
++                            &mut state,
++                            Vec::new(),
++                            texture_transitions,
++                        )?;
++                        (call.0)(&mut *state.raw_encoder);
++                    }
+                     ArcCommand::RunComputePass { .. } | ArcCommand::RunRenderPass { .. } => {
+                         unreachable!()
+                     }
+diff --git a/wgpu-core/src/command/transition_resources.rs b/wgpu-core/src/command/transition_resources.rs
+index 4b84911..eda7c08 100644
+--- a/wgpu-core/src/command/transition_resources.rs
++++ b/wgpu-core/src/command/transition_resources.rs
+@@ -50,6 +50,34 @@ impl Global {
+     }
+ }
+ 
++impl Global {
++    /// (TOTK port) See [`crate::command::Command::TotkRaw`].
++    pub fn command_encoder_totk_raw(
++        &self,
++        command_encoder_id: CommandEncoderId,
++        texture_transitions: impl Iterator<Item = wgt::TextureTransition<TextureId>>,
++        call: crate::command::TotkRawCall,
++    ) -> Result<(), EncoderStateError> {
++        let hub = &self.hub;
++        let cmd_enc = hub.command_encoders.get(command_encoder_id);
++        let mut cmd_buf_data = cmd_enc.data.lock();
++        cmd_buf_data.push_with(|| -> Result<_, TransitionResourcesError> {
++            Ok(ArcCommand::TotkRaw {
++                texture_transitions: texture_transitions
++                    .map(|t| {
++                        Ok(wgt::TextureTransition {
++                            texture: self.resolve_texture_id(t.texture)?,
++                            selector: t.selector,
++                            state: t.state,
++                        })
++                    })
++                    .collect::<Result<_, TransitionResourcesError>>()?,
++                call,
++            })
++        })
++    }
++}
++
+ pub(crate) fn transition_resources(
+     state: &mut EncodingState,
+     buffer_transitions: Vec<wgt::BufferTransition<Arc<Buffer>>>,
+diff --git a/wgpu-core/src/device/trace/record.rs b/wgpu-core/src/device/trace/record.rs
+index 6e8e686..e417345 100644
+--- a/wgpu-core/src/device/trace/record.rs
++++ b/wgpu-core/src/device/trace/record.rs
+@@ -278,6 +278,9 @@ impl IntoTrace for ArcCommand {
+                 // If you want to ignore, you could panic or return a default.
+                 panic!("TransitionResources cannot be converted to Command");
+             }
++            ArcCommand::TotkRaw { .. } => {
++                panic!("TotkRaw cannot be converted to Command");
++            }
+         }
+     }
+ }
+diff --git a/wgpu-hal/src/vulkan/adapter.rs b/wgpu-hal/src/vulkan/adapter.rs
+index 019caa9..2a73bf5 100644
+--- a/wgpu-hal/src/vulkan/adapter.rs
++++ b/wgpu-hal/src/vulkan/adapter.rs
+@@ -2818,6 +2818,15 @@ impl super::Adapter {
+         callback: Option<Box<super::CreateDeviceCallback<'a>>>,
+     ) -> Result<crate::OpenDevice<super::Api>, crate::DeviceError> {
+         let mut enabled_extensions = self.required_device_extensions(features);
++        // (TOTK port) the extensions asked for, where this device has them
++        for &ext in super::TOTK_EXTRA_DEVICE_EXTENSIONS.lock().iter() {
++            if self.phd_capabilities.supports_extension(ext) && !enabled_extensions.contains(&ext) {
++                log::info!("(TOTK) enabling device extension {}", ext.to_string_lossy());
++                enabled_extensions.push(ext);
++            } else if !self.phd_capabilities.supports_extension(ext) {
++                log::warn!("(TOTK) device extension {} not supported", ext.to_string_lossy());
++            }
++        }
+         let mut enabled_phd_features = self.physical_device_features(&enabled_extensions, features);
+ 
+         let family_index = 0; //TODO
+diff --git a/wgpu-hal/src/vulkan/instance.rs b/wgpu-hal/src/vulkan/instance.rs
+index 8951115..7fd559d 100644
+--- a/wgpu-hal/src/vulkan/instance.rs
++++ b/wgpu-hal/src/vulkan/instance.rs
+@@ -291,6 +291,13 @@ impl super::Instance {
+         // so that we don't have to conditionally use the functions provided by the 1.1 instance
+         extensions.push(khr::get_physical_device_properties2::NAME);
+ 
++        // (TOTK port) and the ones asked for (only those available stay, below)
++        for &ext in super::TOTK_EXTRA_INSTANCE_EXTENSIONS.lock().iter() {
++            if !extensions.contains(&ext) {
++                extensions.push(ext);
++            }
++        }
++
+         // Only keep available extensions.
+         extensions.retain(|&ext| {
+             if instance_extensions
+diff --git a/wgpu-hal/src/vulkan/mod.rs b/wgpu-hal/src/vulkan/mod.rs
+index 26f9f5a..b72cd52 100644
+--- a/wgpu-hal/src/vulkan/mod.rs
++++ b/wgpu-hal/src/vulkan/mod.rs
+@@ -57,6 +57,11 @@ use wgt::InternalCounter;
+ 
+ use semaphore_list::SemaphoreList;
+ 
++/// (TOTK port) More Vulkan extensions to enable where available (e.g. what NVIDIA's NGX / DLSS asks for): instance
++/// extensions before the instance is created, device extensions before the device is (wgpuTotkAddVulkanExtensions).
++pub static TOTK_EXTRA_INSTANCE_EXTENSIONS: Mutex<Vec<&'static CStr>> = Mutex::new(Vec::new());
++pub static TOTK_EXTRA_DEVICE_EXTENSIONS: Mutex<Vec<&'static CStr>> = Mutex::new(Vec::new());
++
+ use crate::vulkan::semaphore_list::{SemaphoreListMode, SemaphoreType};
+ 
+ const MAX_TOTAL_ATTACHMENTS: usize = crate::MAX_COLOR_ATTACHMENTS * 2 + 1;

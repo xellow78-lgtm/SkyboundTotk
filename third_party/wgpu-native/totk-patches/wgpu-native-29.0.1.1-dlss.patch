@@ -1,0 +1,236 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d656efa..8864ea5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -126,6 +126,8 @@ version = "1"
+ optional = true
+ 
+ [dependencies]
++# (TOTK port) the Vulkan handles for DLSS (totk_vk.rs): the ash wgpu-hal uses
++ash = "0.38"
+ raw-window-handle = "0.6.0"
+ paste = "1"
+ log = "0.4"
+diff --git a/src/lib.rs b/src/lib.rs
+index cd88a13..0a239b4 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -38,6 +38,9 @@ use wgc::{
+ use crate::conv::map_primitive_state;
+ 
+ pub mod conv;
++/// (TOTK port) Vulkan interop for DLSS
++#[cfg(any(windows, all(unix, not(target_os = "ios"), not(target_os = "macos"))))]
++pub mod totk_vk;
+ pub mod logging;
+ pub mod unimplemented;
+ pub mod utils;
+diff --git a/src/totk_vk.rs b/src/totk_vk.rs
+new file mode 100644
+index 0000000..226fba0
+--- /dev/null
++++ b/src/totk_vk.rs
+@@ -0,0 +1,203 @@
++//! (TOTK port) Vulkan interop for NVIDIA DLSS (NGX): the raw Vulkan objects behind wgpu's, extra Vulkan extensions,
++//! and raw commands recorded in the middle of a wgpu command encoder (wgpu-core's `TotkRaw` command).
++//!
++//! Only the Vulkan backend: on another backend every function reports nothing (false / 0).
++
++use std::ffi::{c_char, c_void, CStr};
++use std::sync::Arc;
++
++use crate::{handle_error, native};
++
++type Vk = hal::api::Vulkan;
++
++/// The raw Vulkan objects of an adapter (instance, physical device) or a device (all of them).
++/// Handles are 64-bit values (dispatchable ones are pointers).
++#[repr(C)]
++pub struct WGPUTotkVulkanHandles {
++    pub instance: u64,
++    pub physical_device: u64,
++    pub device: u64,
++    pub queue: u64,
++    pub queue_family: u32,
++    pub queue_index: u32,
++    /// PFN_vkGetInstanceProcAddr / PFN_vkGetDeviceProcAddr
++    pub get_instance_proc_addr: *const c_void,
++    pub get_device_proc_addr: *const c_void,
++}
++
++/// A texture's state for wgpuTotkCommandEncoderRaw (wgpu's TextureUses bits: RESOURCE = 1 << 4, sampled, Vulkan
++/// SHADER_READ_ONLY_OPTIMAL; STORAGE_READ_WRITE = 1 << 10, storage, Vulkan GENERAL).
++#[repr(C)]
++pub struct WGPUTotkTextureTransition {
++    pub texture: native::WGPUTexture,
++    pub state: u32,
++}
++
++/// Called once with the raw VkCommandBuffer, when the encoder is finished (wgpuCommandEncoderFinish, on that
++/// thread), after the transitions. It must leave the textures in the states it got them in.
++pub type WGPUTotkRawCallback = Option<unsafe extern "C" fn(command_buffer: u64, user: *mut c_void)>;
++
++fn leak_names(names: *const *const c_char, count: usize) -> Vec<&'static CStr> {
++    if names.is_null() {
++        return Vec::new();
++    }
++    (0..count)
++        .filter_map(|i| unsafe {
++            let p = *names.add(i);
++            (!p.is_null()).then(|| &*Box::leak(CStr::from_ptr(p).to_owned().into_boxed_c_str()))
++        })
++        .collect()
++}
++
++/// More Vulkan extensions to enable where available: instance extensions count for instances created after this,
++/// device extensions for devices requested after this.
++#[no_mangle]
++pub unsafe extern "C" fn wgpuTotkAddVulkanExtensions(
++    instance_extensions: *const *const c_char,
++    instance_count: usize,
++    device_extensions: *const *const c_char,
++    device_count: usize,
++) {
++    let mut i = hal::vulkan::TOTK_EXTRA_INSTANCE_EXTENSIONS.lock();
++    for e in leak_names(instance_extensions, instance_count) {
++        if !i.contains(&e) {
++            i.push(e);
++        }
++    }
++    let mut d = hal::vulkan::TOTK_EXTRA_DEVICE_EXTENSIONS.lock();
++    for e in leak_names(device_extensions, device_count) {
++        if !d.contains(&e) {
++            d.push(e);
++        }
++    }
++}
++
++fn fill_instance(out: &mut WGPUTotkVulkanHandles, shared: &hal::vulkan::InstanceShared) {
++    let raw = shared.raw_instance();
++    out.instance = ash::vk::Handle::as_raw(raw.handle());
++    out.get_instance_proc_addr = shared.entry().static_fn().get_instance_proc_addr as *const c_void;
++    out.get_device_proc_addr = raw.fp_v1_0().get_device_proc_addr as *const c_void;
++}
++
++/// The adapter's instance and physical device (before a device exists: what NGX needs to say which device
++/// extensions it wants). False if the adapter is not a Vulkan one.
++#[no_mangle]
++pub unsafe extern "C" fn wgpuTotkAdapterVulkanHandles(
++    adapter: native::WGPUAdapter,
++    out: Option<&mut WGPUTotkVulkanHandles>,
++) -> bool {
++    let (Some(adapter), Some(out)) = (adapter.as_ref(), out) else {
++        return false;
++    };
++    let Some(hal_adapter) = adapter.context.adapter_as_hal::<Vk>(adapter.id) else {
++        return false;
++    };
++    *out = std::mem::zeroed();
++    fill_instance(out, hal_adapter.shared_instance());
++    out.physical_device = ash::vk::Handle::as_raw(hal_adapter.raw_physical_device());
++    true
++}
++
++/// The device's Vulkan objects. False if the device is not a Vulkan one.
++#[no_mangle]
++pub unsafe extern "C" fn wgpuTotkDeviceVulkanHandles(
++    device: native::WGPUDevice,
++    out: Option<&mut WGPUTotkVulkanHandles>,
++) -> bool {
++    let (Some(device), Some(out)) = (device.as_ref(), out) else {
++        return false;
++    };
++    let Some(hal_device) = device.context.device_as_hal::<Vk>(device.id) else {
++        return false;
++    };
++    *out = std::mem::zeroed();
++    fill_instance(out, hal_device.shared_instance());
++    out.physical_device = ash::vk::Handle::as_raw(hal_device.raw_physical_device());
++    out.device = ash::vk::Handle::as_raw(hal_device.raw_device().handle());
++    out.queue = ash::vk::Handle::as_raw(hal_device.raw_queue());
++    out.queue_family = hal_device.queue_family_index();
++    out.queue_index = hal_device.queue_index();
++    true
++}
++
++/// The texture's VkImage (0: none, or not Vulkan). It stays valid while the texture does.
++#[no_mangle]
++pub unsafe extern "C" fn wgpuTotkTextureVkImage(texture: native::WGPUTexture) -> u64 {
++    let Some(texture) = texture.as_ref() else {
++        return 0;
++    };
++    match texture.context.texture_as_hal::<Vk>(texture.id) {
++        Some(t) => ash::vk::Handle::as_raw(t.raw_handle()),
++        None => 0,
++    }
++}
++
++/// The texture view's VkImageView (0: none, or not Vulkan). It stays valid while the view does.
++#[no_mangle]
++pub unsafe extern "C" fn wgpuTotkTextureViewVkImageView(view: native::WGPUTextureView) -> u64 {
++    let Some(view) = view.as_ref() else {
++        return 0;
++    };
++    match view.context.texture_view_as_hal::<Vk>(view.id) {
++        Some(v) => ash::vk::Handle::as_raw(v.raw_handle()),
++        None => 0,
++    }
++}
++
++struct RawCall {
++    callback: unsafe extern "C" fn(u64, *mut c_void),
++    user: usize,
++}
++
++/// Raw Vulkan commands at this point of the encoder: the textures go to the given states (wgpu's barriers, and its
++/// tracking knows them after), then `callback` records into the raw VkCommandBuffer when the encoder is finished.
++/// The textures are kept alive by the command. `user` must stay valid until the callback ran (or the encoder was
++/// dropped without finishing: then the callback never runs).
++#[no_mangle]
++pub unsafe extern "C" fn wgpuTotkCommandEncoderRaw(
++    command_encoder: native::WGPUCommandEncoder,
++    transitions: *const WGPUTotkTextureTransition,
++    transition_count: usize,
++    callback: WGPUTotkRawCallback,
++    user: *mut c_void,
++) {
++    let command_encoder = command_encoder.as_ref().expect("invalid command encoder");
++    let Some(callback) = callback else { return };
++    let list: &[WGPUTotkTextureTransition] = if transitions.is_null() || transition_count == 0 {
++        &[]
++    } else {
++        std::slice::from_raw_parts(transitions, transition_count)
++    };
++    let texture_transitions = list
++        .iter()
++        .map(|t| wgt::TextureTransition {
++            texture: t.texture.as_ref().expect("invalid texture").id,
++            selector: None,
++            state: wgt::TextureUses::from_bits_truncate(t.state as u16),
++        })
++        .collect::<Vec<_>>();
++    let call = RawCall {
++        callback,
++        user: user as usize,
++    };
++    let call = wgc::command::TotkRawCall(Arc::new(move |encoder: &mut dyn hal::DynCommandEncoder| {
++        let Some(vk_encoder) = encoder.as_any_mut().downcast_mut::<hal::vulkan::CommandEncoder>() else {
++            log::error!("wgpuTotkCommandEncoderRaw: not a Vulkan encoder");
++            return;
++        };
++        let raw = ash::vk::Handle::as_raw(vk_encoder.raw_handle());
++        (call.callback)(raw, call.user as *mut c_void);
++    }));
++    if let Err(cause) = command_encoder.context.command_encoder_totk_raw(
++        command_encoder.id,
++        texture_transitions.into_iter(),
++        call,
++    ) {
++        handle_error(
++            &command_encoder.error_sink,
++            cause,
++            None,
++            "wgpuTotkCommandEncoderRaw",
++        );
++    }
++}

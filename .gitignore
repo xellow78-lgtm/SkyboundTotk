@@ -31,3 +31,8 @@ __pycache__/
 !third_party/wgpu-native/lib/wgpu_native.dll
 !third_party/wgpu-native/lib/wgpu_native.dll.lib
 !third_party/sdl2/SDL2.dll
+
+# DLSS: fetched on the PC by third_party/wgpu-native/build_dlss_deps.py (NVIDIA SDK license: not in this repository)
+third_party/dlss/
+third_party/vulkan-headers/
+third_party/wgpu-native/lib/*.orig
