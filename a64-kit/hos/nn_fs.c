@@ -124,25 +124,71 @@ static void user_mount(const char *name, const char *sub) {
     mount(name, root, 1);
 }
 
+/* The save folder: <user>\save\<uid>, or HOS_SAVE_DIR=<folder>\<uid> (the launcher's Save folder setting: a folder
+   OneDrive / Google Drive syncs shares the saves between PCs; the rest of <user> - settings, caches - stays per PC).
+   The first time a save folder is used, this install's saves are copied into it (copied, not moved: the old ones stay
+   as they were), unless it already holds saves (another PC's: those are used). */
+static void copy_tree(const char *from, const char *to) {
+    CreateDirectoryA(to, NULL);
+    char pat[MAX_PATH];
+    snprintf(pat, sizeof pat, "%s\\*", from);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        char a[MAX_PATH], b[MAX_PATH];
+        snprintf(a, sizeof a, "%s\\%s", from, fd.cFileName);
+        snprintf(b, sizeof b, "%s\\%s", to, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) copy_tree(a, b);
+        else if (!CopyFileA(a, b, TRUE)) hos_log("fs: save folder: could not copy %s (error %lu)", a, GetLastError());
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+}
+static void save_root(char *out, size_t n, uint64_t uid_hi, uint64_t uid_lo) {
+    char own[MAX_PATH];
+    snprintf(own, sizeof own, "%s\\save\\%016llx%016llx", hos_user_dir, (unsigned long long)uid_hi, (unsigned long long)uid_lo);
+    const char *dir = getenv("HOS_SAVE_DIR");
+    if (!dir || !*dir) {
+        snprintf(out, n, "%s", own);
+        return;
+    }
+    snprintf(out, n, "%s\\%016llx%016llx", dir, (unsigned long long)uid_hi, (unsigned long long)uid_lo);
+    static int told;
+    if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES) {
+        make_dirs(dir);
+        CreateDirectoryA(dir, NULL);
+        if (GetFileAttributesA(own) != INVALID_FILE_ATTRIBUTES) {
+            copy_tree(own, out);
+            hos_log("fs: save folder %s: this install's saves copied into it (the originals stay in %s)", dir, own);
+            told = 1;
+        }
+    }
+    if (!told++) hos_log("fs: saves in %s (HOS_SAVE_DIR)", out);
+}
+
 /* nn::fs::IsSaveDataExisting(ApplicationId, account::Uid const&) -> bool */
 HLE(_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE) {
     char root[MAX_PATH];
-    snprintf(root, sizeof root, "%s\\save\\%016llx%016llx", hos_user_dir, (unsigned long long)G64(ARG(1) + 8),
-             (unsigned long long)G64(ARG(1)));
+    save_root(root, sizeof root, G64(ARG(1) + 8), G64(ARG(1)));
     RET(GetFileAttributesA(root) != INVALID_FILE_ATTRIBUTES);
 }
 /* MountSaveData(char const*, account::Uid const&) */
 HLE(_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE) {
-    char sub[64];
-    snprintf(sub, sizeof sub, "save\\%016llx%016llx", (unsigned long long)G64(ARG(1) + 8), (unsigned long long)G64(ARG(1)));
-    user_mount(gstr(ARG(0)), sub);
+    char root[MAX_PATH];
+    save_root(root, sizeof root, G64(ARG(1) + 8), G64(ARG(1)));
+    make_dirs(root);
+    CreateDirectoryA(root, NULL);
+    mount(gstr(ARG(0)), root, 1);
     RET(0);
 }
 /* MountSaveDataReadOnly(char const*, ApplicationId, account::Uid const&) */
 HLE(_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE) {
-    char sub[64];
-    snprintf(sub, sizeof sub, "save\\%016llx%016llx", (unsigned long long)G64(ARG(2) + 8), (unsigned long long)G64(ARG(2)));
-    user_mount(gstr(ARG(0)), sub);
+    char root[MAX_PATH];
+    save_root(root, sizeof root, G64(ARG(2) + 8), G64(ARG(2)));
+    make_dirs(root);
+    CreateDirectoryA(root, NULL);
+    mount(gstr(ARG(0)), root, 1);
     RET(0);
 }
 HLE(_ZN2nn2fs21MountTemporaryStorageEPKc) { user_mount(gstr(ARG(0)), "temp"); RET(0); }

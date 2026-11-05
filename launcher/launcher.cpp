@@ -249,7 +249,7 @@ struct Setting {
 
 enum SettingId {
     S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_VSYNC, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_DLSSMODEL, S_FPS, S_FRAMETIMING, S_FPSCOUNTER, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
-    S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_LOG, S_COUNT
+    S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_SAVES, S_LOG, S_COUNT
 };
 std::vector<Setting> settings_list() {
     std::vector<Setting> s(S_COUNT);
@@ -290,10 +290,14 @@ std::vector<Setting> settings_list() {
     s[S_SEC_FILES] = {K_SECTION, L"Files", L""};
     s[S_MODS] = {K_PATH, L"Mods folder", L"TKMM's output, or emulator-style mod folders."};
     s[S_MODS_ON] = {K_TOGGLE, L"Use mods", L""};
+    s[S_SAVES] = {K_PATH, L"Save folder", L"(none): this install's. A OneDrive / Google Drive folder shares saves between PCs."};
     s[S_LOG] = {K_PATH, L"Log file", L"What the game prints (send it with a bug report)."};
     s[S_LOG].file = true;
     return s;
 }
+
+// a K_PATH setting's key in launcher.ini
+const wchar_t* path_key(int id) { return id == S_MODS ? L"mods" : id == S_SAVES ? L"saves" : L"log"; }
 
 // the build's steps (launcher/pipeline.py's)
 struct BuildStep {
@@ -757,7 +761,7 @@ void draw_settings(Draw& d, RectF c) {
             d.fill(RectF(kx - 9 * s, track.Y - 6 * s, 18 * s, 18 * s), h ? kGold : kText, 9);
             d.text(slider_text(id, v), RectF(track.X + track.Width + 8 * s, val.Y, 68 * s, val.Height), 15, kText, 2);
         } else if (st.kind == K_PATH) {
-            const wstring p = app.cfg.get(id == S_MODS ? L"mods" : L"log");
+            const wstring p = app.cfg.get(path_key(id));
             RectF box(val.X, val.Y, val.Width - 172 * s, val.Height);
             d.fill(box, kPanel2, 7);
             d.text(p.empty() ? L"(none)" : p, RectF(box.X + 10 * s, box.Y, box.Width - 20 * s, box.Height), 13,
@@ -1094,6 +1098,8 @@ void play() {
     env[L"RX_PRESENT"] = present[std::clamp((int)setting_value(S_VSYNC), 0, 2)];
     const wstring mods = app.cfg.get(L"mods");
     env[L"HOS_MODS"] = (int)setting_value(S_MODS_ON) && !mods.empty() ? mods : L"";
+    // (the save folder: the game copies this install's saves into it the first time, unless it already holds some)
+    env[L"HOS_SAVE_DIR"] = app.cfg.get(L"saves");
     for (auto& [k, v] : app.cfg.v)   // (env.NAME = value: more for the game)
         if (k.rfind(L"env.", 0) == 0 && k.size() > 4) env[k.substr(4)] = v;
     auto block = env_block(env);
@@ -1410,8 +1416,8 @@ void click(const Hot& h) {
         break;
     case A_MODE: app.cfg.v[L"mode"] = std::to_wstring(h.arg); app.cfg.save(); break;
     case A_BROWSE: {
-        if (h.arg == S_MODS || h.arg == S_LOG) {
-            const wchar_t* key = h.arg == S_MODS ? L"mods" : L"log";
+        if (h.arg == S_MODS || h.arg == S_SAVES || h.arg == S_LOG) {
+            const wchar_t* key = path_key(h.arg);
             wstring p;
             if (h.arg == S_LOG) {   // (a log file: a folder picked, the file named in it)
                 p = pick(false, nullptr, app.cfg.get(key));
@@ -1432,7 +1438,7 @@ void click(const Hot& h) {
         break;
     }
     case A_CLEAR:
-        app.cfg.v[h.arg == S_MODS ? L"mods" : L"log"] = L"";
+        app.cfg.v[path_key(h.arg)] = L"";
         app.cfg.save();
         break;
     case A_BUILD: start_build(); break;
