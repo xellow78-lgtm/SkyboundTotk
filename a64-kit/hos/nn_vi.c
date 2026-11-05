@@ -332,16 +332,18 @@ double hos_vi_frame_seconds(void) {
     memcpy(&seconds, &hi, 4);
     return seconds > 0 ? seconds : 1.0 / 60.0;
 }
-/* HOS_STEP_FRAMES=<1..8>: how many frame times the step averages (5 by default, as MacNativeGames). Fewer follow the
-   frames more closely: on a variable-refresh display an average of 5 lags 2-3 frames behind, and after slow frames
-   Link briefly ran faster (UltraTears' 165 Hz G-Sync report, 2026-10-31). */
+/* How many frame times the step averages: frame_timing in input.ini (F1 > Graphics, the launcher; live): 0 smooth,
+   the last 5 (as MacNativeGames and totk-pc-recomp), 1 responsive, the last frame's alone. An average of 5 evens out
+   uneven frames; on a variable-refresh display (G-Sync / FreeSync: each frame shown as long as it took) it lags 2-3
+   frames behind, and after slow frames the game kept the long step a moment and Link ran visibly faster (a 165 Hz
+   G-Sync report to UltraTears, 2026-10-31). HOS_STEP_FRAMES=<1..8> overrides. */
 static int step_frames(void) {
-    static int n = -1;
-    if (n < 0) {
+    static int env = -1;
+    if (env < 0) {
         const char *e = getenv("HOS_STEP_FRAMES");
-        n = e && atoi(e) >= 1 && atoi(e) <= 8 ? atoi(e) : 5;
+        env = e && atoi(e) >= 1 && atoi(e) <= 8 ? atoi(e) : 0;
     }
-    return n;
+    return env ? env : hos_frame_timing == 1 ? 1 : 5;
 }
 static void frame_step_present(int64_t now) {
     static int64_t last;
@@ -355,6 +357,8 @@ static void frame_step_present(int64_t now) {
         return;
     }
     const int k = step_frames();
+    static int last_k;
+    if (k != last_k) n = next = 0, last_k = k;   /* (the setting changed: start over) */
     samples[next++ % k] = dt < 1.0 / 240 ? 1.0 / 240 : dt > 1.0 / 15 ? 1.0 / 15 : dt;
     if (n < k) n++;
     double sum = 0;

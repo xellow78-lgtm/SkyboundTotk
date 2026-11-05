@@ -51,7 +51,7 @@ const char* const kPageNames[kPages] = {"Graphics", "Mouse", "Controls"};
 
 enum Kind { kOption, kSlider, kToggle, kBinding, kButton, kInfo, kSection };
 enum Id {
-    kOutRes, kAspect, kRes, kFps, kFpsCounter, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
+    kOutRes, kAspect, kRes, kFps, kFrameTiming, kFpsCounter, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
 };
 
 struct Row {
@@ -76,6 +76,7 @@ int fps_index(int v) {
 const char* const kOutResNames[4] = {"1920 x 1080", "Display", "2560 x 1440", "3840 x 2160"};
 const char* const kAspectNames[5] = {"16:9 (the game's own)", "The display's shape", "16:10", "21:9", "32:9"};
 const char* const kCounterNames[3] = {"Off", "FPS", "FPS + frame time"};
+const char* const kTimingNames[2] = {"Smooth", "Responsive"};
 const char* const kButtonNames[5] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Switch"};
 
 // the bindings page: the buttons, the d-pad, the sticks and walk (sections between)
@@ -109,6 +110,9 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
         add(kOption, kFps, "Frame rate limit", kFpsNames[fps_index(b.fps_limit)],
             b.fps_limit == 0 || b.fps_limit > 60 ? "Beta above 60: the camera may turn faster, Link may not climb steps."
                                                  : "The game runs at the right speed at any frame rate.");
+        add(kOption, kFrameTiming, "Frame timing", kTimingNames[std::clamp(b.frame_timing, 0, 1)],
+            b.frame_timing ? "Each frame steps the game by the last frame's time. For G-Sync / FreeSync."
+                           : "Steps the game by the last 5 frames' time: evens out uneven frames.");
         add(kOption, kFpsCounter, "FPS counter", kCounterNames[std::clamp(b.fps_counter, 0, 2)],
             "In the top left corner: frames shown a second.");
         add(kOption, kAniso, "Anisotropic filtering", kAnisoNames[std::clamp(b.aniso, 0, 4)],
@@ -193,12 +197,12 @@ Layout layout(int w, int h, int page) {
     Layout l{};
     l.s = std::min(w / 1920.0f, h / 1080.0f);
     if (l.s <= 0) l.s = 1;
-    const float s = l.s, pw = 1120 * s, ph = 920 * s;
+    const float s = l.s, pw = 1120 * s, ph = 990 * s;
     l.panel = {(w - pw) / 2, (h - ph) / 2, pw, ph};
     for (int i = 0; i < kPages; i++) l.tabs[i] = {l.panel.x + 48 * s + i * 186 * s, l.panel.y + 104 * s, 176 * s, 46 * s};
     l.close = {l.panel.x + pw - 48 * s - 44 * s, l.panel.y + 36 * s, 44 * s, 44 * s};
     l.content = {l.panel.x + 48 * s, l.panel.y + 178 * s, pw - 96 * s, ph - 178 * s - 112 * s};
-    l.row_h = (page == kControls ? 50 : page == kGraphics ? 60 : 76) * s;   // (Graphics: its 9 rows without scrolling)
+    l.row_h = (page == kControls ? 50 : page == kGraphics ? 60 : 76) * s;   // (Graphics: its 10 rows without scrolling)
     l.gap = 8 * s;
     return l;
 }
@@ -252,6 +256,7 @@ void change(State& s, const Row& r, int dir) {
     case kOutRes: b.output_res = (b.output_res + dir + 4) % 4; break;
     case kAspect: b.aspect = (b.aspect + dir + 5) % 5; break;
     case kFpsCounter: b.fps_counter = (b.fps_counter + dir + 3) % 3; break;
+    case kFrameTiming: b.frame_timing = !b.frame_timing; break;
     case kButtons: b.button_icons = (b.button_icons + dir + 5) % 5; break;
     case kMouseCam: b.mouse_camera = !b.mouse_camera; break;
     case kInvert: b.mouse_invert_y = !b.mouse_invert_y; break;
@@ -284,7 +289,7 @@ void reset_controls(State& s) {
     hos_bind_defaults(&d);
     d.render_mode = b.render_mode, d.aniso = b.aniso, d.reflex = b.reflex;   // (the graphics settings: kept)
     d.button_icons = b.button_icons, d.output_res = b.output_res, d.fps_limit = b.fps_limit;
-    d.fps_counter = b.fps_counter, d.aspect = b.aspect;
+    d.fps_counter = b.fps_counter, d.aspect = b.aspect, d.frame_timing = b.frame_timing;
     hos_bind_set(&d);
     set_status(s, "Controls and mouse settings are back to the defaults.");
 }

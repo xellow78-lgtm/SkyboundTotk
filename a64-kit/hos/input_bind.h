@@ -38,6 +38,8 @@ typedef struct {
                                               second, 2 and the frame time */
     int aspect;                            /* the picture's shape (totk_ultrawide.c, at the start): 0 16:9 (the
                                               game's own), 1 the display's, 2 16:10, 3 21:9, 4 32:9 */
+    int frame_timing;                      /* the game's step per frame (nn_vi.c, live): 0 smooth (the average of
+                                              the last 5 frame times), 1 responsive (the last frame's time) */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */
@@ -46,6 +48,7 @@ extern volatile int hos_reflex_mode;   /* Bindings.reflex */
 extern volatile int hos_button_icons_setting;   /* Bindings.button_icons */
 extern volatile int hos_fps_limit;              /* Bindings.fps_limit */
 extern volatile int hos_fps_counter;            /* Bindings.fps_counter */
+extern volatile int hos_frame_timing;           /* Bindings.frame_timing */
 
 /* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
 int hos_render_mode_count(void);
