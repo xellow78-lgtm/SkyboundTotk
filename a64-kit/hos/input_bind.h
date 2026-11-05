@@ -30,6 +30,8 @@ typedef struct {
     int reflex;                            /* NVIDIA Reflex: 0 off, 1 on, 2 on + boost */
     int output_res;                        /* the game's output (totk_res.c, at the start): 0 1920x1080 (its own),
                                               1 the display's (the largest 16:9 that fits), 2 2560x1440, 3 3840x2160 */
+    int fps_limit;                         /* frames a second at most (nn_vi.c, live): 30..240, 0 the display's
+                                              refresh rate (at most 240) */
     int button_icons;                      /* the button prompts drawn: 0 for the device played with, 1 keyboard and
                                               mouse, 2 Xbox, 3 PlayStation, 4 Switch (buttons.c) */
 } Bindings;
@@ -38,6 +40,7 @@ typedef struct {
 extern volatile int hos_aniso_level;   /* Bindings.aniso */
 extern volatile int hos_reflex_mode;   /* Bindings.reflex */
 extern volatile int hos_button_icons_setting;   /* Bindings.button_icons */
+extern volatile int hos_fps_limit;              /* Bindings.fps_limit */
 
 /* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
 int hos_render_mode_count(void);

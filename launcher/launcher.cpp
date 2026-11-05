@@ -248,7 +248,7 @@ struct Setting {
 };
 
 enum SettingId {
-    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_SEC_GAME, S_OUTRES, S_RES, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
+    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_SEC_GAME, S_OUTRES, S_RES, S_FPS, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
     S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_LOG, S_COUNT
 };
 std::vector<Setting> settings_list() {
@@ -266,6 +266,8 @@ std::vector<Setting> settings_list() {
                    {L"1920 x 1080", L"Display", L"2560 x 1440", L"3840 x 2160"}};
     s[S_RES] = {K_OPTION, L"3D resolution", L"The 3D scene's share of it, before the upscaler.",
                 {L"Game's own", L"Quality", L"Balanced", L"Performance", L"Ultra Performance", L"Native (DLAA)"}};
+    s[S_FPS] = {K_OPTION, L"Frame rate limit", L"Beta above 60: the camera may turn faster, climbing may fail.",
+                {L"30", L"60", L"90", L"120", L"144", L"165", L"240", L"Display's rate"}};
     s[S_ANISO] = {K_OPTION, L"Anisotropic filtering", L"Sharper ground and walls at an angle.",
                   {L"Game's own", L"2x", L"4x", L"8x", L"16x"}};
     s[S_REFLEX] = {K_OPTION, L"NVIDIA Reflex", L"Less input lag (NVIDIA, with the DLSS library).",
@@ -360,6 +362,13 @@ void load_all() {
     }
 }
 
+const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 240, 0};   // (input.ini frame_rate_limit; 0 the display's)
+int fps_index(int v) {
+    for (int i = 0; i < 8; i++)
+        if (kFpsValues[i] == v) return i;
+    return 1;
+}
+
 // a setting's current value: an index (options, toggles) or a number (sliders)
 double setting_value(int id) {
     auto& c = app.cfg;
@@ -370,6 +379,7 @@ double setting_value(int id) {
     case S_DISPLAY: return c.geti(L"fullscreen", 0);
     case S_WINDOW: return c.geti(L"window", 0);
     case S_OUTRES: return g.geti("output_resolution", 0);
+    case S_FPS: return fps_index(g.geti("frame_rate_limit", 60));
     case S_RES: return g.geti("render_resolution", 0);
     case S_ANISO: return g.geti("anisotropic_filtering", 0);
     case S_REFLEX: return g.geti("nvidia_reflex", 0);
@@ -396,6 +406,7 @@ void set_setting(int id, double v) {
     case S_WINDOW: c.v[L"window"] = std::to_wstring((int)v); break;
     case S_MODS_ON: c.v[L"mods_on"] = std::to_wstring((int)v); break;
     case S_OUTRES: g.set("output_resolution", std::to_string((int)v)); return;
+    case S_FPS: g.set("frame_rate_limit", std::to_string(kFpsValues[std::clamp((int)v, 0, 7)])); return;
     case S_RES: g.set("render_resolution", std::to_string((int)v)); return;
     case S_ANISO: g.set("anisotropic_filtering", std::to_string((int)v)); return;
     case S_REFLEX: g.set("nvidia_reflex", std::to_string((int)v)); return;

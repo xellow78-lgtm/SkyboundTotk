@@ -4,6 +4,7 @@
    NVN presents through (below). Vsync is a 60 Hz host thread signaling the display's vsync system event; games pace
    their frames on it. */
 #include "hos.h"
+#include "input_bind.h"
 #include <string.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -62,22 +63,32 @@ static double vsync_target_hz(void) {
 
 /* With real-time steps frames are not held to vsync ticks (a grid of ticks turns a 15 ms frame into two ticks: at a
    90 Hz grid, 45 fps): each frame may start 1/cap after the one before, and goes out as soon as it is done (mailbox
-   presents: no tearing). HOS_FPS_CAP=<hz>; default the display's refresh rate, at most 120 (60 when unknown). */
+   presents: no tearing). The cap is frame_rate_limit in input.ini (F1 > Graphics, the launcher; live): 30..240, or 0
+   for the display's refresh rate; 60 by default. 240 at most: with a shorter step TOTK 1.4.3's physics runs out of
+   memory or crashes on some loads (totk-pc-recomp's measurements, runtime/frame_rate.c). HOS_FPS_CAP=<hz> overrides. */
 static volatile LONG64 display_period_ns;   /* (the vsync thread reads the display's timing) */
 static double frame_cap_hz(void) {
-    static double hz = -1;
-    if (hz < 0) {
+    static double env = -1, shown = -1;
+    if (env < 0) {
         const char *e = getenv("HOS_FPS_CAP");
-        if (e && atof(e) >= 20) hz = atof(e) > 480 ? 480 : atof(e);
+        env = e && atof(e) >= 20 ? (atof(e) > 240 ? 240 : atof(e)) : 0;
+    }
+    double hz = env;
+    if (!hz) {
+        const int lim = hos_fps_limit;
+        if (lim >= 30) hz = lim;
         else {
             const int64_t p = display_period_ns;
-            if (!p) return 60;   /* (not known yet: ask again next frame) */
-            hz = 1e9 / (double)p;
-            if (hz > 120) hz = 120;
+            hz = p ? 1e9 / (double)p : 60;   /* (the display's rate not known yet: 60) */
             if (hz < 50) hz = 60;
         }
-        hos_log("vi: frames at most %.0f a second (%s), each shown as soon as it is done", hz,
-                e && atof(e) >= 20 ? "HOS_FPS_CAP" : "the display's refresh rate, at most 120");
+        if (hz > 240) hz = 240;
+    }
+    if (hz != shown) {
+        hos_log("vi: frames at most %.0f a second (%s)%s", hz,
+                env ? "HOS_FPS_CAP" : hos_fps_limit ? "frame_rate_limit" : "the display's refresh rate",
+                hz > 63 ? ": above ~63 the camera may turn faster and Link may not climb steps (beta)" : "");
+        shown = hz;
     }
     return hz;
 }
@@ -308,6 +319,10 @@ static uint64_t frame_step(void) {
     }
     return v;
 }
+/* totk_highfps.c: whether the real-time step is on, and this frame's step (low: ratio = seconds * 30, high: seconds,
+   floats) */
+int hos_realtime_step(void) { return realtime_on(); }
+uint64_t hos_frame_step_bits(void) { return frame_step(); }
 /* The game's step for this frame in seconds (totk_mouse_cam.c: the mouse's motion over it): the real-time step, or
    the interval's. */
 double hos_vi_frame_seconds(void) {
@@ -317,9 +332,20 @@ double hos_vi_frame_seconds(void) {
     memcpy(&seconds, &hi, 4);
     return seconds > 0 ? seconds : 1.0 / 60.0;
 }
+/* HOS_STEP_FRAMES=<1..8>: how many frame times the step averages (5 by default, as MacNativeGames). Fewer follow the
+   frames more closely: on a variable-refresh display an average of 5 lags 2-3 frames behind, and after slow frames
+   Link briefly ran faster (UltraTears' 165 Hz G-Sync report, 2026-10-31). */
+static int step_frames(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("HOS_STEP_FRAMES");
+        n = e && atoi(e) >= 1 && atoi(e) <= 8 ? atoi(e) : 5;
+    }
+    return n;
+}
 static void frame_step_present(int64_t now) {
     static int64_t last;
-    static double samples[5];
+    static double samples[8];
     static int n, next;
     if (!realtime_on()) return;
     const double dt = last ? (now - last) * 1e-9 : 0;
@@ -328,8 +354,9 @@ static void frame_step_present(int64_t now) {
         n = next = 0;
         return;
     }
-    samples[next++ % 5] = dt < 1.0 / 240 ? 1.0 / 240 : dt > 1.0 / 15 ? 1.0 / 15 : dt;
-    if (n < 5) n++;
+    const int k = step_frames();
+    samples[next++ % k] = dt < 1.0 / 240 ? 1.0 / 240 : dt > 1.0 / 15 ? 1.0 / 15 : dt;
+    if (n < k) n++;
     double sum = 0;
     for (int i = 0; i < n; i++) sum += samples[i];
     InterlockedExchange64(&frame_step_bits, (LONG64)step_bits((float)(sum / n)));

@@ -51,7 +51,7 @@ const char* const kPageNames[kPages] = {"Graphics", "Mouse", "Controls"};
 
 enum Kind { kOption, kSlider, kToggle, kBinding, kButton, kInfo, kSection };
 enum Id {
-    kOutRes, kRes, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
+    kOutRes, kRes, kFps, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
 };
 
 struct Row {
@@ -66,6 +66,13 @@ struct Row {
 
 const char* const kAnisoNames[5] = {"Game's own", "2x", "4x", "8x", "16x"};
 const char* const kReflexNames[3] = {"Off", "On", "On + Boost"};
+const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 240, 0};
+const char* const kFpsNames[8] = {"30", "60", "90", "120", "144", "165", "240", "Display's rate"};
+int fps_index(int v) {
+    for (int i = 0; i < 8; i++)
+        if (kFpsValues[i] == v) return i;
+    return 1;
+}
 const char* const kOutResNames[4] = {"1920 x 1080", "Display", "2560 x 1440", "3840 x 2160"};
 const char* const kButtonNames[5] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Switch"};
 
@@ -94,6 +101,9 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
         Row& res = add(kOption, kRes, "3D resolution", hos_render_mode_name(b.render_mode),
                        scaler ? "The 3D scene's size before the upscaler." : "Needs FSR 2 or DLSS (set at launch).");
         res.enabled = scaler;
+        add(kOption, kFps, "Frame rate limit", kFpsNames[fps_index(b.fps_limit)],
+            b.fps_limit == 0 || b.fps_limit > 60 ? "Beta above 60: the camera may turn faster, Link may not climb steps."
+                                                 : "The game runs at the right speed at any frame rate.");
         add(kOption, kAniso, "Anisotropic filtering", kAnisoNames[std::clamp(b.aniso, 0, 4)],
             "Sharper ground and walls at an angle. Cheap on a PC.");
         Row& rf = add(kOption, kReflex, "NVIDIA Reflex", kReflexNames[std::clamp(b.reflex, 0, 2)],
@@ -181,7 +191,7 @@ Layout layout(int w, int h, int page) {
     for (int i = 0; i < kPages; i++) l.tabs[i] = {l.panel.x + 48 * s + i * 186 * s, l.panel.y + 104 * s, 176 * s, 46 * s};
     l.close = {l.panel.x + pw - 48 * s - 44 * s, l.panel.y + 36 * s, 44 * s, 44 * s};
     l.content = {l.panel.x + 48 * s, l.panel.y + 178 * s, pw - 96 * s, ph - 178 * s - 112 * s};
-    l.row_h = (page == kControls ? 50 : 76) * s;
+    l.row_h = (page == kControls ? 50 : page == kGraphics ? 64 : 76) * s;   // (Graphics: its 7 rows without scrolling)
     l.gap = 8 * s;
     return l;
 }
@@ -231,6 +241,7 @@ void change(State& s, const Row& r, int dir) {
     case kRes: b.render_mode = (b.render_mode + dir + hos_render_mode_count()) % hos_render_mode_count(); break;
     case kAniso: b.aniso = (b.aniso + dir + 5) % 5; break;
     case kReflex: b.reflex = (b.reflex + dir + 3) % 3; break;
+    case kFps: b.fps_limit = kFpsValues[(fps_index(b.fps_limit) + dir + 8) % 8]; break;
     case kOutRes: b.output_res = (b.output_res + dir + 4) % 4; break;
     case kButtons: b.button_icons = (b.button_icons + dir + 5) % 5; break;
     case kMouseCam: b.mouse_camera = !b.mouse_camera; break;
@@ -263,7 +274,7 @@ void reset_controls(State& s) {
     hos_bind_get(&b);
     hos_bind_defaults(&d);
     d.render_mode = b.render_mode, d.aniso = b.aniso, d.reflex = b.reflex;   // (the graphics settings: kept)
-    d.button_icons = b.button_icons, d.output_res = b.output_res;
+    d.button_icons = b.button_icons, d.output_res = b.output_res, d.fps_limit = b.fps_limit;
     hos_bind_set(&d);
     set_status(s, "Controls and mouse settings are back to the defaults.");
 }
@@ -756,9 +767,10 @@ void paint(Painter& p, State& s, int w, int h) {
             p.text_in(kStrong, br, row.label, kText, 1);
             continue;
         } else if (two_lines) {
-            p.text(kBody, r.x + 24 * sc, r.y + 11 * sc, row.label, label_c);
-            p.text(kSmall, r.x + 24 * sc, r.y + 11 * sc + G().fonts[kBody].height + 2 * sc,
-                   p.fit(kSmall, row.note, r.w - 520 * sc), kText2);
+            // (the two lines centred in the row: Graphics' rows are shorter)
+            const float top = r.y + std::max(4 * sc, (r.h - G().fonts[kBody].height - G().fonts[kSmall].height) / 2);
+            p.text(kBody, r.x + 24 * sc, top, row.label, label_c);
+            p.text(kSmall, r.x + 24 * sc, top + G().fonts[kBody].height, p.fit(kSmall, row.note, r.w - 520 * sc), kText2);
         } else {
             p.text_in(kBody, {r.x + 24 * sc, r.y, r.w, r.h}, row.label, label_c, 0);
         }
