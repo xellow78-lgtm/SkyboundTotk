@@ -55,6 +55,7 @@ int rx_present(uint64_t guest_address, uint32_t width, uint32_t height);
    was not made: use the old settings window), whether it is open, a key pressed (a virtual-key code), the mouse
    (client pixels; button 0 a move, 1 the left button, down or up), the wheel (notches), and a tick (~60 a second
    while open: a key for a binding being waited for). While open, hos_bind_ui_active is set. */
+int rx_framegen_shown_per_frame(void);   /* (frames shown per game frame: 1 without frame interpolation) */
 int rx_menu_toggle(void);
 int rx_menu_is_open(void);
 void rx_menu_key(int vk);

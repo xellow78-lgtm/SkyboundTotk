@@ -265,8 +265,12 @@ struct PresentRect {
 };
 PresentRect present_rect(uint32_t sw, uint32_t sh, uint32_t tw, uint32_t th);
 bool present_framegen();   // (the player's frame interpolation setting, F7)
+int present_framegen_mult();            // (frames shown per game frame with it on: 2..4)
+void present_set_framegen(int mult);    // (F1: 0 off, else 2..4)
 void present_window_size(int32_t w, int32_t h);   // (rx_resize: ultrawide's aspect)
-void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh, bool debug_present);
+/// made: a frame made by frame interpolation (no present ID or Reflex markers: those name the game's frames)
+void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh, bool debug_present,
+                     bool made = false);
 /// Frame interpolation (rx_framegen.cpp): the frame (its view released) and the frames made between it and the last
 /// handed to the display thread; false: not done (the caller presents it as usual)
 bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh);
@@ -405,6 +409,17 @@ extern WGPUTexture scene_color;         // its HDR colour target (rx_fsr2.cpp)
 extern WGPUTexture scene_mask;          // its object channel target (rx_fsr2.cpp)
 /// FSR 2 (rx_fsr2.cpp): the 3D draws' jitter; the game's scale-up draw replaced (true: skip it)
 bool fsr2_jitter(uint32_t w, uint32_t h, float* ndc_x, float* ndc_y);
+/// The motion vectors FSR 2 / DLSS made for the latest frame (rx_fsr2.cpp), for frame interpolation: the camera's motion
+/// of each scene pixel (RG: its position in the last frame minus now, in the scene's UV: exact for what moves with the
+/// world, not for what moves by itself), and the G-buffer's mark of Link and what he holds (R over 0: the camera's
+/// motion is not theirs). Both at the render size in textures that may be larger: UV x (sx, sy). seq: one more for each
+/// frame; views referenced for the caller (nullptr: none, FSR 2 / DLSS not running).
+struct SceneMotion {
+    WGPUTextureView mv = nullptr, mask = nullptr;
+    float sx = 1, sy = 1;
+    uint64_t seq = 0;
+};
+SceneMotion scene_motion();
 bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_count);
 
 /// DLSS (rx_dlss.cpp; a build with RX_DLSS: otherwise these do nothing). Around the device's creation (rx_core.cpp):

@@ -2444,7 +2444,7 @@ void present_pacing() {
 
 /// The frame into the window and presented (the submit thread, or with frame interpolation the display thread:
 /// rx_framegen.cpp); `view` is released. One present at a time.
-void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh, bool debug_present) {
+void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh, bool debug_present, bool made) {
     static std::mutex present_mu;
     std::lock_guard present_lk(present_mu);
     if (ww > 0 && wh > 0 && ((uint32_t)ww != surface_w || (uint32_t)wh != surface_h))
@@ -2543,9 +2543,11 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
     rx_web_present();   // (the page counts frames)
     rx_web_yield();     // (back to the event loop: the browser shows the canvas and runs WebGPU's callbacks)
 #else
-    const uint64_t present_id = reflex_present_begin();
+    // (Reflex: the game's frames carry their present IDs and markers; frames made by frame interpolation none, so the
+    // IDs stay the game's frame numbers the other markers use)
+    const uint64_t present_id = made ? 0 : reflex_present_begin();
     wgpuSurfacePresent(surface);
-    reflex_present_end(present_id);
+    if (!made) reflex_present_end(present_id);
 #endif
     present_pacing();
     wgpuTextureViewRelease(target);

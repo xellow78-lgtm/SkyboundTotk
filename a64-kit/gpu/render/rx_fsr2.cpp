@@ -387,7 +387,16 @@ bool init_pipelines() {
     return true;
 }
 
+// the latest frame's motion vectors for frame interpolation (scene_motion): FSR 2's / DLSS's own textures
+std::mutex motion_mu;
+SceneMotion motion;   // (views not referenced here: st's; cleared before they are freed)
+uint64_t motion_seq = 0;
+
 void free_sized() {
+    {
+        std::lock_guard lk(motion_mu);
+        motion = SceneMotion{};
+    }
     for (Tex* t : {&st.prepared, &st.dil_mv[0], &st.dil_mv[1], &st.dil_depth, &st.lock[0], &st.lock[1], &st.lock_luma,
                    &st.new_locks, &st.up[0], &st.up[1], &st.lum, &st.luma_hist[0], &st.luma_hist[1], &st.dil_reactive,
                    &st.mv, &st.out, &st.reactive, &st.depth_copy})
@@ -886,11 +895,25 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     st.dispatches++;
     st.reset = false;
     st.last_fsr_frame = frame_number;
+    {
+        std::lock_guard lk(motion_mu);
+        motion.mv = st.mv.v, motion.mask = st.reactive.v;
+        motion.sx = (float)rw / (float)st.mw, motion.sy = (float)rh / (float)st.mh;
+        motion.seq = ++motion_seq;
+    }
     count("fsr2_frames");
     return true;
 }
 
 /// (the settings menu: whether FSR 2 runs this session, RX_FSR2)
 bool fsr2_wanted() { return fsr2_on(); }
+
+SceneMotion scene_motion() {
+    std::lock_guard lk(motion_mu);
+    SceneMotion m = motion;
+    if (m.mv) wgpuTextureViewAddRef(m.mv);
+    if (m.mask) wgpuTextureViewAddRef(m.mask);
+    return m;
+}
 
 }  // namespace rx

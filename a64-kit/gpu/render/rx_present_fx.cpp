@@ -39,6 +39,7 @@ const float kSharpness[] = {0.0f, 0.25f, 0.5f, 1.0f, 2.0f};
 struct Settings {
     bool fsr = true, stretch = false, framegen = false, ultrawide = false;
     float sharpness = 0.25f;
+    int framegen_mult = 2;   // (frames shown per game frame while frame interpolation is on: 2..4)
 };
 std::mutex settings_mu;
 Settings settings;
@@ -54,6 +55,7 @@ Settings current_settings() {
         if (const char* v = getenv("RX_FSR_SHARPNESS")) settings.sharpness = std::clamp((float)atof(v), 0.0f, 2.0f);
         if (const char* v = getenv("RX_ASPECT")) settings.stretch = !strcmp(v, "stretch");
         if (const char* v = getenv("RX_FRAMEGEN")) settings.framegen = *v != '0';
+        if (const char* v = getenv("RX_FRAMEGEN_MULT")) settings.framegen_mult = std::clamp(atoi(v), 2, 4);
         if (const char* v = getenv("RX_ULTRAWIDE")) settings.ultrawide = *v != '0';
         if (FILE* f = fopen(settings_path().c_str(), "r")) {   // (the player's choices win over the defaults)
             char key[32];
@@ -63,6 +65,7 @@ Settings current_settings() {
                 else if (!strcmp(key, "sharpness")) settings.sharpness = std::clamp(val, 0.0f, 2.0f);
                 else if (!strcmp(key, "stretch")) settings.stretch = val != 0;
                 else if (!strcmp(key, "framegen")) settings.framegen = val != 0;
+                else if (!strcmp(key, "framegen_mult")) settings.framegen_mult = std::clamp((int)val, 2, 4);
                 else if (!strcmp(key, "ultrawide")) settings.ultrawide = val != 0;
             }
             fclose(f);
@@ -72,8 +75,8 @@ Settings current_settings() {
 }
 void save_settings(const Settings& s) {
     if (FILE* f = fopen(settings_path().c_str(), "w")) {
-        fprintf(f, "fsr %d\nsharpness %.2f\nstretch %d\nframegen %d\nultrawide %d\n", s.fsr, s.sharpness, s.stretch,
-                s.framegen, s.ultrawide);
+        fprintf(f, "fsr %d\nsharpness %.2f\nstretch %d\nframegen %d\nframegen_mult %d\nultrawide %d\n", s.fsr,
+                s.sharpness, s.stretch, s.framegen, s.framegen_mult, s.ultrawide);
         fclose(f);
     }
 }
@@ -559,6 +562,17 @@ void present_fx_draw(WGPUCommandEncoder e, WGPUTextureView src, uint32_t sw, uin
     draw_pass(e, target, clear, st.rcas, st.mid_view, st.params[1], rect);
 }
 bool present_framegen() { return current_settings().framegen; }
+int present_framegen_mult() { return current_settings().framegen_mult; }
+void present_set_framegen(int mult) {   // (F1: 0 off, else 2..4 frames shown per game frame)
+    Settings s = current_settings();
+    s.framegen = mult >= 2;
+    if (mult >= 2) s.framegen_mult = std::clamp(mult, 2, 4);
+    {
+        std::lock_guard lk(settings_mu);
+        settings = s;
+    }
+    save_settings(s);
+}
 
 /// The window's size (rx_resize). (The aspect ratio no longer follows it: aspect_ratio in input.ini, at the start.)
 void present_window_size(int32_t w, int32_t h) { (void)w, (void)h; }

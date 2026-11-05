@@ -117,27 +117,59 @@ fn med9(v: array<f32, 9>) -> f32 {
 }
 )";
 
+// Each made pixel takes the motion that blends the last frame and the new one best, of three: the block matching's
+// (what moves by itself: Link, enemies; coarse, one per 16x16 pixels), the camera's from FSR 2 / DLSS's motion vectors
+// (per pixel and exact for the world, when they run: u.y = 1), and none (the HUD). "Best": the colour difference between
+// the two frames' samples it pairs, over the pixel and four around it (one pixel's choice would flicker); the camera's
+// is preferred a little where it is about as good, and not used on Link and what he holds (the G-buffer's mark).
 const char* kSynthWgsl = R"(
 @group(0) @binding(0) var fa: texture_2d<f32>;
 @group(0) @binding(1) var fb: texture_2d<f32>;
 @group(0) @binding(2) var flow: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var dst: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(5) var<uniform> u: vec4<f32>;   // t
+@group(0) @binding(5) var<uniform> u: vec4<f32>;   // t, the camera's motion there (1) or not, its UV scale
+@group(0) @binding(6) var mvt: texture_2d<f32>;    // the camera's motion: last position - now, scene UV
+@group(0) @binding(7) var mask: texture_2d<f32>;   // Link and what he holds: R over 0
 fn fl(q: vec2<i32>) -> vec2<f32> {
   return textureLoad(flow, clamp(q, vec2<i32>(0), vec2<i32>(textureDimensions(flow)) - vec2<i32>(1)), 0).xy;
+}
+fn pair_error(p: vec2<f32>, v: vec2<f32>, t: f32, size: vec2<f32>) -> f32 {
+  var e = 0.0;
+  let offs = array<vec2<f32>, 5>(vec2<f32>(0.0, 0.0), vec2<f32>(3.0, 0.0), vec2<f32>(-3.0, 0.0), vec2<f32>(0.0, 3.0),
+                                 vec2<f32>(0.0, -3.0));
+  for (var i = 0; i < 5; i++) {
+    let q = p + offs[i];
+    let a = textureSampleLevel(fa, samp, (q - t * v) / size, 0.0).rgb;
+    let b = textureSampleLevel(fb, samp, (q + (1.0 - t) * v) / size, 0.0).rgb;
+    let d = abs(a - b);
+    e += d.r + d.g + d.b;
+  }
+  return e;
 }
 @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let d = textureDimensions(dst);
   if (g.x >= d.x || g.y >= d.y) { return; }
   let t = u.x;
   let p = vec2<f32>(g.xy) + 0.5;
-  // the motion here: the vectors (one per 16x16 pixels, at their centres) bilinearly
+  let size = vec2<f32>(d);
+  // the block matching's motion here: its vectors (one per 16x16 pixels, at their centres) bilinearly
   let fp = p / 16.0 - 0.5;
   let i = vec2<i32>(floor(fp));
   let w = fp - floor(fp);
-  let v = mix(mix(fl(i), fl(i + vec2<i32>(1, 0)), w.x), mix(fl(i + vec2<i32>(0, 1)), fl(i + vec2<i32>(1, 1)), w.x), w.y);
-  let size = vec2<f32>(d);
+  var v = mix(mix(fl(i), fl(i + vec2<i32>(1, 0)), w.x), mix(fl(i + vec2<i32>(0, 1)), fl(i + vec2<i32>(1, 1)), w.x), w.y);
+  var best = pair_error(p, v, t, size);
+  let still = pair_error(p, vec2<f32>(0.0), t, size);
+  if (still <= best) { best = still; v = vec2<f32>(0.0); }
+  if (u.y > 0.5) {
+    let suv = (p / size) * u.zw;
+    let linked = textureSampleLevel(mask, samp, suv, 0.0).r > 0.0;
+    let vc = -textureSampleLevel(mvt, samp, suv, 0.0).xy * size;   // (now - last, in pixels)
+    if (!linked) {
+      let ec = pair_error(p, vc, t, size) * 0.85;
+      if (ec <= best) { best = ec; v = vc; }
+    }
+  }
   let a = textureSampleLevel(fa, samp, (p - t * v) / size, 0.0).rgb;
   let b = textureSampleLevel(fb, samp, (p + (1.0 - t) * v) / size, 0.0).rgb;
   textureStore(dst, g.xy, vec4<f32>(mix(a, b, t), 1.0));
@@ -190,6 +222,8 @@ struct State {
     WGPUComputePipeline copy = nullptr, luma = nullptr, flow = nullptr, median = nullptr, synth = nullptr;
     WGPUSampler sampler = nullptr;
     WGPUBuffer t_buf[kMaxMult] = {};
+    Tex none;   // (1x1: the camera's motion and Link's mark when FSR 2 / DLSS do not run)
+    uint64_t motion_seq = 0;   // (the motion vectors' frame taken last)
     Tex frames[2], lumas[2], flows[2];
     int cur = 0;
     bool have_prev = false;
@@ -240,6 +274,8 @@ void init_pipelines() {
     sd.lodMaxClamp = 1.0f;
     sd.maxAnisotropy = 1;
     fg.sampler = wgpuDeviceCreateSampler(dev.device, &sd);
+    fg.none = make_tex(1, 1, WGPUTextureFormat_RGBA16Float, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
+                       "rx framegen none");
     for (WGPUBuffer& b : fg.t_buf) {
         WGPUBufferDescriptor d{};
         d.size = 16;
@@ -339,13 +375,7 @@ void dump_png(WGPUTexture tex, uint32_t w, uint32_t h, const char* path) {
     wgpuBufferRelease(buf);
 }
 
-int multiplier() {
-    static const int m = [] {
-        const char* e = getenv("RX_FRAMEGEN_MULT");
-        return e ? std::clamp(atoi(e), 2, kMaxMult) : 2;
-    }();
-    return m;
-}
+int multiplier() { return std::clamp(present_framegen_mult(), 2, kMaxMult); }   // (F1, present.txt; RX_FRAMEGEN_MULT)
 
 /// The display thread: each set's made frames, then the game's, spread over the game's recent frame time
 void display_main() {
@@ -375,7 +405,7 @@ void display_main() {
         const int64_t step = interval / shown;
         for (int k = 0; k <= j.set->made; k++) {
             wgpuTextureViewAddRef(j.set->frame[k].view);
-            surface_present(j.set->frame[k].view, j.sw, j.sh, j.ww, j.wh, false);
+            surface_present(j.set->frame[k].view, j.sw, j.sh, j.ww, j.wh, false, k < j.set->made);
             if (k == j.set->made) break;
             // the next one at its time; if the game's next frame comes first, the rest are left out (shown at once,
             // two presents back to back: the display shows one of them)
@@ -409,7 +439,7 @@ void web_present_k(int64_t due) {
     if (due) (hos_now_ns() - due > 2000000 ? wstat.late : wstat.on_time)++;
     const Tex& t = ws.j.set->frame[ws.k];
     wgpuTextureViewAddRef(t.view);
-    surface_present(t.view, ws.j.sw, ws.j.sh, ws.j.ww, ws.j.wh, false);
+    surface_present(t.view, ws.j.sw, ws.j.sh, ws.j.ww, ws.j.wh, false, ws.k < ws.j.set->made);
 }
 void web_finish() {
     ws.on = false;
@@ -484,7 +514,8 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
 #if !RX_WEB
         std::thread(display_main).detach();
 #endif
-        hos_log("rx: frame interpolation on: %dx the game's frames (made from its last two, shown evenly)", multiplier());
+        hos_log("rx: frame interpolation on: %dx the game's frames (made from its last two, shown evenly; the game held to "
+                "the display's rate / %d)", multiplier(), multiplier());
     }
 
     const int64_t now = hos_now_ns();
@@ -515,8 +546,12 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     const int cur = fg.cur, prev = cur ^ 1;
     const int m = multiplier();
     const bool blend = fg.have_prev && !gap;
+    // the camera's motion from FSR 2 / DLSS: only when made for this frame (one new set since the last frame)
+    SceneMotion sm = scene_motion();
+    const bool camera = sm.mv && sm.mask && sm.seq == fg.motion_seq + 1 && !getenv("RX_FRAMEGEN_NO_CAMERA");
+    fg.motion_seq = sm.seq;
     for (int k = 1; k < m && blend; k++) {
-        const float t[4] = {(float)k / (float)m, 0, 0, 0};
+        const float t[4] = {(float)k / (float)m, camera ? 1.0f : 0.0f, sm.sx, sm.sy};
         wgpuQueueWriteBuffer(dev.queue, fg.t_buf[k], 0, t, sizeof t);
     }
     WGPUCommandEncoder e = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
@@ -535,7 +570,8 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
             b.size = 16;
             dispatch(e, fg.synth,
                      {tex_entry(fg.frames[prev].view), tex_entry(fg.frames[cur].view), tex_entry(fg.flows[1].view), s,
-                      tex_entry(set->frame[k - 1].view), b},
+                      tex_entry(set->frame[k - 1].view), b, tex_entry(camera ? sm.mv : fg.none.view),
+                      tex_entry(camera ? sm.mask : fg.none.view)},
                      sw, sh);
         }
         set->made = m - 1;
@@ -550,6 +586,16 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(e);
     wgpuTextureViewRelease(view);
+    if (sm.mv) wgpuTextureViewRelease(sm.mv);
+    if (sm.mask) wgpuTextureViewRelease(sm.mask);
+    {   // (which motion the made frames had: logged when it changes)
+        static int last = -1;
+        if (blend && (int)camera != last) {
+            last = camera;
+            hos_log("rx: frame interpolation: %s", camera ? "the camera's motion vectors (FSR 2 / DLSS) with the "
+                    "block matching" : "block matching only (FSR 2 / DLSS not running)");
+        }
+    }
     if (static const double dump_at = getenv("RX_FRAMEGEN_DUMP") ? atof(getenv("RX_FRAMEGEN_DUMP")) : 0; dump_at && blend) {
         static const int64_t t0 = now;
         static bool dumped;
@@ -575,3 +621,14 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
 #endif
 }
 }  // namespace rx
+
+/* nn_vi.c: frames shown per game frame (1: frame interpolation off). With it on, the game's frame rate is held to the
+   display's refresh rate / this: more made frames than the display shows are thrown away, and the ones shown come
+   unevenly (judder) */
+extern "C" int rx_framegen_shown_per_frame(void) {
+#if RX_WEB && !RX_WEB_MT
+    return 1;
+#else
+    return rx::present_framegen() ? rx::multiplier() : 1;
+#endif
+}

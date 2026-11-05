@@ -88,9 +88,17 @@ static double frame_cap_hz(void) {
         }
         if (hz > FPS_MAX) hz = FPS_MAX;
     }
+    /* frame interpolation (F7, F1): the game at most the display's rate / the frames shown per game frame, so every
+       made frame is shown, each for the same time (more than the display shows are thrown away, unevenly) */
+    const int per = rx_framegen_shown_per_frame();
+    const char *why = env ? "HOS_FPS_CAP" : hos_fps_limit ? "frame_rate_limit" : "the display's refresh rate";
+    if (per > 1) {
+        const int64_t p = display_period_ns;
+        const double display_hz = p ? 1e9 / (double)p : 0;
+        if (display_hz >= 50 && hz > display_hz / per + 0.5) hz = display_hz / per, why = "frame interpolation";
+    }
     if (hz != shown) {
-        hos_log("vi: frames at most %.0f a second (%s)%s", hz,
-                env ? "HOS_FPS_CAP" : hos_fps_limit ? "frame_rate_limit" : "the display's refresh rate",
+        hos_log("vi: frames at most %.0f a second (%s)%s", hz, why,
                 hz > 63 ? ": above ~63 the camera may turn faster and Link may not climb steps (beta)" : "");
         shown = hz;
     }

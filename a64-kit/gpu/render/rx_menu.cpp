@@ -51,7 +51,7 @@ const char* const kPageNames[kPages] = {"Graphics", "Mouse", "Controls"};
 
 enum Kind { kOption, kSlider, kToggle, kBinding, kButton, kInfo, kSection };
 enum Id {
-    kOutRes, kAspect, kRes, kFps, kFrameTiming, kFpsCounter, kAniso, kReflex, kButtons, kUpscaler, kDlssModel, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
+    kOutRes, kAspect, kRes, kFps, kFrameTiming, kFrameGen, kFpsCounter, kAniso, kReflex, kButtons, kUpscaler, kDlssModel, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
 };
 
 struct Row {
@@ -77,6 +77,7 @@ const char* const kOutResNames[4] = {"1920 x 1080", "Display", "2560 x 1440", "3
 const char* const kAspectNames[5] = {"16:9 (the game's own)", "The display's shape", "16:10", "21:9", "32:9"};
 const char* const kCounterNames[3] = {"Off", "FPS", "FPS + frame time"};
 const char* const kTimingNames[2] = {"Smooth", "Responsive"};
+const char* const kFrameGenNames[4] = {"Off", "2x", "3x", "4x"};
 const char* const kDlssModelNames[5] = {"NVIDIA's default", "K (transformer)", "M (transformer)", "L (transformer)",
                                         "J (transformer)"};
 const char* const kDlssModelNotes[5] = {
@@ -121,6 +122,12 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
         add(kOption, kFrameTiming, "Frame timing", kTimingNames[std::clamp(b.frame_timing, 0, 1)],
             b.frame_timing ? "Each frame steps the game by the last frame's time. For G-Sync / FreeSync."
                            : "Steps the game by the last 5 frames' time: evens out uneven frames.");
+        {
+            const int fg = present_framegen() ? std::clamp(present_framegen_mult(), 2, 4) - 1 : 0;
+            add(kOption, kFrameGen, "Frame generation", kFrameGenNames[fg],
+                fg ? "Frames made between the game's (F7). The game is held to the display's rate / this."
+                   : "Frames made between the game's: smoother, about a frame later. F7 too.");
+        }
         add(kOption, kFpsCounter, "FPS counter", kCounterNames[std::clamp(b.fps_counter, 0, 2)],
             "In the top left corner: frames shown a second.");
         add(kOption, kAniso, "Anisotropic filtering", kAnisoNames[std::clamp(b.aniso, 0, 4)],
@@ -268,6 +275,12 @@ void change(State& s, const Row& r, int dir) {
     case kAspect: b.aspect = (b.aspect + dir + 5) % 5; break;
     case kFpsCounter: b.fps_counter = (b.fps_counter + dir + 3) % 3; break;
     case kFrameTiming: b.frame_timing = !b.frame_timing; break;
+    case kFrameGen: {   // (not a binding: the present settings, present.txt)
+        const int fg = present_framegen() ? std::clamp(present_framegen_mult(), 2, 4) - 1 : 0;
+        const int next = (fg + dir + 4) % 4;
+        present_set_framegen(next ? next + 1 : 0);
+        return;
+    }
     case kDlssModel: b.dlss_preset = (b.dlss_preset + dir + 5) % 5; break;
     case kButtons: b.button_icons = (b.button_icons + dir + 5) % 5; break;
     case kMouseCam: b.mouse_camera = !b.mouse_camera; break;
