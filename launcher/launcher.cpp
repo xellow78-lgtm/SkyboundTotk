@@ -248,7 +248,7 @@ struct Setting {
 };
 
 enum SettingId {
-    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_VSYNC, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_FPS, S_FRAMETIMING, S_FPSCOUNTER, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
+    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_VSYNC, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_DLSSMODEL, S_FPS, S_FRAMETIMING, S_FPSCOUNTER, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
     S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_LOG, S_COUNT
 };
 std::vector<Setting> settings_list() {
@@ -270,6 +270,8 @@ std::vector<Setting> settings_list() {
                    {L"16:9 (game's own)", L"Display's shape", L"16:10", L"21:9", L"32:9"}};
     s[S_RES] = {K_OPTION, L"3D resolution", L"The 3D scene's share of it, before the upscaler.",
                 {L"Game's own", L"Quality", L"Balanced", L"Performance", L"Ultra Performance", L"Native (DLAA)"}};
+    s[S_DLSSMODEL] = {K_OPTION, L"DLSS model", L"NVIDIA's default: K, M or L by mode. Transformer models.",
+                      {L"NVIDIA's default", L"K", L"M", L"L", L"J"}};
     s[S_FPS] = {K_OPTION, L"Frame rate limit", L"Beta above 60: the camera may turn faster, climbing may fail.",
                 {L"30", L"60", L"90", L"120", L"144", L"165", L"200", L"Display's rate"}};
     s[S_FRAMETIMING] = {K_OPTION, L"Frame timing", L"Responsive: no speed-up after a slow frame on G-Sync / FreeSync.",
@@ -407,6 +409,7 @@ double setting_value(int id) {
     case S_FPS: return fps_index(g.geti("frame_rate_limit", 60));
     case S_ASPECT: return g.geti("aspect_ratio", 0);
     case S_FPSCOUNTER: return g.geti("fps_counter", 0);
+    case S_DLSSMODEL: return g.geti("dlss_preset", 0);
     case S_FRAMETIMING: return g.geti("frame_timing", 0);
     case S_RES: return g.geti("render_resolution", 0);
     case S_ANISO: return g.geti("anisotropic_filtering", 0);
@@ -439,6 +442,7 @@ void set_setting(int id, double v) {
     case S_RES: g.set("render_resolution", std::to_string((int)v)); return;
     case S_ASPECT: g.set("aspect_ratio", std::to_string((int)v)); return;
     case S_FPSCOUNTER: g.set("fps_counter", std::to_string((int)v)); return;
+    case S_DLSSMODEL: g.set("dlss_preset", std::to_string((int)v)); return;
     case S_FRAMETIMING: g.set("frame_timing", std::to_string((int)v)); return;
     case S_ANISO: g.set("anisotropic_filtering", std::to_string((int)v)); return;
     case S_REFLEX: g.set("nvidia_reflex", std::to_string((int)v)); return;

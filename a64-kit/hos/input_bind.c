@@ -149,9 +149,11 @@ void hos_bind_defaults(Bindings *b) {
     b->fps_counter = 0;
     b->aspect = 0;
     b->frame_timing = 0;
+    b->dlss_preset = 0;
 }
 
-volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting, hos_fps_limit = 60, hos_fps_counter, hos_frame_timing;
+volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting, hos_fps_limit = 60, hos_fps_counter, hos_frame_timing,
+             hos_dlss_preset;
 static void apply_graphics(const Bindings *b) {
     hos_aniso_level = b->aniso;
     hos_reflex_mode = b->reflex;
@@ -159,6 +161,7 @@ static void apply_graphics(const Bindings *b) {
     hos_fps_limit = b->fps_limit;
     hos_fps_counter = b->fps_counter;
     hos_frame_timing = b->frame_timing;
+    hos_dlss_preset = b->dlss_preset;
 }
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -212,6 +215,7 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "fps_counter")) { b->fps_counter = atoi(v); continue; }
         if (!_stricmp(k, "aspect_ratio")) { b->aspect = atoi(v); continue; }
         if (!_stricmp(k, "frame_timing")) { b->frame_timing = atoi(v); continue; }
+        if (!_stricmp(k, "dlss_preset")) { b->dlss_preset = atoi(v); continue; }
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -241,6 +245,7 @@ static void load(Bindings *b) {
     if (b->fps_counter < 0 || b->fps_counter > 2) b->fps_counter = 0;
     if (b->aspect < 0 || b->aspect > 4) b->aspect = 0;
     if (b->frame_timing < 0 || b->frame_timing > 1) b->frame_timing = 0;
+    if (b->dlss_preset < 0 || b->dlss_preset > 4) b->dlss_preset = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -272,8 +277,10 @@ static void save(const Bindings *b) {
                "aspect_ratio = %d\n"
                "# the game's step per frame: 0 smooth (the average of the last 5 frame times), 1 responsive (the last\n"
                "# frame's time: on a G-Sync / FreeSync display, no speed-up after a slow frame)\n"
-               "frame_timing = %d\n\n", b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit, b->fps_counter,
-               b->aspect, b->frame_timing);
+               "frame_timing = %d\n"
+               "# DLSS's model: 0 NVIDIA's default for the mode, 1 K, 2 M, 3 L (transformer models), 4 J\n"
+               "dlss_preset = %d\n\n", b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit, b->fps_counter,
+               b->aspect, b->frame_timing, b->dlss_preset);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)

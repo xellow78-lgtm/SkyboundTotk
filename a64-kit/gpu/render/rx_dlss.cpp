@@ -19,7 +19,10 @@
 // that range, else at exactly the game's size (the menus' 800x448, Ultra Performance's 640x360). Up to 4 are kept
 // (each one made is a hitch of up to a few seconds); 30 failures in a row turn DLSS off, FSR 2 takes over.
 //
-// RX_DLSS_PRESET=<0..> (a render preset for every mode; default NGX's), RX_DLSS_MASK=0 (no bias mask from Link's
+// The model (NGX's render preset), every mode the same: dlss_preset in input.ini (F1 > Graphics, the launcher; live: the
+// features are made again): NVIDIA's default for each mode (in the SDK used: K for DLAA / Quality / Balanced, M for
+// Performance, L for Ultra Performance: transformer models), or K, M, L or J for all. RX_DLSS_PRESET=<NGX's number>
+// overrides. RX_DLSS_MASK=0 (no bias mask from Link's
 // G-buffer marks), RX_DLSS_JX / RX_DLSS_JY / RX_DLSS_MVX / RX_DLSS_MVY = -1 (a sign, checking), RX_DLSS_LOG=1 (NGX's
 // log into the game's log).
 #include "rx_internal.h"
@@ -48,6 +51,7 @@
 
 // wgpu-native's TOTK exports (totk-src/wgpu-native/src/totk_vk.rs)
 extern "C" {
+extern volatile int hos_dlss_preset;   // hos/input_bind.c: the DLSS model setting
 struct WGPUTotkVulkanHandles {
     uint64_t instance, physical_device, device, queue;
     uint32_t queue_family, queue_index;
@@ -87,6 +91,7 @@ struct State {
     NVSDK_NGX_Handle* feature = nullptr;
     uint32_t fw = 0, fh = 0, fdw = 0, fdh = 0;
     int fquality = -1;
+    unsigned preset = 0;   // (NGX's render preset the features were made with: 0 its default)
     std::mutex mu;   // (NGX is not thread safe: the callbacks run where encoders are finished)
     int64_t evaluations = 0, errors = 0, creations = 0;
     int failures_in_a_row = 0;
@@ -98,6 +103,21 @@ struct State {
     uint32_t range_dw = 0, range_dh = 0;
     Range ranges[6];
 };
+// the render preset to make features with: RX_DLSS_PRESET (NGX's number), else dlss_preset (0 NGX's default)
+unsigned preset_now() {
+    static const char* env = getenv("RX_DLSS_PRESET");
+    if (env) return static_cast<unsigned>(std::atoi(env));
+    static const unsigned kPresets[5] = {0, NVSDK_NGX_DLSS_Hint_Render_Preset_K, NVSDK_NGX_DLSS_Hint_Render_Preset_M,
+                                         NVSDK_NGX_DLSS_Hint_Render_Preset_L, NVSDK_NGX_DLSS_Hint_Render_Preset_J};
+    const int i = hos_dlss_preset;
+    return kPresets[i >= 0 && i < 5 ? i : 0];
+}
+const char* preset_name(unsigned p) {
+    static char b[8];
+    std::snprintf(b, sizeof b, "%c", p >= 1 && p <= 26 ? (char)('A' + p - 1) : '?');
+    return b;
+}
+
 State& S() {
     static State s;
     return s;
@@ -290,9 +310,7 @@ bool create(State& s, VkCommandBuffer cmd, uint32_t cw, uint32_t ch, const Call*
     cp.Feature.InPerfQualityValue = static_cast<NVSDK_NGX_PerfQuality_Value>(c->quality);
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                               NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-    static const char* preset = getenv("RX_DLSS_PRESET");
-    if (preset) {
-        const unsigned p = static_cast<unsigned>(std::atoi(preset));
+    if (const unsigned p = preset_now()) {
         for (auto key : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
                          NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
                          NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
@@ -328,6 +346,15 @@ void evaluate(uint64_t cmd_raw, void* user) {
         return;
     }
     VkCommandBuffer cmd = reinterpret_cast<VkCommandBuffer>(static_cast<uintptr_t>(cmd_raw));
+    if (const unsigned p = preset_now(); p != s.preset) {   // (another model: every feature made again with it)
+        for (auto& sl : s.slots)
+            if (sl.h) s.graveyard.push_back({sl.h, s.evaluations}), sl = State::Slot{};
+        s.feature = nullptr;
+        s.fw = s.fh = 0;
+        s.fquality = -1;
+        if (s.evaluations) hos_log("rx: DLSS: the model is now %s", p ? preset_name(p) : "NVIDIA's default");
+        s.preset = p;
+    }
     release_old(s, false);
     // The feature: made once for the mode and output size and kept while the render size stays in what it takes
     // (the game's DRS moving inside the mode's dynamic range: no new feature). Made again (each one is a hitch:

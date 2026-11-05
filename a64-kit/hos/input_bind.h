@@ -40,6 +40,8 @@ typedef struct {
                                               game's own), 1 the display's, 2 16:10, 3 21:9, 4 32:9 */
     int frame_timing;                      /* the game's step per frame (nn_vi.c, live): 0 smooth (the average of
                                               the last 5 frame times), 1 responsive (the last frame's time) */
+    int dlss_preset;                       /* DLSS's model (rx_dlss.cpp, live): 0 NVIDIA's default for the mode,
+                                              1 K, 2 M, 3 L (transformer), 4 J */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */
@@ -49,6 +51,7 @@ extern volatile int hos_button_icons_setting;   /* Bindings.button_icons */
 extern volatile int hos_fps_limit;              /* Bindings.fps_limit */
 extern volatile int hos_fps_counter;            /* Bindings.fps_counter */
 extern volatile int hos_frame_timing;           /* Bindings.frame_timing */
+extern volatile int hos_dlss_preset;            /* Bindings.dlss_preset */
 
 /* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
 int hos_render_mode_count(void);
