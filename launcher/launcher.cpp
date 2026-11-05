@@ -248,7 +248,7 @@ struct Setting {
 };
 
 enum SettingId {
-    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_FPS, S_FPSCOUNTER, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
+    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_VSYNC, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_FPS, S_FPSCOUNTER, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
     S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_LOG, S_COUNT
 };
 std::vector<Setting> settings_list() {
@@ -261,6 +261,8 @@ std::vector<Setting> settings_list() {
     s[S_DISPLAY] = {K_OPTION, L"Display", L"F11 in the game switches too.", {L"Windowed", L"Fullscreen"}};
     s[S_WINDOW] = {K_OPTION, L"Window size", L"The window's size before fullscreen.",
                    {L"1280 x 720", L"1600 x 900", L"1920 x 1080", L"2560 x 1440"}};
+    s[S_VSYNC] = {K_OPTION, L"VSync", L"Off: frames past the screen's rate (Frame rate limit), less input lag.",
+                  {L"On", L"Off (no tearing)", L"Off (tearing)"}};
     s[S_SEC_GAME] = {K_SECTION, L"In the game (F1 changes these too)", L""};
     s[S_OUTRES] = {K_OPTION, L"Output resolution", L"The size the game draws its frame and HUD in.",
                    {L"1920 x 1080", L"Display", L"2560 x 1440", L"3840 x 2160"}};
@@ -390,6 +392,7 @@ double setting_value(int id) {
     case S_SHARP: return c.getf(L"sharpness", 0.5);
     case S_DISPLAY: return c.geti(L"fullscreen", 0);
     case S_WINDOW: return c.geti(L"window", 0);
+    case S_VSYNC: return c.geti(L"vsync", 0);
     case S_OUTRES: return g.geti("output_resolution", 0);
     case S_FPS: return fps_index(g.geti("frame_rate_limit", 60));
     case S_ASPECT: return g.geti("aspect_ratio", 0);
@@ -418,6 +421,7 @@ void set_setting(int id, double v) {
     }
     case S_DISPLAY: c.v[L"fullscreen"] = std::to_wstring((int)v); break;
     case S_WINDOW: c.v[L"window"] = std::to_wstring((int)v); break;
+    case S_VSYNC: c.v[L"vsync"] = std::to_wstring((int)v); break;
     case S_MODS_ON: c.v[L"mods_on"] = std::to_wstring((int)v); break;
     case S_OUTRES: g.set("output_resolution", std::to_string((int)v)); return;
     case S_FPS: g.set("frame_rate_limit", std::to_string(kFpsValues[std::clamp((int)v, 0, 7)])); return;
@@ -1018,6 +1022,10 @@ void play() {
     env[L"HOS_FULLSCREEN"] = (int)setting_value(S_DISPLAY) ? L"1" : L"";
     static const wchar_t* const sizes[] = {L"1280x720", L"1600x900", L"1920x1080", L"2560x1440"};
     env[L"HOS_WINDOW_SIZE"] = sizes[std::clamp((int)setting_value(S_WINDOW), 0, 3)];
+    // VSync off: mailbox (each refresh shows the newest finished frame) or immediate (no wait: tearing); the game then
+    // runs to its frame rate limit, past a 60 Hz screen's rate
+    static const wchar_t* const present[] = {L"", L"mailbox", L"immediate"};
+    env[L"RX_PRESENT"] = present[std::clamp((int)setting_value(S_VSYNC), 0, 2)];
     const wstring mods = app.cfg.get(L"mods");
     env[L"HOS_MODS"] = (int)setting_value(S_MODS_ON) && !mods.empty() ? mods : L"";
     for (auto& [k, v] : app.cfg.v)   // (env.NAME = value: more for the game)
