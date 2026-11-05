@@ -1,6 +1,6 @@
 # SkyboundTOTK
 
-SkyboundTOTK is an experimental native static recompilation project for *The Legend of Zelda: Tears of the Kingdom*, **base game version 1.0.0**. It targets Windows x64 and Linux x86_64. It is not affiliated with Nintendo. Expect graphical problems and incomplete compatibility; a successful build does not guarantee a complete playthrough.
+SkyboundTOTK is an experimental native static recompilation project for *The Legend of Zelda: Tears of the Kingdom*, **With updated game versions.**. It targets Windows x64 and Linux x86_64. It is not affiliated with Nintendo. Expect graphical problems and incomplete compatibility; a successful build does not guarantee a complete playthrough.
 
 The project's AArch64 game code is translated ahead of time into C and compiled locally into a native executable. A runtime implements the services the game expects, and the renderer translates its graphics work and shaders for WebGPU. This is a game-specific port, not a general-purpose Switch emulator. Some graphics translation still happens at runtime.
 
