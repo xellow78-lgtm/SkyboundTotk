@@ -10,6 +10,16 @@ You must supply your own legally obtained, already-extracted, **unmodified 1.0.0
 
 Keep your game files, generated code, executable package and saves private. The `game/`, `build/` and `dist/` directories are Git-ignored, but check what you are publishing rather than relying on ignore rules alone. The generated standalone package contains copyrighted game-derived data and must not be shared or committed.
 
+## Download (release package)
+
+The [Releases](https://github.com/xellow78-lgtm/SkyboundTotk/releases) page has a small zip: the launcher, its build
+script and a readme, nothing of the game. Extract it to a drive with plenty of room, start `SkyboundTOTK Launcher.exe`,
+choose your dumped ExeFS and RomFS folders on the Build page and click Build. The first build downloads what it needs into
+that folder (no admin, nothing system-wide): Python if the PC has none ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)),
+the source from GitHub, clang (emsdk's LLVM), and Microsoft's C++ Build Tools from Microsoft after you accept their
+license in the launcher; with "Make the DLSS library" ticked, Rust too. The rest of this section is for building from a
+checkout of the source.
+
 ## Build on Windows
 
 ### Requirements

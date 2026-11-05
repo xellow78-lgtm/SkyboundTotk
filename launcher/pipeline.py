@@ -8,7 +8,8 @@ Steps (each skipped when its result is already there, so a stopped build continu
   files    the game's ExeFS and RomFS into <source>/game: from folders you extracted (the ExeFS is copied, the RomFS is
            linked, not copied), or from your base game and 1.4.3 update .nsp files with your prod.keys (nx.py)
   overlay  changed source files copied over the source (--overlay: the folder Claude's changes go into)
-  tools    Python packages (installed if missing), clang (emsdk), Visual Studio's C++ tools
+  tools    Python packages, clang (emsdk's LLVM) and Microsoft's C++ tools: what is missing is downloaded next to the
+           source (<source>/../emsdk, <source>/../msvc; the C++ tools only with --msvc-license: Microsoft's license)
   dlss     (--dlss) the WebGPU library with what DLSS and Reflex need, and NVIDIA's DLSS files (Rust, ~20-30 min once)
   lift     the game's code translated to C (a64-kit/build.py lift; skipped when nothing it reads changed)
   compile  compiled and linked (a64-kit/build.py native: only what changed)
@@ -18,13 +19,16 @@ It prints lines for the launcher between the build tools' own output:
   @@step <key> <state> <label>    state: wait, run, done, skip, fail
   @@progress <0..1> <text>        the running step's progress
   @@end ok|fail <message>
+  @@need msvc_license <url>       Microsoft's C++ tools are needed: the launcher asks for their license, then builds again
 usage: pipeline.py --source <SkyboundTOTK folder> [--exefs <dir> --romfs <dir> | --nsp <base.nsp> --update <upd.nsp>
                    --keys <prod.keys>] [--overlay <dir>] [--dlss] [--fetch <owner/repo> --branch <name>] [--log <file>]
+                   [--msvc-license]
        pipeline.py --source <folder> --check <owner/repo> --branch <name>: is there a newer commit? one line:
                    @@update <sha> <unix time> <subject> | @@uptodate <sha> | @@updatefail <why>
 """
 import argparse
 import calendar
+import hashlib
 import os
 import re
 import shutil
@@ -75,6 +79,208 @@ def run(args, cwd, env, parse=None):
     if p.wait():
         raise Failed("%s failed (exit code %d): its output is above" % (Path(str(args[1] if len(args) > 1 else args[0])).name,
                                                                          p.returncode))
+
+
+def download(url, dst, label, lo=0.0, hi=1.0, sha256=None):
+    """url into dst (through dst.part: a stopped download starts again), the step's progress from lo to hi"""
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part = dst.with_name(dst.name + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": "SkyboundTOTK-launcher"})
+    h = hashlib.sha256()
+    with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done, last = 0, 0.0
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            h.update(chunk)
+            done += len(chunk)
+            if time.time() - last > 0.5:
+                last = time.time()
+                frac = done / total if total else 0
+                progress(lo + (hi - lo) * frac, "%s: %d of %s MB" % (label, done >> 20, total >> 20 if total else "?"))
+    if sha256 and h.hexdigest().lower() != sha256.lower():
+        part.unlink()
+        raise Failed("%s: the download is damaged (its SHA-256 does not match): try again" % label)
+    part.replace(dst)
+    return dst
+
+
+# clang: the LLVM of emsdk 6.0.9 (the build's compiler; emsdk's own "releases" build, downloaded as emsdk does it)
+EMSDK_VERSION, EMSDK_RELEASE = "6.0.9", "f04ea239d533260dd1db760dd2d668d5f9a88d6b"
+
+
+def install_clang(emsdk):
+    """emsdk's upstream (clang, lld) into <emsdk>/upstream: wasm-binaries.zip from emsdk's own download place"""
+    url = ("https://storage.googleapis.com/webassembly/emscripten-releases-builds/win/%s/wasm-binaries.zip"
+           % EMSDK_RELEASE)
+    say("downloading clang (emsdk %s's LLVM, about 400 MB) into %s" % (EMSDK_VERSION, emsdk))
+    zpath = download(url, SKYBOUND / "tmp" / ("wasm-binaries-%s.zip" % EMSDK_RELEASE[:12]), "clang", 0.05, 0.4)
+    up = Path(emsdk) / "upstream"
+    tmp = Path(emsdk) / "upstream.new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    with zipfile.ZipFile(zpath) as z:
+        names = z.namelist()
+        tops = {n.split("/")[0] for n in names}
+        strip = len(tops) == 1 and all("/" in n for n in names)   # (one folder holding all: left out, as emsdk does)
+        for i, info in enumerate(z.infolist()):
+            rel = info.filename.split("/", 1)[1] if strip else info.filename
+            if not rel or rel.endswith("/") or ".." in Path(rel).parts:
+                continue
+            out = tmp / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(info) as src, open(out, "wb") as o:
+                shutil.copyfileobj(src, o)
+            if i % 200 == 0:
+                progress(0.4 + 0.15 * i / max(1, len(names)), "clang: unpacking")
+    if not (tmp / "bin/clang.exe").is_file():
+        raise Failed("the clang download has no bin/clang.exe: emsdk's package changed?")
+    shutil.rmtree(up, ignore_errors=True)
+    tmp.rename(up)
+    (up / ".emsdk_version").write_text("releases-%s-64bit" % EMSDK_RELEASE)
+    zpath.unlink()
+
+
+# Microsoft's C++ tools (the compiler's headers and libraries, link.exe for Rust), without Visual Studio's installer
+# and without admin: the packages Visual Studio's installer itself downloads, from Microsoft (the same way as Mārtiņš
+# Možeiko's portable-msvc.py, written here anew). Only after the user accepted Microsoft's license (--msvc-license).
+VS_CHANNEL = "https://aka.ms/vs/17/release/channel"
+
+
+def vs_manifests():
+    channel = json.loads(urllib.request.urlopen(urllib.request.Request(VS_CHANNEL, headers={
+        "User-Agent": "SkyboundTOTK-launcher"}), timeout=60).read())
+    items = channel["channelItems"]
+    vsman = next(i for i in items if i["id"] == "Microsoft.VisualStudio.Manifests.VisualStudio")
+    manifest = json.loads(urllib.request.urlopen(vsman["payloads"][0]["url"], timeout=120).read())
+    tools = next((i for i in items if i["id"] == "Microsoft.VisualStudio.Product.BuildTools"), {})
+    license = next((r.get("license") for r in tools.get("localizedResources", [])
+                    if r.get("language", "").lower() == "en-us"), None)
+    return manifest, license
+
+
+def msvc_license_url():
+    try:
+        return vs_manifests()[1] or "https://visualstudio.microsoft.com/license-terms/"
+    except Exception:
+        return "https://visualstudio.microsoft.com/license-terms/"
+
+
+def install_msvc(dest):
+    say("downloading Microsoft's C++ build tools into %s (about 1 GB; you accepted their license)" % dest)
+    progress(0.6, "C++ tools: Microsoft's package list")
+    manifest, _ = vs_manifests()
+    packages = {}
+    for p in manifest["packages"]:
+        packages.setdefault(p["id"].lower(), []).append(p)
+
+    def pick(pid):
+        ps = packages.get(pid.lower(), [])
+        return next((p for p in ps if p.get("language") in (None, "en-US", "neutral")), ps[0] if ps else None)
+
+    msvc_v, sdk_v = {}, {}
+    for pid in packages:
+        parts = pid.split(".")
+        if pid.startswith("microsoft.visualstudio.component.vc.") and pid.endswith(".x86.x64") and parts[4].isdigit():
+            msvc_v[tuple(int(x) if x.isdigit() else -1 for x in parts[4:-2])] = pid   # (e.g. ...vc.14.44.17.14.x86.x64)
+        elif (pid.startswith("microsoft.visualstudio.component.windows10sdk.") or
+              pid.startswith("microsoft.visualstudio.component.windows11sdk.")) and parts[-1].isdigit():
+            sdk_v[int(parts[-1])] = pid
+    if not msvc_v or not sdk_v:
+        raise Failed("Microsoft's package list has no C++ tools or Windows SDK: its layout changed?")
+    vc = ".".join(msvc_v[max(msvc_v)].split(".")[4:-2])   # e.g. 14.44.17.14
+    names = ["microsoft.vc.%s.%s" % (vc, n) for n in (
+        "crt.headers.base", "crt.source.base", "asan.headers.base", "pgo.headers.base",
+        "tools.hostx64.targetx64.base", "tools.hostx64.targetx64.res.base", "crt.x64.desktop.base",
+        "crt.x64.store.base", "premium.tools.hostx64.targetx64.base", "pgo.x64.base", "asan.x64.base")]
+    dest = Path(dest)
+    new = dest.with_name(dest.name + ".new")
+    shutil.rmtree(new, ignore_errors=True)
+    dl = SKYBOUND / "tmp" / "msvc"
+    dl.mkdir(parents=True, exist_ok=True)
+    for k, name in enumerate(names):
+        p = pick(name)
+        if not p:
+            say("  (not in Microsoft's list: %s)" % name)
+            continue
+        for pay in p.get("payloads", []):
+            f = download(pay["url"], dl / ("%s_%s" % (name, Path(pay["fileName"]).name)), "C++ tools %d/%d" % (
+                k + 1, len(names)), 0.6 + 0.15 * k / len(names), 0.6 + 0.15 * (k + 1) / len(names), pay.get("sha256"))
+            with zipfile.ZipFile(f) as z:   # (a .vsix: what goes in the install is under Contents/)
+                for info in z.infolist():
+                    if info.filename.startswith("Contents/") and not info.filename.endswith("/"):
+                        out = new / info.filename[len("Contents/"):]
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        with z.open(info) as src, open(out, "wb") as o:
+                            shutil.copyfileobj(src, o)
+            f.unlink()
+    # the Windows SDK: MSIs (and the CABs they name), unpacked with msiexec's administrative install (no admin)
+    comp = pick(sdk_v[max(sdk_v)])
+    sdk = None
+    for dep in (comp or {}).get("dependencies", {}):
+        cand = pick(dep)
+        if cand and any(x["fileName"].startswith("Installers\\") for x in cand.get("payloads", [])):
+            sdk = cand
+            break
+    if not sdk:
+        raise Failed("Microsoft's package list: no Windows SDK installers found")
+    msis = ["Windows SDK for Windows Store Apps Tools-x86_en-us.msi",
+            "Windows SDK for Windows Store Apps Headers-x86_en-us.msi",
+            "Windows SDK for Windows Store Apps Headers OnecoreUap-x86_en-us.msi",
+            "Windows SDK for Windows Store Apps Libs-x86_en-us.msi",
+            "Universal CRT Headers Libraries and Sources-x86_en-us.msi"]
+    msis += ["Windows SDK Desktop Headers %s-x86_en-us.msi" % t for t in ("x64", "x86", "arm", "arm64")]
+    msis += ["Windows SDK OnecoreUap Headers %s-x86_en-us.msi" % t for t in ("x64", "x86", "arm", "arm64")]
+    msis += ["Windows SDK Desktop Libs x64-x86_en-us.msi", "Windows SDK Desktop Tools x64-x86_en-us.msi"]
+    by_name = {x["fileName"]: x for x in sdk.get("payloads", [])}
+    got, cabs = [], set()
+    for k, m in enumerate(msis):
+        pay = by_name.get("Installers\\" + m)
+        if not pay:
+            say("  (not in the SDK: %s)" % m)
+            continue
+        f = download(pay["url"], dl / m, "Windows SDK %d/%d" % (k + 1, len(msis)), 0.75 + 0.1 * k / len(msis),
+                     0.75 + 0.1 * (k + 1) / len(msis), pay.get("sha256"))
+        got.append(f)
+        data = f.read_bytes()
+        i = data.find(b".cab")
+        while i >= 0:   # (the CABs an MSI names: 32 hex characters before .cab)
+            name = data[i - 32:i + 4]
+            if re.fullmatch(rb"[0-9a-fA-F]{32}\.cab", name):
+                cabs.add(name.decode())
+            i = data.find(b".cab", i + 4)
+    for k, c in enumerate(sorted(cabs)):
+        pay = by_name.get("Installers\\" + c)
+        if pay:
+            download(pay["url"], dl / c, "Windows SDK files %d/%d" % (k + 1, len(cabs)), 0.85 + 0.08 * k / len(cabs),
+                     0.85 + 0.08 * (k + 1) / len(cabs), pay.get("sha256"))
+    for k, f in enumerate(got):
+        progress(0.93 + 0.05 * k / len(got), "Windows SDK: unpacking %s" % f.name[:40])
+        r = subprocess.run(["msiexec.exe", "/a", str(f), "/quiet", "/qn", "TARGETDIR=%s" % new.resolve()])
+        if r.returncode:
+            raise Failed("msiexec could not unpack %s (exit code %d)" % (f.name, r.returncode))
+        (new / f.name).unlink(missing_ok=True)   # (the administrative install leaves a copy of the MSI)
+    shutil.rmtree(dl, ignore_errors=True)
+    tools_v = sorted((new / "VC/Tools/MSVC").iterdir())[-1].name
+    sdk_bin = sorted(d.name for d in (new / "Windows Kits/10/bin").iterdir() if d.name[:3] == "10.")[-1]
+    bs = "\\"
+    vc_dir = bs.join(["%~dp0VC", "Tools", "MSVC", tools_v])
+    kits = "%~dp0Windows Kits" + bs + "10"
+    inc = ";".join([vc_dir + bs + "include"] + [bs.join([kits, "Include", sdk_bin, x])
+                                              for x in ("ucrt", "shared", "um", "winrt", "cppwinrt")])
+    lib = ";".join([bs.join([vc_dir, "lib", "x64"])] + [bs.join([kits, "Lib", sdk_bin, x, "x64"]) for x in ("ucrt", "um")])
+    path = ";".join([bs.join([vc_dir, "bin", "Hostx64", "x64"]), bs.join([kits, "bin", sdk_bin, "x64"]),
+                     bs.join([kits, "bin", sdk_bin, "x64", "ucrt"]), "%PATH%"])
+    (new / "setup_x64.bat").write_text("\r\n".join([
+        "@echo off", "", "set VSCMD_ARG_HOST_ARCH=x64", "set VSCMD_ARG_TGT_ARCH=x64", "",
+        "set VCToolsVersion=" + tools_v, "set WindowsSDKVersion=" + sdk_bin + bs, "",
+        "set VCToolsInstallDir=" + vc_dir + bs, "set WindowsSdkBinPath=" + kits + bs + "bin" + bs, "",
+        "set PATH=" + path, "set INCLUDE=" + inc, "set LIB=" + lib, ""]))
+    shutil.rmtree(dest, ignore_errors=True)
+    new.rename(dest)
 
 
 def vs_env():
@@ -293,17 +499,26 @@ def tools(a, env):
             subprocess.run([sys.executable, "-c", "import zstandard"], capture_output=True).returncode:
         need.append("zstandard")
     if need:
-        user = [] if sys.prefix != sys.base_prefix else ["--user"]
-        run([sys.executable, "-m", "pip", "install"] + user + need, SOURCE, env)
-    progress(0.3, "Python packages")
+        # (into the Python that runs this: the launcher's own, next to the source, takes them in place; another one, the
+        # user's: --user, nothing system-wide)
+        own = sys.prefix != sys.base_prefix or SKYBOUND in Path(sys.prefix).resolve().parents
+        run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check"] + ([] if own else ["--user"]) + need,
+            SOURCE, env)
+    progress(0.05, "Python packages")
     clang = Path(env["EMSDK"]) / "upstream/bin/clang.exe"
     if not clang.is_file():
-        raise Failed("clang not found at %s: run setup_tools.bat once (it installs emsdk 6.0.9)" % clang)
-    progress(0.6, "clang")
+        install_clang(env["EMSDK"])
+    progress(0.55, "clang")
     vs, bat = vs_env()
     if not vs:
-        raise Failed("no Visual Studio with the C++ build tools: install \"Build Tools for Visual Studio\" (Desktop "
-                     "development with C++), or run setup_school.bat once (no admin)")
+        if not a.msvc_license:
+            say("@@need msvc_license %s" % msvc_license_url())
+            raise Failed("Microsoft's C++ build tools are needed: accept their license in the launcher (it downloads "
+                         "them, no admin), or install \"Build Tools for Visual Studio\" (Desktop development with C++)")
+        install_msvc(SKYBOUND / "msvc")
+        vs, bat = vs_env()
+        if not vs:
+            raise Failed("the downloaded C++ tools did not set up: see the lines above")
     say("using %s" % bat)
     for k, v in vs.items():
         if k.upper() not in ("EMSDK", "TEMP", "TMP", "PYTHONIOENCODING", "PYTHONUNBUFFERED"):
@@ -458,6 +673,7 @@ def main():
     p.add_argument("--keys")
     p.add_argument("--overlay")
     p.add_argument("--dlss", action="store_true")
+    p.add_argument("--msvc-license", action="store_true")
     p.add_argument("--log")
     p.add_argument("--check")
     p.add_argument("--fetch")

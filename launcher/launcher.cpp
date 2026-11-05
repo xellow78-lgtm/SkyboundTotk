@@ -334,13 +334,17 @@ struct App {
     enum { U_NONE, U_CHECKING, U_AVAILABLE, U_CURRENT, U_FAILED } update = U_NONE;
     std::string update_sha, update_subject, update_why;
     int64_t update_time = 0;
+    // a first build from the release package: Python downloaded first, Microsoft's license asked when the build needs it
+    bool python_busy = false, pending_fetch = false;
+    std::string need_msvc_license;   // (the license's address, from the build's @@need line)
 } app;
 
 // where updates come from: launcher.ini update_repo / update_branch (update_check = 0: no check at the start)
 wstring update_repo() { return app.cfg.get(L"update_repo", L"xellow78-lgtm/SkyboundTotk"); }
 wstring update_branch() { return app.cfg.get(L"update_branch", L"update-1.4.3"); }
 
-const UINT WM_BUILD_LINES = WM_APP + 1, WM_GAME_EXIT = WM_APP + 2, WM_BUILD_EXIT = WM_APP + 3, WM_UPDATE_CHECKED = WM_APP + 4;
+const UINT WM_BUILD_LINES = WM_APP + 1, WM_GAME_EXIT = WM_APP + 2, WM_BUILD_EXIT = WM_APP + 3, WM_UPDATE_CHECKED = WM_APP + 4,
+           WM_PYTHON_READY = WM_APP + 5;
 
 wstring cfg_default_mods() {
     // (TKMM's output next to the skybound folder, as rebuild_and_test.bat looks for it)
@@ -363,6 +367,9 @@ void load_all() {
         wstring up = parent(parent(app.dir));
         if (exists(up + L"\\a64-kit\\build.py")) app.source = up;
     }
+    // (the release package: the launcher alone in a folder, with pipeline.py; the first build downloads the source
+    // into "source" beside it, and the tools (Python, clang, Microsoft's C++ tools, Rust) beside that)
+    if (app.source.empty() && exists(app.dir + L"\\pipeline.py")) app.source = app.dir + L"\\source";
     app.dist = app.source.empty() ? app.dir : app.source + L"\\dist\\SkyboundTOTK";
     if (!exists(app.dist + L"\\SkyboundTOTK.exe") && exists(app.dir + L"\\SkyboundTOTK.exe")) app.dist = app.dir;
     if (!app.cfg.v.count(L"mods")) app.cfg.v[L"mods"] = cfg_default_mods();
@@ -986,7 +993,57 @@ wstring python_exe() {
     std::string p = read_file(app.dist + L"\\python.txt");
     wstring w = trim(widen(p));
     if (!w.empty() && exists(w)) return w;
+    const wstring own = parent(app.source) + L"\\python\\python.exe";   // (the one the launcher downloaded)
+    if (!app.source.empty() && exists(own)) return own;
     return L"python";
+}
+
+// runs a command line without a window and waits (at most `ms`): its exit code, or -1
+int run_quiet(wstring cmd, DWORD ms) {
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return -1;
+    CloseHandle(pi.hThread);
+    DWORD code = (DWORD)-1;
+    if (WaitForSingleObject(pi.hProcess, ms) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    else TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+    return (int)code;
+}
+
+// a Python 3.10 or newer to run the build with ("python" may be Windows' Store shortcut, which runs nothing)
+bool python_ok() {
+    return run_quiet(L"\"" + python_exe() + L"\" -c \"import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)\"",
+                     20000) == 0;
+}
+
+// Python for the build, when the PC has none: python-build-standalone's (github.com/astral-sh/python-build-standalone,
+// Python's own license) into <the source's parent>\python, with Windows' own curl.exe and tar.exe; WM_PYTHON_READY
+// (wparam 1: done)
+void start_python_download() {
+    if (app.python_busy) return;
+    app.python_busy = true;
+    const wstring root = parent(app.source);
+    const wstring url = app.cfg.get(L"python_url",
+        L"https://github.com/astral-sh/python-build-standalone/releases/download/20261026/"
+        L"cpython-3.13.18%2B20261026-x86_64-pc-windows-msvc-install_only.tar.gz");
+    app.status = L"Downloading Python for the build (about 30 MB)\u2026";
+    redraw();
+    HWND w = app.hwnd;
+    std::thread([root, url, w] {
+        wchar_t sys[MAX_PATH];
+        GetSystemDirectoryW(sys, MAX_PATH);
+        CreateDirectoryW(root.c_str(), nullptr);
+        const wstring tgz = root + L"\\python-download.tar.gz";
+        bool ok = run_quiet(L"\"" + wstring(sys) + L"\\curl.exe\" -L --fail -s -o \"" + tgz + L"\" \"" + url + L"\"",
+                            600000) == 0;
+        ok = ok && run_quiet(L"\"" + wstring(sys) + L"\\tar.exe\" -xf \"" + tgz + L"\" -C \"" + root + L"\"", 600000) == 0;
+        DeleteFileW(tgz.c_str());
+        ok = ok && GetFileAttributesW((root + L"\\python\\python.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
+        PostMessageW(w, WM_PYTHON_READY, ok ? 1 : 0, 0);
+    }).detach();
 }
 
 // an environment block: this process's, with `extra` set (NAME -> value; empty value: removed)
@@ -1161,12 +1218,21 @@ void update_checked(const std::string& out) {
 }
 
 void start_build(bool fetch = false) {
-    if (app.build || app.game) return;
-    if (app.source.empty() || !exists(app.source + L"\\a64-kit\\build.py")) {
+    if (app.build || app.game || app.python_busy) return;
+    const bool fresh = !app.source.empty() && !exists(app.source + L"\\a64-kit\\build.py");
+    if (app.source.empty() || (fresh && !exists(app.dir + L"\\pipeline.py"))) {
         app.status = L"Choose the SkyboundTOTK source folder first (the one with a64-kit in it).";
         redraw();
         return;
     }
+    if (fresh) fetch = true;   // (the release package's first build: the source from GitHub first)
+    CreateDirectoryW(app.source.c_str(), nullptr);
+    if (!python_ok()) {   // (no Python: the launcher's own, then the build)
+        app.pending_fetch = fetch;
+        start_python_download();
+        return;
+    }
+    app.need_msvc_license.clear();
     const wstring ov = app.cfg.get(L"overlay");
     const wstring pipeline = pipeline_path();
     if (pipeline.empty()) {
@@ -1194,6 +1260,7 @@ void start_build(bool fetch = false) {
     }
     add(L"--overlay", ov);
     if (app.cfg.geti(L"dlss", 0)) args += L" --dlss";
+    if (app.cfg.geti(L"msvc_license", 0)) args += L" --msvc-license";
     if (fetch) args += L" --fetch " + quote(update_repo()) + L" --branch " + quote(update_branch());
     CreateDirectoryW(app.dist.c_str(), nullptr);
     add(L"--log", app.dist + L"\\launcher_build.log");
@@ -1289,6 +1356,8 @@ void build_lines() {
             for (auto& st : app.steps)
                 if (st.state == "run") st.progress = f;
             if (got == 2) app.build_text = widen(text);
+        } else if (l.rfind("@@need msvc_license ", 0) == 0) {
+            app.need_msvc_license = l.substr(20);
         } else if (l.rfind("@@end ", 0) == 0) {
             app.build_ok = l.compare(6, 2, "ok") == 0;
             app.build_end = widen(l.size() > 9 ? l.substr(app.build_ok ? 9 : 11) : "");
@@ -1492,6 +1561,31 @@ LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         load_all();
         if (app.update == App::U_AVAILABLE || app.update == App::U_FAILED) start_update_check();   // (after an update)
         FlashWindow(w, TRUE);
+        redraw();
+        if (!app.need_msvc_license.empty()) {   // (the build needs Microsoft's C++ tools: their license, then again)
+            const wstring url = widen(app.need_msvc_license);
+            app.need_msvc_license.clear();
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            const wstring q = L"The build needs Microsoft's C++ Build Tools (about 1 GB). The launcher can download them "
+                              L"from Microsoft into a folder next to the game (no admin, nothing installed system-wide).\n\n"
+                              L"Their license just opened in your browser:\n" + url +
+                              L"\n\nDo you accept Microsoft's license and want them downloaded?";
+            if (MessageBoxW(w, q.c_str(), L"Microsoft C++ Build Tools", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                app.cfg.v[L"msvc_license"] = L"1";
+                app.cfg.save();
+                start_build();
+            }
+        }
+        return 0;
+    }
+    case WM_PYTHON_READY: {
+        app.python_busy = false;
+        if (wp && python_ok()) {
+            app.status = L"Python is ready.";
+            start_build(app.pending_fetch);
+        } else {
+            app.status = L"Python could not be downloaded. Install Python 3.10+ from python.org, then Build again.";
+        }
         redraw();
         return 0;
     }
