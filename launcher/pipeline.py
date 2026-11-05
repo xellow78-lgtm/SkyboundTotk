@@ -257,6 +257,8 @@ def update(a):
         if rel.startswith(keep) or ".." in Path(rel).parts:
             continue
         dst = SOURCE / rel
+        if rel.startswith("third_party/wgpu-native/lib/") and dst.is_file() and b"wgpuTotk" in dst.read_bytes():
+            continue   # (the WebGPU library this PC built, with DLSS and Reflex: not replaced by the plain one)
         blob = z.read(prefix + rel)
         if not dst.is_file() or dst.read_bytes() != blob:
             dst.parent.mkdir(parents=True, exist_ok=True)
