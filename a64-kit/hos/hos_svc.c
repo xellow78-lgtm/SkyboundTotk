@@ -266,7 +266,7 @@ void a64_svc(Ctx *c, uint32_t imm) {
     case 0x07:   /* ExitProcess */
         hos_log("svcExitProcess");
         hos_log_flush();
-        ExitProcess(0);
+        TerminateProcess(GetCurrentProcess(), 0);   /* (as display.c's: no exit-time clean-up to crash in) */
         return;
     case 0x0C: { /* GetThreadPriority(-, handle) -> (result, priority) */
         HosThread *t = thread_handle((uint32_t)c->x[1]);

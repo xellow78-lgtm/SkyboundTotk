@@ -381,7 +381,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         hos_log("display: window closed, exiting");
         hos_log_flush();
-        ExitProcess(0);
+        /* (at once: ExitProcess ran the static DLSS library's own clean-up after the Vulkan device was gone, which
+           crashed reading freed memory: run_launcher.log, 2026-11-04. Nothing here needs exit-time clean-up: the
+           pipeline cache and input.ini are closed after each write) */
+        TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     }
     return DefWindowProcA(w, msg, wp, lp);

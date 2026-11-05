@@ -50,7 +50,7 @@ const char *hos_render_mode_name(int m) {
     if (m < 0 || m >= NMODES) m = 0;
     const float share = hos_res_scene_share();
     if (m == 0)
-        snprintf(names[m], 64, "Game's own (up to %ux%u)", (unsigned)(hos_out_w * share), (unsigned)(hos_out_h * share));
+        snprintf(names[m], 64, "Game's own (%ux%u)", (unsigned)(hos_out_w * share), (unsigned)(hos_out_h * share));
     else if (m == NMODES - 1 && !hos_res_native())
         snprintf(names[m], 64, "Native (DLAA) - at the next start");
     else
@@ -108,6 +108,26 @@ const char *hos_render_mode_cycle(void) {
 }
 
 #if GAME_VERSION == 143
+/* The game's own dynamic resolution, off (HOS_DRS=1: on). Each frame f_08584300, the scene resolution controller, fits
+   the recent frame times and gives the renderer a scale for the scene; its first test is its own enable bit (+0x110 bit
+   0, main+0x5843e0), and with the bit clear it takes its own disabled path: scale 1.0. Left on, it fought the fixed
+   3D resolutions: Native at 2560x1440 rendered 2296x1288, 2048x1152 and 1280x720 in turn (run_launcher.log,
+   2026-11-04), every new size made its scene targets again (stalls of 100-140 ms) and DLSS its feature. The site is
+   the one UltraTears switches the same way (github.com/kuraeow/ultratears; only the fact of where: this is its own
+   code). The bit is cleared in the register the test reads, not in the controller. */
+static int game_drs(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_DRS");
+        on = e && *e && *e != '0';
+        hos_log("drs: the game's own dynamic resolution %s", on ? "on (HOS_DRS=1)" : "off: the 3D resolution stays fixed");
+    }
+    return on;
+}
+SPLICE_AFTER(0x08584300, "c->x[8]=recomp_load32(c,c->x[9] + 272);") {
+    if (!game_drs()) c->x[8] &= ~1ULL;
+}
+
 static int drs_probe(void) {
     static int m = -1;
     if (m < 0) {
