@@ -310,8 +310,13 @@ def tools(a, env):
 
 
 def has_reflex_lib():
+    """The patched WebGPU library, as new as the sources want: Reflex (wgpuTotkReflexSleep) and the SPIR-V cache
+    (wgpuTotkCreateRenderPipelineCapture). An older one is rebuilt (cargo rebuilds only the changed crates)."""
     lib = SOURCE / "third_party/wgpu-native/lib/wgpu_native.dll.lib"
-    return lib.is_file() and b"wgpuTotkReflexSleep" in lib.read_bytes()
+    if not lib.is_file():
+        return False
+    data = lib.read_bytes()
+    return b"wgpuTotkReflexSleep" in data and b"wgpuTotkCreateRenderPipelineCapture" in data
 
 
 def dlss(a, env):
@@ -323,8 +328,9 @@ def dlss(a, env):
         run([sys.executable, "-u", builder, "--work", SKYBOUND / "wgpu-build", "--skip-wgpu"], SOURCE, env)
         return "done"
     if not a.dlss:
-        say("DLSS and Reflex need the rebuilt WebGPU library: tick \"DLSS library\" on the Build page to make it "
-            "(~20-30 min once). Building without them now (FSR 2 works).")
+        say("DLSS, Reflex and the SPIR-V shader cache need the rebuilt WebGPU library: tick \"DLSS library\" on the "
+            "Build page to make it (~20-30 min the first time, a few minutes after). Building without them now (FSR 2 "
+            "works).")
         return "skip"
     env["RUSTUP_HOME"] = str(SKYBOUND / "rust/rustup")
     env["CARGO_HOME"] = str(SKYBOUND / "rust/cargo")

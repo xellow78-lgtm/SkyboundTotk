@@ -2,6 +2,8 @@
 /game/
 /build/
 /dist/
+# The renderer's caches (made from the game's shaders) wherever the exe runs.
+rxcache/
 *.nsp
 *.xci
 *.nca

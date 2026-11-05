@@ -76,6 +76,7 @@ std::string nc_pending;
 std::unordered_set<uint64_t> nc_known_texts, nc_known_pipelines;
 std::string nc_path;
 int64_t nc_last_save = 0;
+std::mutex nc_file_mu;   // (the file: save()'s appends, and load()'s reading and compaction)
 
 // what the loader read (the render thread takes it once `loaded` is set)
 std::atomic<bool> nc_loaded{false};
@@ -235,6 +236,7 @@ void add_record(char type, const std::string& payload) {   // (nc_mu held)
 
 /// Reads the file (a thread of its own): texts by hash and the pipeline records, for the render thread.
 void load() {
+    std::unique_lock file_lock(nc_file_mu);   // (save() skips its writes meanwhile: they wait in nc_pending)
     FILE* f = std::fopen(nc_path.c_str(), "rb");
     if (!f) {
         nc_loaded = true;
@@ -316,6 +318,91 @@ void load() {
         std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
             return a.first != b.first ? a.first > b.first : a.second > b.second;
         });
+        // Compaction: the file only grows (every pipeline any session made, and each session's 'U' record), 359 MB with
+        // 314,701 pipelines in the user's log, and at 400 MB it was started again, every pipeline lost. Past
+        // kCompactRecords pipelines or kCompactBytes it is written again with the most recently used kKeepRecords
+        // (far more than are made at a start, RX_PIPELINE_CACHE_MAX), the texts they use, the compute programs and one
+        // 'U' record per session for them.
+        constexpr size_t kCompactRecords = 80000, kKeepRecords = 50000;
+        constexpr int64_t kCompactBytes = 250ll << 20;
+        if (order.size() > kCompactRecords || bytes > kCompactBytes) {
+            std::fclose(f);
+            f = nullptr;
+            const size_t keep = std::min(order.size(), kKeepRecords);
+            std::unordered_set<uint64_t> texts, keys;
+            for (size_t k = 0; k < keep; k++) {
+                const PipelineDesc& d = list[order[k].second];
+                texts.insert(d.vs_text);
+                if (d.fs_text) texts.insert(d.fs_text);
+                keys.insert(d.key);
+            }
+            std::string out;
+            Writer w{out};
+            const uint32_t head2[3] = {kMagic, kVersion, signature()};
+            w.bytes(head2, sizeof head2);
+            auto record = [&](char type, const std::string& payload) {
+                w.put(type);
+                w.put((uint32_t)payload.size());
+                w.bytes(payload.data(), payload.size());
+            };
+            std::string payload2;
+            {
+                std::lock_guard lk(nc_mu);
+                for (uint64_t h : texts) {
+                    auto it = nc_texts.find(h);
+                    if (it == nc_texts.end()) continue;
+                    payload2.clear();
+                    Writer pw{payload2};
+                    pw.put(h);
+                    pw.bytes(it->second.data(), it->second.size());
+                    record('T', payload2);
+                }
+                for (const auto& [h, text] : nc_compute_texts) {
+                    payload2.clear();
+                    Writer pw{payload2};
+                    pw.put(h);
+                    pw.bytes(text.data(), text.size());
+                    record('C', payload2);
+                }
+            }
+            for (size_t k = keep; k-- > 0;) {   // (the oldest first: the file's order breaks ties as before)
+                payload2.clear();
+                Writer pw{payload2};
+                put_desc(pw, list[order[k].second]);
+                record('P', payload2);
+            }
+            std::unordered_map<uint32_t, std::vector<uint64_t>> by_session;
+            for (size_t k = 0; k < keep; k++)
+                if (order[k].first) by_session[order[k].first].push_back(list[order[k].second].key);
+            for (auto& [session, ks] : by_session) {
+                payload2.clear();
+                Writer pw{payload2};
+                pw.put(session);
+                pw.bytes(ks.data(), ks.size() * sizeof(uint64_t));
+                record('U', payload2);
+            }
+            const std::string tmp = nc_path + ".new";
+            FILE* o = std::fopen(tmp.c_str(), "wb");
+            const bool written = o && std::fwrite(out.data(), 1, out.size(), o) == out.size();
+            if (o) std::fclose(o);
+            if (written && MoveFileExA(tmp.c_str(), nc_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                hos_log("rx: pipeline cache: compacted %lld MB with %zu pipelines to %lld MB with the %zu most recently "
+                        "used (%zu shader texts)", (long long)(bytes >> 20), order.size(),
+                        (long long)(out.size() >> 20), keep, texts.size());
+                bytes = (int64_t)out.size();
+                order.resize(keep);
+                std::lock_guard lk(nc_mu);   // (what was left out is recorded again when a session makes it)
+                for (auto it = nc_texts.begin(); it != nc_texts.end();)
+                    if (!texts.count(it->first)) nc_known_texts.erase(it->first), it = nc_texts.erase(it);
+                    else ++it;
+                n_texts = nc_texts.size();
+                for (const PipelineDesc& d : list)
+                    if (!keys.count(d.key)) nc_known_pipelines.erase(d.key);
+            } else {
+                std::remove(tmp.c_str());
+                hos_log("rx: pipeline cache: could not compact %s", nc_path.c_str());
+            }
+        }
         nc_records.reserve(order.size());
         for (const auto& [last, i] : order) nc_records.push_back(std::move(list[i]));
         nc_session = sessions + 1;
@@ -328,7 +415,7 @@ void load() {
         hos_log("rx: pipeline cache %s is from another build or damaged: started again", nc_path.c_str());
     }
     if (f) std::fclose(f);
-    if (bytes > (400ll << 20)) {   // (grown past use: the next session starts it again)
+    if (bytes > (600ll << 20)) {   // (grown past use even after compaction: the next session starts it again)
         std::remove(nc_path.c_str());
         std::lock_guard lk(nc_mu);
         nc_known_texts.clear();
@@ -337,6 +424,7 @@ void load() {
     }
     hos_log("rx: pipeline cache: %zu shader texts, %zu pipelines to make in the background, %zu compute programs "
             "(%lld MB)", n_texts, nc_records.size(), nc_compute_texts.size(), (long long)(bytes >> 20));
+    file_lock.unlock();
     nc_loaded = true;
     // the compute programs' modules, here (WGSL parsing and validation; they compiled when they were recorded)
     const int64_t t0 = hos_now_ns();
@@ -372,6 +460,12 @@ void save() {
         if (nc_pending.empty()) return;
         out.swap(nc_pending);
     }
+    std::unique_lock file_lock(nc_file_mu, std::try_to_lock);
+    if (!file_lock.owns_lock()) {   // (load() is reading or compacting the file: the next save writes these)
+        std::lock_guard lk(nc_mu);
+        nc_pending.insert(0, out);
+        return;
+    }
     FILE* f = std::fopen(nc_path.c_str(), "ab");
     if (!f) return;
     std::fseek(f, 0, SEEK_END);   // (in append mode the position reads 0 until the first write)
@@ -383,7 +477,236 @@ void save() {
     std::fclose(f);
 }
 
+// ---- the SPIR-V cache (rxcache/spirv.bin): the SPIR-V wgpu's Vulkan backend wrote for each pipeline stage. A later
+// session makes the stage's module from it (wgpuDeviceCreateShaderModuleSpirV, passthrough), so neither the WGSL's
+// parsing and validation (the user's logs: "modules 6283 ms" of 8.6 s for 1,108 pipelines at a start; 36 s of 42 at
+// the Great Sky Island spawn) nor the SPIR-V writing per pipeline happen again. A stage's SPIR-V depends on its WGSL,
+// its stage and the binding numbers of its bind group layout (wgpu packs them: binding 5 alone is Vulkan's binding 0),
+// so it is kept under those three. Needs the patched wgpu_native.dll (wgpuTotkCreateRenderPipelineCapture; the
+// launcher builds it) and passthrough on the device (Vulkan); otherwise off. The file is tied to the wgpu_native.dll
+// it came from (its size and time: another naga may write other SPIR-V): another one starts it again. Records: u64
+// key, u64 the WGSL's hash, u32 stage, u32 words, the words; appended as pipelines are made, read when used. The
+// game's shaders (made from its data): it stays on this machine, never in the repository. RX_NO_SPIRV_CACHE=1: off.
+constexpr uint32_t kSpvMagic = 0x56535852;   // "RXSV"
+constexpr uint32_t kSpvVersion = 1;
+constexpr int64_t kSpvMaxBytes = 1024ll << 20;   // (past that at a start: started again; nothing added past it)
+
+using CaptureFn = WGPURenderPipeline (*)(WGPUDevice, const WGPURenderPipelineDescriptor*, uint32_t**, size_t*,
+                                         uint32_t**, size_t*);
+using FreeFn = void (*)(uint32_t*, size_t);
+using PassthroughFn = bool (*)(WGPUDevice);
+
+struct SpvEntry {
+    uint64_t text;
+    uint32_t stage, words;
+    int64_t offset;                    // of the words
+    WGPUShaderModule module = nullptr;   // (made from them once; kept, as the WGSL modules are)
+    bool bad = false;                    // (a pipeline with it reported an error: WGSL from now on)
+};
+std::mutex sv_mu;
+std::once_flag sv_once;
+bool sv_on = false;
+HANDLE sv_file = INVALID_HANDLE_VALUE;
+int64_t sv_end = 0;
+std::unordered_map<uint64_t, SpvEntry> sv_index;
+CaptureFn sv_capture = nullptr;
+FreeFn sv_free = nullptr;
+std::atomic<int64_t> sv_hits{0}, sv_kept{0};
+
+uint64_t fnv(const void* p, size_t n, uint64_t h) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+/// the key of a stage's SPIR-V: its WGSL, its stage and its layout's binding numbers (in the layout's order)
+uint64_t sv_key(uint64_t text, const std::vector<uint32_t>& layout, uint32_t stage) {
+    uint64_t h = fnv(&text, 8, 0xcbf29ce484222325ull);
+    h = fnv(&stage, 4, h);
+    for (uint32_t v : layout) {
+        const uint32_t binding = v & 1023;   // (pack_layout: the binding in the low 10 bits)
+        h = fnv(&binding, 4, h);
+    }
+    return fnv(&kSpvVersion, 4, h ^ layout.size());
+}
+
+bool sv_io(bool write, int64_t off, void* p, DWORD n) {   // (sv_mu held)
+    OVERLAPPED o{};
+    o.Offset = (DWORD)off;
+    o.OffsetHigh = (DWORD)(off >> 32);
+    DWORD done = 0;
+    const BOOL ok = write ? WriteFile(sv_file, p, n, &done, &o) : ReadFile(sv_file, p, n, &done, &o);
+    return ok && done == n;
+}
+
+/// wgpu_native.dll's size and time: the SPIR-V is what that build's naga wrote
+uint64_t sv_stamp() {
+    HMODULE m = GetModuleHandleA("wgpu_native.dll");
+    char path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!m || !GetModuleFileNameA(m, path, sizeof path) || !GetFileAttributesExA(path, GetFileExInfoStandard, &a))
+        return 0;
+    uint64_t h = fnv(&a.nFileSizeLow, 4, 0xcbf29ce484222325ull);
+    h = fnv(&a.nFileSizeHigh, 4, h);
+    return fnv(&a.ftLastWriteTime, sizeof a.ftLastWriteTime, h);
+}
+
+void sv_open() {   // (sv_mu held)
+    if (!nc_on || getenv("RX_NO_SPIRV_CACHE") || getenv("RX_SHADER_CHECKS")) return;
+    HMODULE m = GetModuleHandleA("wgpu_native.dll");
+    if (!m) return;
+    sv_capture = (CaptureFn)(void*)GetProcAddress(m, "wgpuTotkCreateRenderPipelineCapture");
+    sv_free = (FreeFn)(void*)GetProcAddress(m, "wgpuTotkFreeSpirv");
+    auto passthrough = (PassthroughFn)(void*)GetProcAddress(m, "wgpuTotkPassthroughShaders");
+    if (!sv_capture || !sv_free || !passthrough) {
+        hos_log("rx: SPIR-V cache: off (this wgpu_native.dll is from before it: the launcher's build makes a new one)");
+        return;
+    }
+    if (!passthrough(dev.device)) {
+        hos_log("rx: SPIR-V cache: off (the device has no SPIR-V passthrough)");
+        return;
+    }
+    const uint64_t stamp = sv_stamp();
+    std::string path = nc_path;
+    path.replace(path.size() - std::strlen("pipelines.bin"), std::string::npos, "spirv.bin");
+    sv_file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                          FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (sv_file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size{};
+    GetFileSizeEx(sv_file, &size);
+    uint32_t head[4] = {};
+    const char* why = nullptr;
+    if (size.QuadPart == 0) why = "";
+    else if (size.QuadPart < (int64_t)sizeof head || !sv_io(false, 0, head, sizeof head) || head[0] != kSpvMagic ||
+             head[1] != kSpvVersion) why = "from another build or damaged";
+    else if ((((uint64_t)head[3] << 32) | head[2]) != stamp) why = "made by another wgpu_native.dll";
+    else if (size.QuadPart > kSpvMaxBytes) why = "grown past use";
+    int64_t off = sizeof head;
+    if (!why) {   // the index: each record's key and where its words are (the words are read when used)
+        struct Rec {
+            uint64_t key, text;
+            uint32_t stage, words;
+        } r;
+        static_assert(sizeof(Rec) == 24);
+        while (off + (int64_t)sizeof r <= size.QuadPart && sv_io(false, off, &r, sizeof r) && r.words &&
+               r.words < (16u << 20) && off + (int64_t)sizeof r + (int64_t)r.words * 4 <= size.QuadPart) {
+            SpvEntry& e = sv_index[r.key];
+            e.text = r.text, e.stage = r.stage, e.words = r.words, e.offset = off + (int64_t)sizeof r;
+            off += sizeof r + (int64_t)r.words * 4;
+        }
+        if (off != size.QuadPart) {   // (a record cut short by an abrupt exit: written over from there)
+            LARGE_INTEGER at{};
+            at.QuadPart = off;
+            SetFilePointerEx(sv_file, at, nullptr, FILE_BEGIN);
+            SetEndOfFile(sv_file);
+        }
+    } else {
+        if (*why) hos_log("rx: SPIR-V cache %s: %s, started again", path.c_str(), why);
+        LARGE_INTEGER zero{};
+        SetFilePointerEx(sv_file, zero, nullptr, FILE_BEGIN);
+        SetEndOfFile(sv_file);
+        uint32_t h[4] = {kSpvMagic, kSpvVersion, (uint32_t)stamp, (uint32_t)(stamp >> 32)};
+        sv_io(true, 0, h, sizeof h);
+        off = sizeof h;
+    }
+    sv_end = off;
+    sv_on = true;
+    hos_log("rx: SPIR-V cache: %zu pipeline stages kept (%lld MB)", sv_index.size(), (long long)(off >> 20));
+}
+
 } // namespace
+
+bool spirv_cache_on() {
+    std::call_once(sv_once, [] {
+        std::lock_guard lk(sv_mu);
+        sv_open();
+    });
+    return sv_on;
+}
+
+WGPUShaderModule spirv_stage_module(uint64_t text, const std::vector<uint32_t>& layout, uint32_t stage) {
+    if (!text || !spirv_cache_on()) return nullptr;
+    const uint64_t key = sv_key(text, layout, stage);
+    std::vector<uint32_t> words;
+    {
+        std::lock_guard lk(sv_mu);
+        auto it = sv_index.find(key);
+        if (it == sv_index.end() || it->second.bad || it->second.text != text || it->second.stage != stage)
+            return nullptr;
+        if (it->second.module) {
+            sv_hits++;
+            return it->second.module;
+        }
+        words.resize(it->second.words);
+        if (!sv_io(false, it->second.offset, words.data(), (DWORD)(words.size() * 4))) return nullptr;
+    }
+    WGPUShaderModuleDescriptorSpirV d{};
+    d.sourceSize = (uint32_t)words.size();
+    d.source = words.data();
+    WGPUShaderModule m = wgpuDeviceCreateShaderModuleSpirV(dev.device, &d);   // (passthrough: no parsing)
+    if (!m) return nullptr;
+    std::lock_guard lk(sv_mu);
+    SpvEntry& e = sv_index[key];
+    if (e.module) {   // (another compiler made it meanwhile)
+        wgpuShaderModuleRelease(m);
+        m = e.module;
+    }
+    e.module = m;
+    sv_hits++;
+    return m;
+}
+
+void spirv_stage_bad(uint64_t text, const std::vector<uint32_t>& layout, uint32_t stage) {
+    std::lock_guard lk(sv_mu);
+    auto it = sv_index.find(sv_key(text, layout, stage));
+    if (it != sv_index.end()) it->second.bad = true;
+}
+
+WGPURenderPipeline spirv_create_pipeline(const WGPURenderPipelineDescriptor* d, SpirvCapture& c) {
+    c = SpirvCapture{};
+    if (!spirv_cache_on()) return wgpuDeviceCreateRenderPipeline(dev.device, d);
+    return sv_capture(dev.device, d, &c.vs, &c.vs_count, &c.fs, &c.fs_count);
+}
+
+void spirv_keep(SpirvCapture& c, bool ok, uint64_t vs_text, const std::vector<uint32_t>& vs_layout, uint64_t fs_text,
+                const std::vector<uint32_t>& fs_layout) {
+    struct Stage {
+        uint32_t*& words;
+        size_t& count;
+        uint64_t text;
+        const std::vector<uint32_t>& layout;
+        uint32_t stage;
+    };
+    for (Stage s : {Stage{c.vs, c.vs_count, vs_text, vs_layout, 0}, Stage{c.fs, c.fs_count, fs_text, fs_layout, 1}}) {
+        if (!s.words) continue;
+        if (ok && s.text && s.count) {
+            const uint64_t key = sv_key(s.text, s.layout, s.stage);
+            std::string rec;
+            Writer w{rec};
+            w.put(key);
+            w.put(s.text);
+            w.put(s.stage);
+            w.put((uint32_t)s.count);
+            w.bytes(s.words, s.count * 4);
+            std::lock_guard lk(sv_mu);
+            if (sv_on && !sv_index.count(key) && sv_end + (int64_t)rec.size() <= kSpvMaxBytes &&
+                sv_io(true, sv_end, rec.data(), (DWORD)rec.size())) {
+                SpvEntry& e = sv_index[key];
+                e.text = s.text, e.stage = s.stage, e.words = (uint32_t)s.count, e.offset = sv_end + 24;
+                sv_end += rec.size();
+                sv_kept++;
+            }
+        }
+        sv_free(s.words, s.count);
+        s.words = nullptr;
+        s.count = 0;
+    }
+}
+
+void spirv_stats(int64_t* hits, int64_t* kept) {
+    *hits = sv_hits.load();
+    *kept = sv_kept.load();
+}
 
 bool native_cache_on() { return nc_on; }
 
@@ -538,5 +861,14 @@ void native_cache_pipeline(const PipelineDesc&) {}
 void native_cache_compute_text(uint64_t, const std::string&) {}
 void native_cache_used(uint64_t) {}
 WGPUShaderModule native_cache_compute_module(uint64_t) { return nullptr; }
+bool spirv_cache_on() { return false; }
+WGPUShaderModule spirv_stage_module(uint64_t, const std::vector<uint32_t>&, uint32_t) { return nullptr; }
+void spirv_stage_bad(uint64_t, const std::vector<uint32_t>&, uint32_t) {}
+WGPURenderPipeline spirv_create_pipeline(const WGPURenderPipelineDescriptor* d, SpirvCapture& c) {
+    c = SpirvCapture{};
+    return wgpuDeviceCreateRenderPipeline(dev.device, d);
+}
+void spirv_keep(SpirvCapture&, bool, uint64_t, const std::vector<uint32_t>&, uint64_t, const std::vector<uint32_t>&) {}
+void spirv_stats(int64_t* hits, int64_t* kept) { *hits = *kept = 0; }
 } // namespace rx
 #endif

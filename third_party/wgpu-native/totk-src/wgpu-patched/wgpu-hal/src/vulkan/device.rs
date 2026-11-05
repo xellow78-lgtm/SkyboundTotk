@@ -15,6 +15,16 @@ use parking_lot::Mutex;
 use super::{conv, RawTlasInstance};
 use crate::TlasInstance;
 
+std::thread_local! {
+    /// (TOTK port) Set to `Some` by wgpu-native's wgpuTotkCreateRenderPipelineCapture: the SPIR-V naga writes for each
+    /// stage of a pipeline created on this thread (naga's stage, the words) is added to it. A stage's SPIR-V is a
+    /// function of the module, its entry point and stage, the pipeline layout's binding map, the device's options and
+    /// the module's runtime checks: the renderer keeps it under those, and a later session makes the stage's module from
+    /// it (passthrough, `ShaderModule::Raw`): no WGSL parsing and validation, and no SPIR-V writing per pipeline.
+    pub static TOTK_SPIRV_CAPTURE: core::cell::RefCell<Option<Vec<(u32, Vec<u32>)>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
 impl super::DeviceShared {
     /// Set the name of `object` to `name`.
     ///
@@ -715,6 +725,12 @@ impl super::Device {
                     naga::back::spv::write_vec(&module, &info, options, Some(&pipeline_options))
                 }
                 .map_err(|e| crate::PipelineError::Linkage(stage_flags, format!("{e}")))?;
+                // (TOTK port) the stage's SPIR-V for the renderer's cache, when the caller asked for it on this thread
+                TOTK_SPIRV_CAPTURE.with(|c| {
+                    if let Some(out) = c.borrow_mut().as_mut() {
+                        out.push((naga_stage as u32, spv.clone()));
+                    }
+                });
                 self.create_shader_module_impl(&spv, &None)?
             }
         };

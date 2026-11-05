@@ -1,0 +1,44 @@
+diff -ru a/wgpu-hal/src/vulkan/device.rs b/wgpu-hal/src/vulkan/device.rs
+--- a/wgpu-hal/src/vulkan/device.rs	2026-11-05 08:45:21.919227508 -0500
++++ b/wgpu-hal/src/vulkan/device.rs	2026-11-05 08:45:21.920391072 -0500
+@@ -15,6 +15,16 @@
+ use super::{conv, RawTlasInstance};
+ use crate::TlasInstance;
+ 
++std::thread_local! {
++    /// (TOTK port) Set to `Some` by wgpu-native's wgpuTotkCreateRenderPipelineCapture: the SPIR-V naga writes for each
++    /// stage of a pipeline created on this thread (naga's stage, the words) is added to it. A stage's SPIR-V is a
++    /// function of the module, its entry point and stage, the pipeline layout's binding map, the device's options and
++    /// the module's runtime checks: the renderer keeps it under those, and a later session makes the stage's module from
++    /// it (passthrough, `ShaderModule::Raw`): no WGSL parsing and validation, and no SPIR-V writing per pipeline.
++    pub static TOTK_SPIRV_CAPTURE: core::cell::RefCell<Option<Vec<(u32, Vec<u32>)>>> =
++        const { core::cell::RefCell::new(None) };
++}
++
+ impl super::DeviceShared {
+     /// Set the name of `object` to `name`.
+     ///
+@@ -715,6 +725,12 @@
+                     naga::back::spv::write_vec(&module, &info, options, Some(&pipeline_options))
+                 }
+                 .map_err(|e| crate::PipelineError::Linkage(stage_flags, format!("{e}")))?;
++                // (TOTK port) the stage's SPIR-V for the renderer's cache, when the caller asked for it on this thread
++                TOTK_SPIRV_CAPTURE.with(|c| {
++                    if let Some(out) = c.borrow_mut().as_mut() {
++                        out.push((naga_stage as u32, spv.clone()));
++                    }
++                });
+                 self.create_shader_module_impl(&spv, &None)?
+             }
+         };
+diff -ru a/wgpu-hal/src/vulkan/mod.rs b/wgpu-hal/src/vulkan/mod.rs
+--- a/wgpu-hal/src/vulkan/mod.rs	2026-11-05 08:45:21.919279199 -0500
++++ b/wgpu-hal/src/vulkan/mod.rs	2026-11-05 08:45:21.920432776 -0500
+@@ -35,6 +35,7 @@
+ mod swapchain;
+ 
+ pub use adapter::PhysicalDeviceFeatures;
++pub use device::TOTK_SPIRV_CAPTURE;
+ 
+ use alloc::{boxed::Box, ffi::CString, sync::Arc, vec::Vec};
+ use core::{

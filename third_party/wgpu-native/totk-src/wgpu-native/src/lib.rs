@@ -845,7 +845,7 @@ pub unsafe extern "C" fn wgpuAdapterRequestDevice(
     let adapter_limits = context.adapter_limits(adapter_id);
     let base_limits = get_base_device_limits_from_adapter_limits(&adapter_limits);
 
-    let (desc, device_lost_handler, error_callback) = match descriptor {
+    let (mut desc, device_lost_handler, error_callback) = match descriptor {
         Some(descriptor) => {
             let (desc, error_callback) = follow_chain!(
                 map_device_descriptor((descriptor, base_limits),
@@ -867,6 +867,14 @@ pub unsafe extern "C" fn wgpuAdapterRequestDevice(
         ),
     };
 
+    // (TOTK port) SPIR-V passthrough when the adapter has it (Vulkan): the renderer makes the modules it made before
+    // from the SPIR-V it kept (wgpuTotkCreateShaderModuleCapture), without WGSL parsing and validation again
+    if context
+        .adapter_features(adapter_id)
+        .contains(wgt::Features::PASSTHROUGH_SHADERS)
+    {
+        desc.required_features |= wgt::Features::PASSTHROUGH_SHADERS;
+    }
     let result = context.adapter_request_device(adapter_id, &desc, None, None);
     match result {
         Ok((device_id, queue_id)) => {
@@ -4492,6 +4500,64 @@ pub unsafe extern "C" fn wgpuQueueSubmitForIndex(
 
 /// (TOTK port) HOS_AB's phase, set by the renderer each frame: while it is 1, the wgpu patch switch HOS_AB_SWITCH
 /// names is flipped (an A/B inside one run)
+/// (TOTK port) wgpuDeviceCreateRenderPipeline, and the SPIR-V the Vulkan backend wrote for its vertex and fragment
+/// stages (the stages whose modules came from WGSL), for the renderer's SPIR-V cache: a later session gives it to
+/// wgpuDeviceCreateShaderModuleSpirV for a pipeline with the same layout (no WGSL parsing and validation, and no SPIR-V
+/// writing). *vs / *vs_count and *fs / *fs_count: the words (count 0: none, a stage from SPIR-V already, another
+/// backend or an error); freed with wgpuTotkFreeSpirv.
+#[no_mangle]
+pub unsafe extern "C" fn wgpuTotkCreateRenderPipelineCapture(
+    device: native::WGPUDevice,
+    descriptor: Option<&native::WGPURenderPipelineDescriptor>,
+    vs: *mut *mut u32,
+    vs_count: *mut usize,
+    fs: *mut *mut u32,
+    fs_count: *mut usize,
+) -> native::WGPURenderPipeline {
+    hal::vulkan::TOTK_SPIRV_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let pipeline = wgpuDeviceCreateRenderPipeline(device, descriptor);
+    let stages = hal::vulkan::TOTK_SPIRV_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default();
+    for (words, count) in [(vs, vs_count), (fs, fs_count)] {
+        if !words.is_null() && !count.is_null() {
+            *words = std::ptr::null_mut();
+            *count = 0;
+        }
+    }
+    for (stage, spv) in stages {
+        let (words, count) = match stage {
+            0 => (vs, vs_count),
+            3 => (fs, fs_count),
+            _ => continue,
+        };
+        if words.is_null() || count.is_null() || spv.is_empty() || !(*words).is_null() {
+            continue;
+        }
+        *count = spv.len();
+        *words = Box::into_raw(spv.into_boxed_slice()) as *mut u32;
+    }
+    pipeline
+}
+
+/// (TOTK port) frees what wgpuTotkCreateRenderPipelineCapture returned
+#[no_mangle]
+pub unsafe extern "C" fn wgpuTotkFreeSpirv(words: *mut u32, count: usize) {
+    if !words.is_null() && count != 0 {
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(words, count)));
+    }
+}
+
+/// (TOTK port) whether the device took SPIR-V passthrough (wgpuDeviceCreateShaderModuleSpirV works)
+#[no_mangle]
+pub unsafe extern "C" fn wgpuTotkPassthroughShaders(device: native::WGPUDevice) -> bool {
+    let device = device.as_ref().expect("invalid device");
+    device
+        .context
+        .device_features(device.id)
+        .contains(wgt::Features::PASSTHROUGH_SHADERS)
+}
+
 #[no_mangle]
 pub extern "C" fn wgpuTotkSetAbPhase(phase: u32) {
     wgt::TOTK_AB_PHASE.store(phase, std::sync::atomic::Ordering::Relaxed);

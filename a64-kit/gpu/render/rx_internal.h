@@ -615,6 +615,24 @@ void native_cache_used(uint64_t key);   // a draw used this pipeline (render thr
 bool native_cache_on();
 void native_cache_compute_text(uint64_t h, const std::string& text);   // a compute program's WGSL that compiled
 WGPUShaderModule native_cache_compute_module(uint64_t h);   // its module, made by the cache's thread (or null)
+/// The SPIR-V cache (rx_pipecache_native.cpp): the SPIR-V of pipeline stages, kept under their WGSL text's hash, their
+/// bind group layout (packed, pack_layout) and stage (0 vertex, 1 fragment). spirv_stage_module: a module made from
+/// it, or null (none kept, or the cache is off). spirv_create_pipeline: wgpuDeviceCreateRenderPipeline, giving back
+/// the SPIR-V of the stages whose modules were WGSL; spirv_keep keeps it (when `ok`: the pipeline had no error) and
+/// frees it. spirv_stage_bad: a pipeline with that SPIR-V gave an error (its WGSL from now on).
+struct SpirvCapture {
+    uint32_t* vs = nullptr;
+    size_t vs_count = 0;
+    uint32_t* fs = nullptr;
+    size_t fs_count = 0;
+};
+bool spirv_cache_on();
+WGPUShaderModule spirv_stage_module(uint64_t text, const std::vector<uint32_t>& layout, uint32_t stage);
+void spirv_stage_bad(uint64_t text, const std::vector<uint32_t>& layout, uint32_t stage);
+WGPURenderPipeline spirv_create_pipeline(const WGPURenderPipelineDescriptor* d, SpirvCapture& c);
+void spirv_keep(SpirvCapture& c, bool ok, uint64_t vs_text, const std::vector<uint32_t>& vs_layout, uint64_t fs_text,
+                const std::vector<uint32_t>& fs_layout);
+void spirv_stats(int64_t* hits, int64_t* kept);   // (stages made from kept SPIR-V; stages newly kept)
 /// The module of a cached WGSL text (interned as a translation would: draws of the same text share the module)
 ShaderModule* prewarm_stage_module(uint64_t h, const std::string& text, const char* what);
 /// Makes a cached pipeline, unless the map has its key (render thread); false when there was nothing to make

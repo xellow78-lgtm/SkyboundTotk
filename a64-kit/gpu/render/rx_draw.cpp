@@ -271,13 +271,21 @@ struct PipelineJob {
     WGPUDepthStencilState depth{};
     std::vector<WGPUBindGroupLayoutEntry> bgl[2];   // (the browser's pipeline cache records them)
     int nbgl = 1;
+    std::vector<uint32_t> packed[2];   // the stages' bind group layouts, packed (the SPIR-V cache's keys)
 };
 
 std::atomic<int64_t> st_module_ns, st_pipeline_ns, st_pipelines_made;   // (pipeline compilers' time)
 
 void compile(PipelineJob& j) {
     const int64_t t0 = hos_now_ns();
-    const bool vs_ok = ensure_module(*j.vs_module), fs_ok = !j.fs_module || ensure_module(*j.fs_module);
+    // the stages' modules: from the SPIR-V cache when it has them for these layouts (no WGSL parsing), else the WGSL
+    const uint64_t vs_text = j.vs_module->text_hash, fs_text = j.fs_module ? j.fs_module->text_hash : 0;
+    const bool spirv = !RX_WEB && spirv_cache_on() && vs_text && (!j.fs_module || fs_text);
+    // (a vertex stage from SPIR-V carries no reflection, and wgpu then refuses a WGSL fragment stage's inputs as not
+    // written by it: the vertex stage from SPIR-V only with the fragment stage from SPIR-V too)
+    WGPUShaderModule fs_spv = spirv && j.fs_module ? spirv_stage_module(fs_text, j.packed[1], 1) : nullptr;
+    WGPUShaderModule vs_spv = spirv && (!j.fs_module || fs_spv) ? spirv_stage_module(vs_text, j.packed[0], 0) : nullptr;
+    const bool vs_ok = vs_spv || ensure_module(*j.vs_module), fs_ok = !j.fs_module || fs_spv || ensure_module(*j.fs_module);
     const int64_t t1 = hos_now_ns();
     st_module_ns += t1 - t0;
     struct Timer {
@@ -289,8 +297,12 @@ void compile(PipelineJob& j) {
             const int64_t now = hos_now_ns();
             if (now - last > 5000000000LL) {
                 last = now;
-                hos_log("rx: pipeline compilers: %lld pipelines, modules %.0f ms, pipelines %.0f ms (total so far)",
-                        (long long)st_pipelines_made.load(), st_module_ns.load() / 1e6, st_pipeline_ns.load() / 1e6);
+                int64_t spv_hits = 0, spv_kept = 0;
+                spirv_stats(&spv_hits, &spv_kept);
+                hos_log("rx: pipeline compilers: %lld pipelines, modules %.0f ms, pipelines %.0f ms (total so far); "
+                        "stages from the SPIR-V cache %lld, newly kept %lld",
+                        (long long)st_pipelines_made.load(), st_module_ns.load() / 1e6, st_pipeline_ns.load() / 1e6,
+                        (long long)spv_hits, (long long)spv_kept);
             }
         }
     } timer{t1};
@@ -299,8 +311,8 @@ void compile(PipelineJob& j) {
         j.target->state = 2;
         return;
     }
-    j.vs = j.vs_module->module;
-    j.fs = j.fs_module ? j.fs_module->module : nullptr;
+    j.vs = vs_spv ? vs_spv : j.vs_module->module;
+    j.fs = fs_spv ? fs_spv : j.fs_module ? j.fs_module->module : nullptr;
     for (size_t i = 0; i < j.buffers.size(); i++) {
         j.buffers[i].attributes = j.attributes[i].data();
         j.buffers[i].attributeCount = j.attributes[i].size();
@@ -354,8 +366,26 @@ void compile(PipelineJob& j) {
     return;
 #endif
     scope_push();
-    j.target->pipeline = wgpuDeviceCreateRenderPipeline(dev.device, &d);
-    const std::string error = scope_pop();
+    SpirvCapture captured;
+    const bool capture = spirv && (!vs_spv || (j.fs && !fs_spv));   // (a stage from WGSL: its SPIR-V is kept)
+    j.target->pipeline = capture ? spirv_create_pipeline(&d, captured) : wgpuDeviceCreateRenderPipeline(dev.device, &d);
+    std::string error = scope_pop();
+    if (capture) spirv_keep(captured, error.empty(), vs_spv ? 0 : vs_text, j.packed[0], fs_spv ? 0 : fs_text, j.packed[1]);
+    if (!error.empty() && (vs_spv || fs_spv)) {   // (the kept SPIR-V did not take: the WGSL, as before)
+        static std::atomic<int> logged_spv;
+        if (logged_spv++ < 10) hos_log("rx: a pipeline from the SPIR-V cache gave an error (made from the WGSL): %s", error.c_str());
+        if (vs_spv) spirv_stage_bad(vs_text, j.packed[0], 0);
+        if (fs_spv) spirv_stage_bad(fs_text, j.packed[1], 1);
+        if (j.target->pipeline) wgpuRenderPipelineRelease(j.target->pipeline);
+        j.target->pipeline = nullptr;
+        if (ensure_module(*j.vs_module) && (!j.fs_module || ensure_module(*j.fs_module))) {
+            d.vertex.module = j.vs_module->module;
+            if (j.fs_module) fs.module = j.fs_module->module;
+            scope_push();
+            j.target->pipeline = wgpuDeviceCreateRenderPipeline(dev.device, &d);
+            error = scope_pop();
+        }
+    }
     wgpuPipelineLayoutRelease(j.layout);
     if (!error.empty()) {
         static std::atomic<int> logged;
@@ -1656,6 +1686,8 @@ Pipeline* get_pipeline(const std::vector<uint32_t>& key, ProgramPair& prog, cons
     }
     job->vs_module = &prog.vs;
     job->fs_module = prog.has_fs ? &prog.fs : nullptr;
+    job->packed[0] = vs_res.layout;
+    if (fs_res) job->packed[1] = fs_res->layout;
     job->buffers = vi.layouts;
     job->attributes.assign(vi.attributes.begin(), vi.attributes.begin() + (ptrdiff_t)vi.nattr);
     job->targets = targets;
@@ -1721,6 +1753,8 @@ bool prewarm_pipeline(const PipelineDesc& d, ShaderModule* vs, ShaderModule* fs)
     job->layout = wgpuDeviceCreatePipelineLayout(dev.device, &pld);
     job->vs_module = vs;
     job->fs_module = fs;
+    job->packed[0] = d.layout[0];
+    if (d.nlayouts > 1) job->packed[1] = d.layout[1];
     job->buffers = d.buffers;
     job->attributes = d.attributes;
     job->targets = d.targets;
