@@ -413,10 +413,18 @@ class Nsp:
         self.f.seek(off)
         return self.f.read(size)
 
-    def program(self):
+    def program(self, base=None):
+        """The program NCA. A gamecard can hold more than one (the game and an update put on the cartridge): then
+        the base game's (program ID ending in 000, no patch RomFS) unless base=False, else the largest."""
         progs = [n for n in self.ncas.values() if n.content_type == 0]
-        if len(progs) != 1:
-            raise ValueError(f"expected one program NCA, found {len(progs)}")
+        if not progs:
+            raise ValueError("no program NCA")
+        if len(progs) > 1:
+            def patch(n):
+                return any(sec and sec["crypt"] == 4 for sec in n.sections)
+            pick = [n for n in progs if (base is not False) == ((n.program_id & 0xFFF) == 0 and not patch(n))]
+            progs = sorted(pick or progs, key=lambda n: -n.size)
+            print(f"  ({len(self.ncas)} NCAs; program {progs[0].program_id:016x} used)", flush=True)
         return progs[0]
 
 
@@ -489,7 +497,7 @@ def main():
             copy_out(lambda o, n, off=off: pfs.read(off + o, n), size, os.path.join(out, name))
             print(f"  {name:<12} {size:>12,}")
     elif cmd in ("romfs-list", "romfs", "romfs-verify"):
-        rfs, ivfc = romfs_source(prog, update.program() if update else None)
+        rfs, ivfc = romfs_source(prog, update.program(base=False) if update else None)
         if cmd == "romfs-verify":
             n6 = ivfc.blocks(5)
             print(f"RomFS level: {n6:,} blocks of {1 << ivfc.levels[5][2]:,} bytes; checking "
