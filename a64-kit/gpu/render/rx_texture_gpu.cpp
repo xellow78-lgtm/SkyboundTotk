@@ -2,18 +2,22 @@
 // - ASTC: a compute shader unswizzles and decodes every block of a mip level straight into the RGBA8 texture. The CPU
 //   decoder took 6 s of thread time (0.7-1.2 s of the frame that first drew it) for TOTK's 1024x1024 x121 terrain
 //   material array; the GPU takes milliseconds. RX_ASTC_CPU=1: the CPU decoder as before.
+// - ASTC to BC7: sRGB ASTC textures decoded as above into a scratch RGBA8 texture, a chunk of layers at a time, then
+//   encoded to BC7 blocks (rx_bc7_gpu.wgsl.h) copied into the real texture: 8 bits a texel in video memory, not 32.
 // - Other block-linear textures of 4-16 byte blocks (BC, RGBA8, RGBA16F...): a compute shader unswizzles them into a
 //   linear buffer, copied to the texture. The CPU unswizzle of TOTK's 3686x3686 and 7373x3686 BC maps was ~150 ms of
 //   the boot frame. RX_UNSWIZZLE_CPU=1: the CPU as before.
 //
 // The shader is a WGSL port of astc_decoder.comp from yuzu/suyu/Eden (GPL-3.0-or-later, like the rest of the suyu
 // code in a64-kit: gpu/third_party/suyu), itself based on the FasTC decoder (Apache-2.0).
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "rx_bc7_gpu.wgsl.h"
 #include "rx_internal.h"
 
 namespace rx {
@@ -1192,10 +1196,10 @@ struct Pass {
 struct Gpu {
     std::mutex mu;
     bool tried = false;
-    Pass astc, unswizzle;
+    Pass astc, unswizzle, bc7;
 } gpu;
 
-bool make_pass(Pass& p, const char* wgsl, bool texture_out, const char* what) {
+bool make_pass(Pass& p, const char* wgsl, bool texture_out, const char* what, bool texture_in = false) {
     WGPUShaderSourceWGSL src{};
     src.chain.sType = WGPUSType_ShaderSourceWGSL;
     src.code = WGPUStringView{wgsl, std::strlen(wgsl)};
@@ -1206,7 +1210,12 @@ bool make_pass(Pass& p, const char* wgsl, bool texture_out, const char* what) {
     WGPUBindGroupLayoutEntry e[3]{};
     e[0].binding = 0;
     e[0].visibility = WGPUShaderStage_Compute;
-    e[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    if (texture_in) {   // (the BC7 encoder: the decoded texels, sampled with textureLoad)
+        e[0].texture.sampleType = WGPUTextureSampleType_Float;
+        e[0].texture.viewDimension = WGPUTextureViewDimension_2DArray;
+    } else {
+        e[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    }
     e[1].binding = 1;
     e[1].visibility = WGPUShaderStage_Compute;
     if (texture_out) {
@@ -1246,6 +1255,9 @@ void init_locked() {
     gpu.tried = true;
     if (make_pass(gpu.astc, kAstcWgsl, true, "ASTC decoder")) hos_log("rx: ASTC textures are decoded on the GPU");
     make_pass(gpu.unswizzle, kUnswizzleWgsl, false, "unswizzle");
+    if (dev.bc && gpu.astc.pipeline && make_pass(gpu.bc7, kBc7Wgsl, false, "BC7 encoder", true))
+        hos_log("rx: decoded sRGB ASTC textures are encoded to BC7 on the GPU (8 bits a texel instead of 32; "
+                "RX_ASTC_BC=0: none, 2: linear ones too)");
 }
 
 bool pass_on(const Pass& p, const char* off_switch) {
@@ -1319,6 +1331,10 @@ void submit(WGPUCommandEncoder enc) {
 } // namespace
 
 bool astc_gpu_on() { return pass_on(gpu.astc, "RX_ASTC_CPU"); }
+bool astc_bc_gpu_on() {
+    static const bool off = getenv("RX_ASTC_BC") && *getenv("RX_ASTC_BC") == '0';
+    return !off && astc_gpu_on() && pass_on(gpu.bc7, "RX_ASTC_CPU");
+}
 bool unswizzle_gpu_on() { return pass_on(gpu.unswizzle, "RX_UNSWIZZLE_CPU"); }
 
 bool astc_gpu_decode(WGPUTexture tex, const uint8_t* src, uint64_t total, const BlockLinearLevel* levels, int nlevels,
@@ -1366,6 +1382,121 @@ bool astc_gpu_decode(WGPUTexture tex, const uint8_t* src, uint64_t total, const 
     wgpuBufferRelease(data);
     count("tex_astc_gpu");
     return true;
+}
+
+bool astc_gpu_decode_bc7(WGPUTexture tex, const uint8_t* src, uint64_t total, const BlockLinearLevel* levels,
+                         int nlevels, uint32_t layers, uint32_t layer_stride, uint32_t block_w, uint32_t block_h) {
+    if (!astc_bc_gpu_on() || !tex || !src || !total || nlevels < 1 || !layers) return false;
+    const uint32_t width = wgpuTextureGetWidth(tex), height = wgpuTextureGetHeight(tex);
+    if (!width || !height || (width & 3) || (height & 3)) return false;
+    // the layers in chunks of at most ~64 MB of RGBA8 (all levels): the scratch texture they are decoded into
+    const uint64_t layer_rgba = (uint64_t)width * height * 4 * 4 / 3 + 1;
+    const uint32_t chunk = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(layers, (64ull << 20) / layer_rgba));
+    WGPUTextureDescriptor sd{};
+    sd.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
+    sd.dimension = WGPUTextureDimension_2D;
+    sd.size = {width, height, chunk};
+    sd.format = WGPUTextureFormat_RGBA8Unorm;
+    sd.mipLevelCount = (uint32_t)nlevels;
+    sd.sampleCount = 1;
+    WGPUTexture scratch = wgpuDeviceCreateTexture(dev.device, &sd);
+    if (!scratch) return false;
+    // per level: the blocks, each row padded to 256 bytes, the chunk's layers one after another in one output buffer
+    struct Params {
+        uint32_t width, height, bx, by, row_blocks, layer_blocks, pad0, pad1;
+    };
+    std::vector<Params> params;
+    std::vector<uint64_t> offsets;
+    uint64_t out_size = 0;
+    for (int l = 0; l < nlevels; l++) {
+        const uint32_t w = std::max(1u, width >> l), h = std::max(1u, height >> l);
+        const uint32_t bx = (w + 3) / 4, by = (h + 3) / 4, row_blocks = (bx + 15) & ~15u;
+        params.push_back({w, h, bx, by, row_blocks, row_blocks * by, 0, 0});
+        offsets.push_back(out_size);
+        out_size += (uint64_t)row_blocks * 16 * by * chunk;
+    }
+    if (out_size > dev.limits.maxStorageBufferBindingSize) {
+        wgpuTextureRelease(scratch);
+        return false;
+    }
+    WGPUBufferDescriptor bd{};
+    bd.size = out_size;
+    bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
+    WGPUBuffer out = wgpuDeviceCreateBuffer(dev.device, &bd);
+    WGPUBuffer ubuf = uniforms(params);
+    std::vector<WGPUTextureView> views;
+    for (int l = 0; l < nlevels; l++) {
+        WGPUTextureViewDescriptor vd{};
+        vd.format = WGPUTextureFormat_RGBA8Unorm;
+        vd.dimension = WGPUTextureViewDimension_2DArray;
+        vd.baseMipLevel = (uint32_t)l;
+        vd.mipLevelCount = 1;
+        vd.baseArrayLayer = 0;
+        vd.arrayLayerCount = chunk;
+        vd.aspect = WGPUTextureAspect_All;
+        vd.usage = WGPUTextureUsage_TextureBinding;
+        views.push_back(wgpuTextureCreateView(scratch, &vd));
+    }
+    std::vector<WGPUBindGroup> groups;
+    for (int l = 0; l < nlevels; l++) {
+        WGPUBindGroupEntry ge[3]{};
+        ge[0].binding = 0;
+        ge[0].textureView = views[l];
+        ge[1].binding = 1;
+        ge[1].buffer = out;
+        ge[1].offset = offsets[l];
+        ge[1].size = (uint64_t)params[l].layer_blocks * 16 * chunk;
+        ge[2].binding = 2;
+        ge[2].buffer = ubuf;
+        ge[2].offset = 256ull * l;
+        ge[2].size = sizeof(Params);
+        WGPUBindGroupDescriptor gd{};
+        gd.layout = gpu.bc7.bgl;
+        gd.entryCount = 3;
+        gd.entries = ge;
+        groups.push_back(wgpuDeviceCreateBindGroup(dev.device, &gd));
+    }
+    bool ok = true;
+    for (uint32_t layer0 = 0; ok && layer0 < layers; layer0 += chunk) {
+        const uint32_t n = std::min(chunk, layers - layer0);
+        const uint64_t from = (uint64_t)layer0 * layer_stride;
+        if (from >= total) break;
+        const uint64_t bytes = std::min<uint64_t>(total - from, (uint64_t)n * layer_stride);
+        // the ASTC blocks into the scratch texture (its own submit; the queue keeps the order)
+        ok = astc_gpu_decode(scratch, src + from, bytes, levels, nlevels, n, layer_stride, block_w, block_h);
+        if (!ok) break;
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
+        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
+        wgpuComputePassEncoderSetPipeline(pass, gpu.bc7.pipeline);
+        for (int l = 0; l < nlevels; l++) {
+            wgpuComputePassEncoderSetBindGroup(pass, 0, groups[l], 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, (params[l].bx + 7) / 8, (params[l].by + 7) / 8, n);
+        }
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+        for (int l = 0; l < nlevels; l++) {
+            WGPUTexelCopyBufferInfo bsrc{};
+            bsrc.buffer = out;
+            bsrc.layout.offset = offsets[l];
+            bsrc.layout.bytesPerRow = params[l].row_blocks * 16;
+            bsrc.layout.rowsPerImage = params[l].by;
+            WGPUTexelCopyTextureInfo to{};
+            to.texture = tex;
+            to.mipLevel = (uint32_t)l;
+            to.origin = {0, 0, layer0};
+            to.aspect = WGPUTextureAspect_All;
+            const WGPUExtent3D extent{params[l].bx * 4, params[l].by * 4, n};
+            wgpuCommandEncoderCopyBufferToTexture(enc, &bsrc, &to, &extent);
+        }
+        submit(enc);
+    }
+    for (WGPUBindGroup g : groups) wgpuBindGroupRelease(g);
+    for (WGPUTextureView v : views) wgpuTextureViewRelease(v);
+    wgpuBufferRelease(ubuf);
+    wgpuBufferRelease(out);
+    wgpuTextureRelease(scratch);
+    if (ok) count("tex_astc_bc7_gpu");
+    return ok;
 }
 
 bool unswizzle_gpu(WGPUTexture tex, const uint8_t* src, uint64_t total, const BlockLinearLevel* levels, int nlevels,

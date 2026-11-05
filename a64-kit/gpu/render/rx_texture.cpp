@@ -560,17 +560,8 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
                              info.dimension == WGPUTextureDimension_3D));
     const bool decode_any_compressed = decode_bc;
     static const bool astc_bc7 = env_flag("RX_ASTC_BC7");
-    const bool to_bc7 = astc_bc7 && dev.bc && cv == Convert::Astc && info.dimension == WGPUTextureDimension_2D &&
+    bool to_bc7 = astc_bc7 && dev.bc && cv == Convert::Astc && info.dimension == WGPUTextureDimension_2D &&
                         !(info.size.width & 3) && !(info.size.height & 3);
-    const WGPUTextureFormat format = decode_any_compressed
-                                         ? (VideoCore::Surface::IsPixelFormatSRGB(info.format)
-                                                ? WGPUTextureFormat_RGBA8UnormSrgb
-                                                : WGPUTextureFormat_RGBA8Unorm)
-                                     : to_bc7 ? (VideoCore::Surface::IsPixelFormatSRGB(info.format)
-                                                     ? WGPUTextureFormat_BC7RGBAUnormSrgb
-                                                     : WGPUTextureFormat_BC7RGBAUnorm)
-                                              : guest_format;
-
     const uint64_t total = guest_size(info);
     // made by the GPU from the guest's bytes as they are (rx_texture_gpu.cpp), 2D (arrays) in block-linear layout:
     // - ASTC decoded there: the texture is RGBA8Unorm, as storage textures cannot be sRGB, with the sRGB encoding as
@@ -578,7 +569,26 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
     // - other textures uploaded as they are (BC, 4-16 byte texels), from 256 KB: unswizzled there
     const bool gpu_layout_ok = !gpu_force_cpu && !deferring && !info.linear && info.dimension == WGPUTextureDimension_2D &&
                                info.size.depth == 1 && total <= dev.limits.maxStorageBufferBindingSize;
-    const bool astc_gpu = gpu_layout_ok && cv == Convert::Astc && !to_bc7 && astc_gpu_on();
+    // - ASTC decoded there and encoded again to BC7 (rx_bc7_gpu.wgsl.h): a quarter of RGBA8's video memory. 2D, sizes a
+    //   multiple of 4 (BC7's blocks), sRGB (colour) textures only: the encoder fits each block's texels to one line, and
+    //   a bumpy normal map's X and Y vary independently (measured on a synthetic one: mean 4-9 degrees off, worst over
+    //   30), so linear ones (normals, masks) stay RGBA8. RX_ASTC_BC=0: none; RX_ASTC_BC=2: linear ones too;
+    //   RX_ASTC_BC_ARRAYS=0: single textures only (arrays, the terrain's materials among them, stay RGBA8)
+    static const bool bc_arrays = !(getenv("RX_ASTC_BC_ARRAYS") && *getenv("RX_ASTC_BC_ARRAYS") == '0');
+    static const bool bc_linear = getenv("RX_ASTC_BC") && *getenv("RX_ASTC_BC") == '2';
+    const bool astc_bc = gpu_layout_ok && cv == Convert::Astc && !to_bc7 && dev.bc && !(info.size.width & 3) &&
+                         !(info.size.height & 3) && (bc_arrays || info.layers == 1) &&
+                         (bc_linear || VideoCore::Surface::IsPixelFormatSRGB(info.format)) && astc_bc_gpu_on();
+
+    const WGPUTextureFormat format = decode_any_compressed
+                                         ? (VideoCore::Surface::IsPixelFormatSRGB(info.format)
+                                                ? WGPUTextureFormat_RGBA8UnormSrgb
+                                                : WGPUTextureFormat_RGBA8Unorm)
+                                     : (to_bc7 || astc_bc) ? (VideoCore::Surface::IsPixelFormatSRGB(info.format)
+                                                     ? WGPUTextureFormat_BC7RGBAUnormSrgb
+                                                     : WGPUTextureFormat_BC7RGBAUnorm)
+                                              : guest_format;
+    const bool astc_gpu = gpu_layout_ok && cv == Convert::Astc && !to_bc7 && !astc_bc && astc_gpu_on();
     const bool swizzle_gpu = gpu_layout_ok && cv == Convert::None && !decode_any_compressed && !to_bc7 &&
                              (bpp == 4 || bpp == 8 || bpp == 16) && !is_depth_format(format) && total >= (256u << 10) &&
                              unswizzle_gpu_on();
@@ -647,7 +657,7 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
     size_t level_offset = 0;
     const u32 copy_layers = info.dimension == WGPUTextureDimension_3D ? 1 : info.layers;
     bool gpu_decoded = false;
-    if (astc_gpu || swizzle_gpu) {
+    if (astc_gpu || swizzle_gpu || astc_bc) {
         std::vector<BlockLinearLevel> lv;
         size_t off = 0;
         for (u32 level = 0; level < info.levels; level++) {
@@ -659,18 +669,21 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
             off += CalculateLevelSize(li, level);
         }
         const int64_t t0 = hos_now_ns();
-        gpu_decoded = astc_gpu ? astc_gpu_decode(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers,
+        gpu_decoded = astc_bc    ? astc_gpu_decode_bc7(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers,
+                                                       layer_stride, tile.width, tile.height)
+                      : astc_gpu ? astc_gpu_decode(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers,
                                                  layer_stride, tile.width, tile.height)
                                : unswizzle_gpu(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers, layer_stride,
                                                li.bpp_log2, tile.width, tile.height);
         if (static const bool log_inplace = env_flag("RX_LOG_INPLACE"); log_inplace && total > (1u << 20))
-            hos_log("rx: %s %ux%u x%u levels %u format %d on the GPU: %.2f ms, %llu KB", astc_gpu ? "ASTC" : "unswizzle",
+            hos_log("rx: %s %ux%u x%u levels %u format %d on the GPU: %.2f ms, %llu KB",
+                    astc_bc ? "ASTC to BC7" : astc_gpu ? "ASTC" : "unswizzle",
                     info.size.width, info.size.height, copy_layers, info.levels, (int)info.format,
                     (hos_now_ns() - t0) / 1e6, (unsigned long long)(total >> 10));
         // RX_GPU_VERIFY=1 (or RX_ASTC_VERIFY=1): each texture also made by the CPU, and the two compared (level by
         // level, first and last layer; ASTC within 1 of 255: the GPU rounds where the CPU truncates)
         static const bool verify = env_flag("RX_GPU_VERIFY") || env_flag("RX_ASTC_VERIFY");
-        if (verify && gpu_decoded) {
+        if (verify && gpu_decoded && !astc_bc) {   // (BC7 is lossy: no CPU twin to compare with)
             gpu_force_cpu = true;
             const auto cpu = decode(tic, info, va);
             gpu_force_cpu = false;
@@ -712,6 +725,20 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
             }
         }
         if (gpu_decoded && !rx_side_thread) spike.upload_bytes += (int64_t)total;
+        if (astc_bc) {
+            // (the texture is BC7 either way: if the GPU could not, the CPU decodes and encodes it as RX_ASTC_BC7 does)
+            if (!gpu_decoded) to_bc7 = true;
+            static std::atomic<int64_t> n, saved;
+            uint64_t texels = 0;
+            for (u32 level = 0; level < info.levels; level++) {
+                const Extent3D ls = AdjustMipSize(info.size, level);
+                texels += (uint64_t)((ls.width + 3) & ~3u) * ((ls.height + 3) & ~3u);
+            }
+            const int64_t k = ++n, mb = (saved += (int64_t)(texels * copy_layers * 3)) >> 20;
+            if (k <= 3 || (k & (k - 1)) == 0)
+                hos_log("rx: ASTC to BC7 on the GPU: %lld textures, %lld MB of video memory saved against RGBA8%s",
+                        (long long)k, (long long)mb, gpu_decoded ? "" : " (this one by the CPU)");
+        }
     }
     for (u32 level = 0; !gpu_decoded && level < info.levels; level++) {
         const Extent3D level_size = AdjustMipSize(info.size, level);

@@ -632,6 +632,12 @@ bool astc_gpu_on();
 /// at once (any thread). False: nothing was done (the CPU decodes it).
 bool astc_gpu_decode(WGPUTexture tex, const uint8_t* src, uint64_t total, const BlockLinearLevel* levels, int nlevels,
                      uint32_t layers, uint32_t layer_stride, uint32_t block_w, uint32_t block_h);
+/// Whether decoded ASTC textures are encoded again to BC7 on the GPU (RX_ASTC_BC=0: kept RGBA8; needs BC textures)
+bool astc_bc_gpu_on();
+/// The same decode into tex, a BC7 texture (no storage binding; its size a multiple of 4): each chunk of layers is
+/// decoded into an RGBA8 scratch texture, each level encoded to BC7 blocks (rx_bc7_gpu.wgsl.h) and copied in.
+bool astc_gpu_decode_bc7(WGPUTexture tex, const uint8_t* src, uint64_t total, const BlockLinearLevel* levels,
+                         int nlevels, uint32_t layers, uint32_t layer_stride, uint32_t block_w, uint32_t block_h);
 /// Whether other block-linear textures are unswizzled by the GPU (native; RX_UNSWIZZLE_CPU=1: by the CPU)
 bool unswizzle_gpu_on();
 /// Unswizzles every level of a 2D (array) texture of 4, 8 or 16 byte blocks (bpp_log2 2-4) into tex, as it is
