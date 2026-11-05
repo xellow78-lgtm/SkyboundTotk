@@ -85,6 +85,8 @@ def download(url, dst, label, lo=0.0, hi=1.0, sha256=None):
     """url into dst (through dst.part: a stopped download starts again), the step's progress from lo to hi"""
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.is_file() and sha256 and hashlib.sha256(dst.read_bytes()).hexdigest().lower() == sha256.lower():
+        return dst   # (already here from a stopped build)
     part = dst.with_name(dst.name + ".part")
     req = urllib.request.Request(url, headers={"User-Agent": "SkyboundTOTK-launcher"})
     h = hashlib.sha256()
@@ -259,7 +261,9 @@ def install_msvc(dest):
                      0.85 + 0.08 * (k + 1) / len(cabs), pay.get("sha256"))
     for k, f in enumerate(got):
         progress(0.93 + 0.05 * k / len(got), "Windows SDK: unpacking %s" % f.name[:40])
-        r = subprocess.run(["msiexec.exe", "/a", str(f), "/quiet", "/qn", "TARGETDIR=%s" % new.resolve()])
+        # (one command line, as msiexec reads it: a property's value is quoted after the =, TARGETDIR="<dir>"; with the
+        # whole argument quoted, as a list makes it, a folder with spaces was refused: 1639, invalid command line)
+        r = subprocess.run('msiexec.exe /a "%s" /quiet /qn TARGETDIR="%s"' % (f, new.resolve()))
         if r.returncode:
             raise Failed("msiexec could not unpack %s (exit code %d)" % (f.name, r.returncode))
         (new / f.name).unlink(missing_ok=True)   # (the administrative install leaves a copy of the MSI)
