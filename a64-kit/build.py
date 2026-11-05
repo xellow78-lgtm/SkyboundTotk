@@ -791,6 +791,16 @@ def cmd_native(a):
                    ["-g", "-o", exe, "@" + rsp, "-Wl,/STACK:268435456", "-Wl,/SUBSYSTEM:CONSOLE"] + order_flags + libs,
                    check=True)
     print("linked %s (%.0f MB) in %.0fs" % (exe, os.path.getsize(exe) / 2 ** 20, time.time() - t0))
+    # the launcher (launcher/launcher.cpp: build from your game files, settings, Play), when its source changed
+    launcher = os.path.join(HERE, "..", "launcher", "launcher.cpp")
+    lexe = os.path.join(nat, "SkyboundTOTK Launcher.exe")
+    if os.name == "nt" and os.path.exists(launcher) and (not os.path.exists(lexe) or
+                                                         os.path.getmtime(launcher) > os.path.getmtime(lexe)):
+        cxx = toolchain.need(toolchain.find("clang++"))
+        r = subprocess.run([cxx] + toolchain.native_target() + toolchain.native_link() +
+                           ["-std=c++20", "-O2", "-o", lexe, launcher, "-Wl,/SUBSYSTEM:WINDOWS", "-luser32", "-lgdi32",
+                            "-lgdiplus", "-lole32", "-lshell32", "-ldwmapi", "-luuid"])
+        print("launcher: %s" % (lexe if r.returncode == 0 else "not built (the game is: its error is above)"))
 
 
 def cmd_web(a):

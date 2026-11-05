@@ -47,6 +47,16 @@ The first lift and compile can take a long time. The builder reuses a completed 
 
 The package normally creates its own `user/` directory beside the executable; it does not automatically use the saves from another installation. Native renderer pipeline cache data is kept in `rxcache/` beside the executable. The executable also accepts an image path and `--romfs` / `--user` overrides for advanced use, but they are not needed for normal launching.
 
+### The launcher
+
+After the first build, `dist/SkyboundTOTK/SkyboundTOTK Launcher.exe` does the rest from one window:
+
+- **Build** takes your game files, either the extracted ExeFS and RomFS folders (the RomFS is linked, not copied) or the base game and 1.4.3 update `.nsp` files with your own `prod.keys`. It then runs the build steps with their progress: game files, source changes, build tools, the optional DLSS library, translating the game's code, compiling and installing. Steps that are already done are skipped, and a stopped build continues where it left off. The build itself is `launcher/pipeline.py`, and its log is `launcher_build.log` in the game folder.
+- **Settings** sets the upscaler (off, FSR 2 or DLSS), FSR 2 sharpness, fullscreen and window size. It also changes the game's own settings that F1 changes (3D resolution, anisotropic filtering, NVIDIA Reflex, button icons, the mouse), the mods folder and the log file. The launcher's own settings are in `launcher.ini` next to it. `env.NAME = value` lines there add environment variables for the game.
+- **Play** starts the game with those settings and writes what it prints to the log file.
+
+The launcher needs the same tools as `build.bat` (Python, Visual Studio's C++ tools, clang from emsdk). Python packages it lacks are installed. It does not install compilers.
+
 ### Build and launch troubleshooting
 
 - **Python or `lz4` missing:** install them for the Python on PATH, then reopen the tools prompt. Run `python -m pip install lz4` with that same Python.
