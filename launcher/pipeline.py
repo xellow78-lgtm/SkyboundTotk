@@ -684,6 +684,7 @@ def main():
     if a.check:
         return check(a)
     if a.log:
+        Path(a.log).parent.mkdir(parents=True, exist_ok=True)   # (a first build: no dist folder yet)
         LOG = open(a.log, "w", encoding="utf-8")
     if a.nsp and not a.update:
         say("@@end fail The 1.4.3 update's .nsp is needed with the base game's")

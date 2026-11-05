@@ -1264,6 +1264,7 @@ void start_build(bool fetch = false) {
     if (app.cfg.geti(L"dlss", 0)) args += L" --dlss";
     if (app.cfg.geti(L"msvc_license", 0)) args += L" --msvc-license";
     if (fetch) args += L" --fetch " + quote(update_repo()) + L" --branch " + quote(update_branch());
+    CreateDirectoryW(parent(app.dist).c_str(), nullptr);   // (<source>\\dist first: a first build has neither)
     CreateDirectoryW(app.dist.c_str(), nullptr);
     add(L"--log", app.dist + L"\\launcher_build.log");
 
