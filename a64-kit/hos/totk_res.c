@@ -10,7 +10,10 @@
 
    The setting: output_resolution in input.ini (F1 > Graphics, the launcher), at the start: 0 1920x1080 (the game's
    own), 1 the display's (the largest 16:9 that fits the main monitor), 2 2560x1440, 3 3840x2160. HOS_OUTPUT_RES=<w>x<h>
-   overrides it. Shapes other than 16:9 wait for the ultrawide work (the camera and the HUD's layouts).
+   overrides it. With another aspect ratio (aspect_ratio, totk_ultrawide.c) the output takes that shape: 16:10 keeps
+   the width (2560x1440 -> 2560x1600), a wider one the height (-> 3413x1440 for 21:9), the display's own is the display's
+   size (the largest of the shape that fits it). The scene then takes the output's shape too (the scene splice: 1.4.3
+   makes it 1600x900 times output width / 1920 otherwise, a 16:9 scene in a 16:10 frame).
 
    TOTK 1.4.3:
    - the swapchain size nnMain builds (0x438_00000780 in x8, f_08bdb440) and the display configuration's canvas (+0x10)
@@ -45,7 +48,8 @@
 unsigned hos_out_w = BASE_W, hos_out_h = BASE_H;   /* the game's output (nn_vi.c, the renderer) */
 static struct {
     unsigned sw, sh;    /* the scene */
-    int scene_set;      /* the scene splice: Native */
+    int scene_set;      /* the scene splice: Native, or an output that is not 16:9 */
+    int native;         /* Native: the scene is the whole output */
     int on;             /* the splices are on: the heap table was grown (or did not need to be) */
     char heapdef[MAX_PATH];
 } R;
@@ -56,8 +60,8 @@ int hos_mods_romfs(const char *rel, char *out, size_t cap);
 int hos_run_tool(const char *cwd, const char *args, const char *log_name);   /* buttons.c */
 
 /* The scene's share of the output that the 3D resolution modes are fractions of (totk_drs.c): 5/6, or 1 for Native */
-float hos_res_scene_share(void) { return R.on && R.scene_set ? 1.0f : 5.0f / 6.0f; }
-int hos_res_native(void) { return R.on && R.scene_set; }
+float hos_res_scene_share(void) { return R.on && R.native ? 1.0f : 5.0f / 6.0f; }
+int hos_res_native(void) { return R.on && R.native; }
 
 static uint64_t heap_extra_kib(void) {
     const double grow = fmax(0.0, (double)hos_out_w * hos_out_h / (BASE_W * BASE_H) - 1.0) +
@@ -89,12 +93,34 @@ static void decide(void) {
             hos_log("res: the display is %lux%lu: output %ux%u", dm.dmPelsWidth, dm.dmPelsHeight, w & ~1u, h & ~1u);
         }
     }
-    if (w * 9 != h * 16 && abs((int)(w * 9) - (int)(h * 16)) > (int)h / 8)
-        hos_log("res: %ux%u is not 16:9: the view is stretched until the ultrawide support (the camera, the HUD)", w, h);
+    /* another shape (totk_ultrawide.c): the output follows it */
+    double hos_aspect_wanted(void);
+    const double a = hos_aspect_wanted();
+    if (a > 0 && !(e && *e)) {
+        unsigned dw = 0, dh = 0;
+        if (b.output_res == 1) {   /* the display's: the largest of the shape that fits it */
+            DEVMODEA dm = {0};
+            dm.dmSize = sizeof dm;
+            if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) dw = dm.dmPelsWidth, dh = dm.dmPelsHeight;
+        }
+        if (dw >= 1280 && dh >= 720) {
+            if (dw > dh * a) w = (unsigned)lround(dh * a), h = dh;
+            else w = dw, h = (unsigned)lround(dw / a);
+        } else if (a < 16.0 / 9.0) {
+            h = (unsigned)lround(w / a);   /* (taller: the width stays) */
+        } else {
+            w = (unsigned)lround(h * a);   /* (wider: the height stays) */
+        }
+        if (w > 7680) w = 7680, h = (unsigned)lround(7680 / a);
+        if (h > 4320) h = 4320, w = (unsigned)lround(4320 * a);
+        hos_log("res: aspect %.4f: output %ux%u", a, w & ~1u, h & ~1u);
+    }
     hos_out_w = w & ~1u, hos_out_h = h & ~1u;
-    /* the scene: the game's own 5/6 of the output, or the whole output for Native (DLAA) */
-    R.scene_set = b.render_mode == 5;
-    const double k = R.scene_set ? 1.0 : 5.0 / 6.0;
+    /* the scene: the game's own 5/6 of the output, or the whole output for Native (DLAA); set by the splice for Native
+       and for any shape but 16:9 (the game's own sizing would keep it 16:9) */
+    R.native = b.render_mode == 5;
+    R.scene_set = R.native || abs((int)(hos_out_w * 9) - (int)(hos_out_h * 16)) > (int)hos_out_h / 50;
+    const double k = R.native ? 1.0 : 5.0 / 6.0;
     double sw = hos_out_w * k, sh = hos_out_h * k;
     const double fit = fmin(1.0, fmin(SCENE_MAX / sw, SCENE_MAX / sh));
     R.sw = (unsigned)(sw * fit + 0.5), R.sh = (unsigned)(sh * fit + 0.5);
@@ -138,13 +164,13 @@ void hos_res_init(void) {
     }
     const uint64_t extra = heap_extra_kib();
     if (extra && !make_heapdef(extra)) {
-        hos_out_w = BASE_W, hos_out_h = BASE_H, R.scene_set = 0;
+        hos_out_w = BASE_W, hos_out_h = BASE_H, R.scene_set = 0, R.native = 0;
         return;
     }
     hos_total_memory += ((extra << 10) + 0x1fffff) & ~0x1fffffull;
     R.on = 1;
     hos_log("res: output %ux%u, scene %ux%u%s; texture heap +%llu MB, game memory %llu MB", hos_out_w, hos_out_h, R.sw,
-            R.sh, R.scene_set ? " (Native)" : " (the game's 5/6 of the output)", (unsigned long long)(extra >> 10),
+            R.sh, R.native ? " (Native)" : " (5/6 of the output)", (unsigned long long)(extra >> 10),
             (unsigned long long)(hos_total_memory >> 20));
 #else
     hos_log("res: a bigger resolution needs TOTK 1.4.3: the game's own");
@@ -186,14 +212,14 @@ SPLICE_AFTER(0x083dc9a8, "L_083dcb28:;") {
     static int logged;
     if (!logged++) hos_log("res: the game's canvas is %ux%u", hos_out_w, hos_out_h);
 }
-/* the scene's size, as the renderer (x19) stores it (+0xcc4, +0xcc8; main+0x585e48): Native only; 1.4.3 multiplies it
-   by output width / 1920 afterwards */
+/* the scene's size, as the renderer (x19) stores it (+0xcc4, +0xcc8; main+0x585e48): for Native and for a shape other
+   than 16:9; 1.4.3 multiplies it by output width / 1920 afterwards */
 SPLICE_AFTER(0x08585da0, "recomp_store32(c,(c->x[19]+3272ULL),_v);") {
     if (!R.on || !R.scene_set) return;
     const float k = (float)hos_out_w / BASE_W;
     putf(c->x[19] + 0xcc4, R.sw / k);
     putf(c->x[19] + 0xcc8, R.sh / k);
     static int logged;
-    if (!logged++) hos_log("res: the scene is %ux%u (Native)", R.sw, R.sh);
+    if (!logged++) hos_log("res: the scene is %ux%u%s", R.sw, R.sh, R.native ? " (Native)" : "");
 }
 #endif

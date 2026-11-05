@@ -1,9 +1,9 @@
 /* TOTK at other aspect ratios: aspect_ratio in input.ini (F1 > Graphics, the launcher; at the start): 0 16:9 (the
    game's own), 1 the display's shape, 2 16:10, 3 21:9, 4 32:9. HOS_ASPECT=<w>:<h>, <w>x<h> or a ratio overrides it.
-   The game's cameras take that aspect instead of 16:9, and the present (gpu/render/rx_present_fx.cpp) shows the
-   (still 16:9) frame at that shape: wider than 16:9 more of the world is seen at the sides; narrower (16:10) the
-   vertical view stays and a little less is seen at the sides. Each pixel of the frame is shown a little wider (or
-   taller) than it is high. The HUD's layouts are laid out for the shape (totk_ultrawide_ui.c), so it keeps its
+   The game's output takes that shape (totk_res.c: e.g. 2560x1600 or 3440x1440) and its cameras its aspect instead of
+   16:9: wider than 16:9 more of the world is seen at the sides; narrower (16:10) the vertical view stays and a little
+   less is seen at the sides. (Should the output have to stay 1920x1080, the present shows that 16:9 frame stretched
+   to the shape.) The HUD's layouts are laid out for the shape (totk_ultrawide_ui.c), so it keeps its
    proportions. Fixed for the session: the layouts are read at the start.
 
    The cameras: each place that hands an aspect ratio to the perspective projection (sead's +0xb0) gets the ratio
@@ -20,6 +20,7 @@
    Not adjusted (as in MacNativeGames): HUD markers that follow objects in the world sit a little off. */
 #include "hos.h"
 #include "input_bind.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,15 +74,18 @@ static double parse_ratio(const char *e) {
     return w >= 0.5 && w <= 8 ? w : 0;
 }
 
-/* hos_main.c, before the game starts (after the bindings and mods are known): the aspect for the session */
-void hos_aspect_init(void) {
+/* The shape asked for (aspect_ratio / HOS_ASPECT), 0 for 16:9; decided once, before the resolution (totk_res.c sizes
+   the game's output to it) */
+static double asked = -1;
+static const char *asked_by = "aspect_ratio";
+double hos_aspect_wanted(void) {
+    if (asked >= 0) return asked;
     Bindings b;
     hos_bind_get(&b);
     double a = 0;
-    const char *what = "aspect_ratio";
     const char *e = getenv("HOS_ASPECT");
     if (e && *e) {
-        a = parse_ratio(e), what = "HOS_ASPECT";
+        a = parse_ratio(e), asked_by = "HOS_ASPECT";
         if (!a && strcmp(e, "0")) hos_log("aspect: HOS_ASPECT=%s is not <w>:<h>, <w>x<h> or a ratio in 0.5..8: 16:9", e);
     } else if (b.aspect == 1) {
 #ifdef _WIN32
@@ -95,7 +99,7 @@ void hos_aspect_init(void) {
     } else if (b.aspect == 2) {
         a = 16.0 / 10.0;
     } else if (b.aspect == 3) {
-        a = 21.0 / 9.0;
+        a = 64.0 / 27.0;   /* (21:9 as monitors are: 2560x1080; 3440x1440 is within 1%) */
     } else if (b.aspect == 4) {
         a = 32.0 / 9.0;
     }
@@ -104,6 +108,21 @@ void hos_aspect_init(void) {
 #if GAME_VERSION != 143 && GAME_VERSION != 100
     a = 0;
 #endif
+    asked = a;
+    return a;
+}
+
+/* hos_main.c, after hos_res_init (the output's size): the cameras and the HUD for the session. The output has the
+   shape asked for when the resolution could follow it (totk_res.c), so nothing is stretched; at 1920x1080 (the heap
+   table could not be grown) the 16:9 frame is shown at the shape, stretched. The cameras take the output's exact
+   ratio. */
+void hos_aspect_init(void) {
+    extern unsigned hos_out_w, hos_out_h;   /* totk_res.c */
+    double a = hos_aspect_wanted();
+    const double game = 16.0 / 9.0, out = (double)hos_out_w / hos_out_h;
+    if (a <= 0 && fabs(out / game - 1) >= 0.01 && out >= 0.5 && out <= 8) a = out, asked_by = "the output's shape";
+    const int shaped = a > 0 && fabs(out / a - 1) < 0.01;
+    if (shaped) a = out;
     hos_view_aspect = (float)a;
     hos_ultrawide_apply();
 #ifdef _WIN32
@@ -111,8 +130,9 @@ void hos_aspect_init(void) {
     hos_ultrawide_ui_prepare();
 #endif
     if (a > 0)
-        hos_log("aspect: %.4f (%s): the cameras see %s; the HUD's layouts follow", a, what,
-                a > game ? "more at the sides" : "the same height, a little less at the sides");
+        hos_log("aspect: %.4f (%s): the cameras see %s; the HUD's layouts follow; %s", a, asked_by,
+                a > game ? "more at the sides" : "the same height, a little less at the sides",
+                shaped ? "the output has that shape (nothing stretched)" : "the 16:9 output is stretched to it");
     else
         hos_log("aspect: 16:9 (the game's own)");
 }

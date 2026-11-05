@@ -228,7 +228,7 @@ const wchar_t* const kPageNames[kPages] = {L"Play", L"Settings", L"Build"};
 // what a click on a drawn thing does
 enum Act {
     A_NONE, A_PAGE, A_PLAY, A_OPEN_LOG, A_OPEN_FOLDER, A_PREV, A_NEXT, A_SLIDER, A_BROWSE, A_CLEAR, A_MODE, A_TOGGLE,
-    A_BUILD, A_CANCEL, A_OPEN_BUILD_LOG, A_GO_BUILD
+    A_BUILD, A_CANCEL, A_OPEN_BUILD_LOG, A_GO_BUILD, A_UPDATE, A_CHECK
 };
 struct Hot {
     RectF r;
@@ -326,9 +326,17 @@ struct App {
     bool build_ok = false, build_ran = false;
     float spin = 0;
     wstring status;   // (a line under the page title: what just happened)
+    // updates (pipeline.py --check): the newest commit of the update branch on GitHub
+    enum { U_NONE, U_CHECKING, U_AVAILABLE, U_CURRENT, U_FAILED } update = U_NONE;
+    std::string update_sha, update_subject, update_why;
+    int64_t update_time = 0;
 } app;
 
-const UINT WM_BUILD_LINES = WM_APP + 1, WM_GAME_EXIT = WM_APP + 2, WM_BUILD_EXIT = WM_APP + 3;
+// where updates come from: launcher.ini update_repo / update_branch (update_check = 0: no check at the start)
+wstring update_repo() { return app.cfg.get(L"update_repo", L"xellow78-lgtm/SkyboundTotk"); }
+wstring update_branch() { return app.cfg.get(L"update_branch", L"update-1.4.3"); }
+
+const UINT WM_BUILD_LINES = WM_APP + 1, WM_GAME_EXIT = WM_APP + 2, WM_BUILD_EXIT = WM_APP + 3, WM_UPDATE_CHECKED = WM_APP + 4;
 
 wstring cfg_default_mods() {
     // (TKMM's output next to the skybound folder, as rebuild_and_test.bat looks for it)
@@ -359,7 +367,7 @@ void load_all() {
     app.ini.load();
     if (app.steps.empty()) {
         static const std::pair<const char*, const wchar_t*> st[] = {
-            {"files", L"Game files"}, {"overlay", L"Source changes"}, {"tools", L"Build tools"},
+            {"update", L"Updates"}, {"files", L"Game files"}, {"overlay", L"Source changes"}, {"tools", L"Build tools"},
             {"dlss", L"DLSS library"}, {"lift", L"Translate the game's code"}, {"compile", L"Compile"},
             {"install", L"Install"}};
         for (auto& [k, l] : st) app.steps.push_back({k, l});
@@ -628,6 +636,42 @@ void draw_play(Draw& d, RectF c) {
            false, exists(app.cfg.get(L"log")));
     button(d, RectF(hero.X + 190 * s, hero.Y + hero.Height - 52 * s, 170 * s, 34 * s), L"Open the game folder",
            A_OPEN_FOLDER, 0, false, is_dir(app.dist));
+
+    // updates: the newest commit of the update branch
+    RectF ur(c.X, hero.Y + hero.Height + 14 * s, c.Width, 64 * s);
+    d.fill(ur, kPanel, 10);
+    wstring u1, u2;
+    Color uc = kDim;
+    if (app.update == App::U_AVAILABLE) {
+        wchar_t when[64] = L"";
+        if (app.update_time > 0) {
+            const time_t t = (time_t)app.update_time;
+            struct tm tm;
+            localtime_s(&tm, &t);
+            wcsftime(when, 64, L"%Y-%m-%d %H:%M", &tm);
+        }
+        u1 = L"Update available", uc = kGold;
+        u2 = widen(app.update_subject) + L"   \u00B7   " + when;
+    } else if (app.update == App::U_CHECKING) {
+        u1 = L"Checking for updates\u2026";
+        u2 = update_repo() + L" (" + update_branch() + L")";
+    } else if (app.update == App::U_CURRENT) {
+        u1 = L"Up to date", uc = kGood;
+        u2 = update_repo() + L" (" + update_branch() + L") at " + widen(app.update_sha.substr(0, 10));
+    } else if (app.update == App::U_FAILED) {
+        u1 = L"Could not check for updates";
+        u2 = widen(app.update_why.substr(0, 160));
+    } else {
+        u1 = L"Updates";
+        u2 = L"Not checked yet.";
+    }
+    d.text(u1, RectF(ur.X + 20 * s, ur.Y + 9 * s, ur.Width - 300 * s, 24 * s), 15, uc, 0, FontStyleBold);
+    d.text(u2, RectF(ur.X + 20 * s, ur.Y + 34 * s, ur.Width - 300 * s, 20 * s), 12.5f, kDim);
+    RectF ub(ur.X + ur.Width - 248 * s, ur.Y + 13 * s, 228 * s, 38 * s);
+    if (app.update == App::U_AVAILABLE)
+        button(d, ub, L"UPDATE AND BUILD", A_UPDATE, 0, true, !app.build && !running);
+    else
+        button(d, ub, L"Check now", A_CHECK, 0, false, app.update != App::U_CHECKING);
 }
 
 
@@ -1023,19 +1067,96 @@ void add_log(const wstring& line) {
 
 wstring quote(const wstring& s) { return L"\"" + s + L"\""; }
 
-void start_build() {
+
+// the newest pipeline: the source changes folder's or the source's, whichever is newer, then the one next to this
+// launcher (after an update the source's is the newest)
+int64_t mtime(const wstring& p) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &a)) return -1;
+    return (int64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
+}
+wstring pipeline_path() {
+    const wstring ov = app.cfg.get(L"overlay");
+    const wstring a = ov.empty() ? wstring() : ov + L"\\launcher\\pipeline.py", b = app.source + L"\\launcher\\pipeline.py";
+    const int64_t ta = a.empty() ? -1 : mtime(a), tb = mtime(b);
+    if (ta >= 0 || tb >= 0) return ta > tb ? a : b;
+    const wstring c = app.dir + L"\\pipeline.py";
+    return exists(c) ? c : wstring();
+}
+
+// pipeline.py --check in the background: WM_UPDATE_CHECKED when it answered
+void start_update_check() {
+    if (app.update == App::U_CHECKING || app.source.empty() || !exists(app.source + L"\\a64-kit\\build.py")) return;
+    const wstring pipeline = pipeline_path();
+    if (pipeline.empty()) return;
+    app.update = App::U_CHECKING;
+    wstring args = quote(python_exe()) + L" -u " + quote(pipeline) + L" --source " + quote(app.source) + L" --check " +
+                   quote(update_repo()) + L" --branch " + quote(update_branch());
+    HWND w = app.hwnd;
+    const wstring cwd = app.source;
+    std::thread([args, w, cwd]() mutable {
+        SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+        HANDLE rd = nullptr, wr = nullptr;
+        CreatePipe(&rd, &wr, &sa, 0);
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        STARTUPINFOW si{};
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = si.hStdError = wr;
+        PROCESS_INFORMATION pi{};
+        std::string out;
+        if (CreateProcessW(nullptr, args.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, cwd.c_str(), &si, &pi)) {
+            CloseHandle(wr);
+            char buf[4096];
+            DWORD n;
+            while (ReadFile(rd, buf, sizeof buf, &n, nullptr) && n) out.append(buf, n);
+            WaitForSingleObject(pi.hProcess, 60000);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        } else {
+            CloseHandle(wr);
+            out = "@@updatefail could not run Python";
+        }
+        CloseHandle(rd);
+        auto* copy = new std::string(out);
+        PostMessageW(w, WM_UPDATE_CHECKED, 0, (LPARAM)copy);
+    }).detach();
+}
+void update_checked(const std::string& out) {
+    app.update = App::U_FAILED;
+    app.update_why = "no answer";
+    size_t at = 0;
+    while (at < out.size()) {
+        size_t e = out.find('\n', at);
+        std::string l = out.substr(at, e == std::string::npos ? std::string::npos : e - at);
+        at = e == std::string::npos ? out.size() : e + 1;
+        while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+        if (l.rfind("@@update ", 0) == 0) {
+            char sha[64] = {0};
+            long long t = 0;
+            int used = 0;
+            if (sscanf(l.c_str() + 9, "%63s %lld %n", sha, &t, &used) >= 2) {
+                app.update = App::U_AVAILABLE, app.update_sha = sha, app.update_time = t;
+                app.update_subject = l.substr(9 + used);
+            }
+        } else if (l.rfind("@@uptodate ", 0) == 0) {
+            app.update = App::U_CURRENT, app.update_sha = l.substr(11);
+        } else if (l.rfind("@@updatefail ", 0) == 0) {
+            app.update = App::U_FAILED, app.update_why = l.substr(13);
+        }
+    }
+    redraw();
+}
+
+void start_build(bool fetch = false) {
     if (app.build || app.game) return;
     if (app.source.empty() || !exists(app.source + L"\\a64-kit\\build.py")) {
         app.status = L"Choose the SkyboundTOTK source folder first (the one with a64-kit in it).";
         redraw();
         return;
     }
-    // (the newest pipeline: the source changes folder's, the source's, then the one next to this launcher)
-    wstring pipeline;
     const wstring ov = app.cfg.get(L"overlay");
-    for (const wstring& p : {ov.empty() ? wstring() : ov + L"\\launcher\\pipeline.py", app.source + L"\\launcher\\pipeline.py",
-                             app.dir + L"\\pipeline.py"})
-        if (!p.empty() && exists(p)) { pipeline = p; break; }
+    const wstring pipeline = pipeline_path();
     if (pipeline.empty()) {
         app.status = L"launcher\\pipeline.py not found in the source.";
         redraw();
@@ -1061,6 +1182,7 @@ void start_build() {
     }
     add(L"--overlay", ov);
     if (app.cfg.geti(L"dlss", 0)) args += L" --dlss";
+    if (fetch) args += L" --fetch " + quote(update_repo()) + L" --branch " + quote(update_branch());
     CreateDirectoryW(app.dist.c_str(), nullptr);
     add(L"--log", app.dist + L"\\launcher_build.log");
 
@@ -1225,6 +1347,8 @@ void click(const Hot& h) {
         app.cfg.save();
         break;
     case A_BUILD: start_build(); break;
+    case A_UPDATE: app.page = kBuild, start_build(true); break;
+    case A_CHECK: start_update_check(); break;
     case A_CANCEL:
         if (app.job) TerminateJobObject(app.job, 1);
         app.build_end = L"Cancelled. Build again to continue where it stopped.";
@@ -1354,8 +1478,15 @@ LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             if (st.state == "run") st.state = app.build_ok ? "done" : "fail";
         KillTimer(w, 2);
         load_all();
+        if (app.update == App::U_AVAILABLE || app.update == App::U_FAILED) start_update_check();   // (after an update)
         FlashWindow(w, TRUE);
         redraw();
+        return 0;
+    }
+    case WM_UPDATE_CHECKED: {
+        std::string* out = (std::string*)lp;
+        update_checked(*out);
+        delete out;
         return 0;
     }
     case WM_GAME_EXIT: {
@@ -1430,6 +1561,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int show) {
     if (wcsstr(cmd, L"--build-now")) app.page = kBuild, start_build();   // (tests)
     ShowWindow(app.hwnd, show);
     UpdateWindow(app.hwnd);
+    if (app.cfg.geti(L"update_check", 1) && !wcsstr(cmd, L"--build-now")) start_update_check();
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);

@@ -2,6 +2,9 @@
 """The launcher's build: your game files in, the game out (launcher/launcher.cpp runs this and shows its progress).
 
 Steps (each skipped when its result is already there, so a stopped build continues):
+  update   (--fetch <owner/repo> --branch <name>) the newest source from GitHub over <source>: the branch's newest
+           commit as a zip (no git needed). Files the previous update brought and the new one no longer has are removed;
+           nothing else is touched (your game files, build, dist, user folder). The steps below then rebuild what changed.
   files    the game's ExeFS and RomFS into <source>/game: from folders you extracted (the ExeFS is copied, the RomFS is
            linked, not copied), or from your base game and 1.4.3 update .nsp files with your prod.keys (nx.py)
   overlay  changed source files copied over the source (--overlay: the folder Claude's changes go into)
@@ -16,19 +19,25 @@ It prints lines for the launcher between the build tools' own output:
   @@progress <0..1> <text>        the running step's progress
   @@end ok|fail <message>
 usage: pipeline.py --source <SkyboundTOTK folder> [--exefs <dir> --romfs <dir> | --nsp <base.nsp> --update <upd.nsp>
-                   --keys <prod.keys>] [--overlay <dir>] [--dlss] [--log <file>]
+                   --keys <prod.keys>] [--overlay <dir>] [--dlss] [--fetch <owner/repo> --branch <name>] [--log <file>]
+       pipeline.py --source <folder> --check <owner/repo> --branch <name>: is there a newer commit? one line:
+                   @@update <sha> <unix time> <subject> | @@uptodate <sha> | @@updatefail <why>
 """
 import argparse
+import calendar
 import os
 import re
 import shutil
 import subprocess
 import sys
+import io
+import json
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
 
-STEPS = [("files", "Game files"), ("overlay", "Source changes"), ("tools", "Build tools"),
+STEPS = [("update", "Updates"), ("files", "Game files"), ("overlay", "Source changes"), ("tools", "Build tools"),
          ("dlss", "DLSS library"), ("lift", "Translate the game's code"), ("compile", "Compile"),
          ("install", "Install")]
 LOG = None
@@ -172,16 +181,104 @@ def junction(link, target):
 def overlay(a):
     if not a.overlay or not Path(a.overlay).is_dir():
         return "skip"
-    n = 0
+    n = old = 0
+    since = installed_version()[1]   # (overlay files from before the installed update are in it already, or older)
     for root, _, files in os.walk(a.overlay):
         for f in files:
             src = Path(root) / f
+            if since and src.stat().st_mtime < since:
+                old += 1
+                continue
             dst = SOURCE / src.relative_to(a.overlay)
             dst.parent.mkdir(parents=True, exist_ok=True)
             if not dst.is_file() or dst.read_bytes() != src.read_bytes():
                 shutil.copy2(src, dst)
                 n += 1
-    say("%d changed files copied from %s" % (n, a.overlay))
+    say("%d changed files copied from %s%s" % (n, a.overlay, " (%d older than the installed update left out)" % old if old else ""))
+    return "done"
+
+
+# ---- updates: the newest commit of a branch on GitHub ----
+VERSION_FILE, MANIFEST_FILE = ".skybound_version", ".skybound_files.txt"
+
+
+def installed_version():
+    """(sha, commit time) of the update the source holds, ("", 0) if none"""
+    try:
+        sha, t = (SOURCE / VERSION_FILE).read_text(encoding="utf-8").split()[:2]
+        return sha, int(t)
+    except (OSError, ValueError):
+        return "", 0
+
+
+def github(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "SkyboundTOTK-launcher",
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def newest_commit(repo, branch):
+    """(sha, unix time, subject) of the branch's newest commit"""
+    c = json.loads(github("https://api.github.com/repos/%s/commits/%s" % (repo, branch)))
+    when = c["commit"]["committer"]["date"]   # e.g. 2026-11-05T05:40:00Z
+    t = calendar.timegm(time.strptime(when, "%Y-%m-%dT%H:%M:%SZ"))
+    return c["sha"], t, c["commit"]["message"].splitlines()[0][:120]
+
+
+def check(a):
+    try:
+        sha, t, subject = newest_commit(a.check, a.branch)
+    except Exception as e:
+        say("@@updatefail %s" % e)
+        return 0
+    have = installed_version()[0]
+    say("@@uptodate %s" % sha if have == sha else "@@update %s %d %s" % (sha, t, subject))
+    return 0
+
+
+def update(a):
+    if not a.fetch:
+        return "skip"
+    sha, t, subject = newest_commit(a.fetch, a.branch)
+    if installed_version()[0] == sha:
+        say("the source is already at %s" % sha[:10])
+        return "skip"
+    progress(0.1, "downloading %s" % sha[:10])
+    data = github("https://api.github.com/repos/%s/zipball/%s" % (a.fetch, sha))
+    say("downloaded %d KB: %s" % (len(data) >> 10, subject))
+    z = zipfile.ZipFile(io.BytesIO(data))
+    names = [n for n in z.namelist() if not n.endswith("/")]
+    prefix = names[0].split("/")[0] + "/" if names else ""
+    files = sorted(n[len(prefix):] for n in names if n.startswith(prefix) and len(n) > len(prefix))
+    keep = ("game/", "build/", "dist/", "tmp/", ".git/")
+    written = 0
+    for i, rel in enumerate(files):
+        if rel.startswith(keep) or ".." in Path(rel).parts:
+            continue
+        dst = SOURCE / rel
+        blob = z.read(prefix + rel)
+        if not dst.is_file() or dst.read_bytes() != blob:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dst.write_bytes(blob)
+            except PermissionError:   # (a running launcher's own exe: aside, then written)
+                dst.rename(dst.with_name(dst.name + ".old"))
+                dst.write_bytes(blob)
+            written += 1
+        if i % 50 == 0:
+            progress(0.2 + 0.7 * i / max(1, len(files)), rel[-60:])
+    removed = 0
+    try:   # (what the previous update brought and this one no longer has)
+        for rel in (SOURCE / MANIFEST_FILE).read_text(encoding="utf-8").splitlines():
+            if rel and rel not in files and not rel.startswith(keep) and (SOURCE / rel).is_file():
+                (SOURCE / rel).unlink()
+                removed += 1
+    except OSError:
+        pass
+    (SOURCE / MANIFEST_FILE).write_text("\n".join(files) + "\n", encoding="utf-8")
+    (SOURCE / VERSION_FILE).write_text("%s %d\n" % (sha, t), encoding="utf-8")
+    say("updated to %s (%s): %d files changed, %d removed" % (sha[:10], subject, written, removed))
     return "done"
 
 
@@ -350,9 +447,14 @@ def main():
     p.add_argument("--overlay")
     p.add_argument("--dlss", action="store_true")
     p.add_argument("--log")
+    p.add_argument("--check")
+    p.add_argument("--fetch")
+    p.add_argument("--branch", default="update-1.4.3")
     a = p.parse_args()
     SOURCE = Path(a.source).resolve()
     SKYBOUND = SOURCE.parent
+    if a.check:
+        return check(a)
     if a.log:
         LOG = open(a.log, "w", encoding="utf-8")
     if a.nsp and not a.update:
@@ -367,7 +469,7 @@ def main():
     (SKYBOUND / "tmp").mkdir(exist_ok=True)
     for key, _ in STEPS:
         step(key, "wait")
-    work = {"files": lambda: game_files(a, env), "overlay": lambda: overlay(a), "tools": lambda: tools(a, env),
+    work = {"update": lambda: update(a), "files": lambda: game_files(a, env), "overlay": lambda: overlay(a), "tools": lambda: tools(a, env),
             "dlss": lambda: dlss(a, env), "lift": lambda: lift(a, env), "compile": lambda: compile_(a, env),
             "install": lambda: install(a, env)}
     t0 = time.time()
@@ -386,6 +488,18 @@ def main():
             say("@@end fail %s: %s" % (label, e))
             return 1
         step(key, state)
+        if key == "update" and state == "done":
+            new = SOURCE / "launcher/pipeline.py"
+            if new.is_file() and new.read_bytes() != Path(__file__).read_bytes():
+                # (the update brought another pipeline: the rest of the build is its, in this process's place)
+                args = [sys.executable, "-u", str(new)] + [x for x in sys.argv[1:]]
+                i = args.index("--fetch")
+                del args[i:i + 2]
+                say("continuing with the updated pipeline")
+                if LOG:
+                    LOG.close()
+                    LOG = None
+                return subprocess.call(args)
     say("@@end ok Built in %d min. Press Play." % max(1, round((time.time() - t0) / 60)))
     return 0
 
