@@ -442,7 +442,8 @@ void reflex_replay_job(bool present);
 uint64_t reflex_present_begin();
 void reflex_present_end(uint64_t present_id);
 
-/// The settings menu (rx_menu.cpp): drawn over the window's image when open, before the present's commands finish.
+/// The settings menu (rx_menu.cpp): drawn over the window's image when open, before the present's commands finish;
+/// menu_open() is also true while the FPS counter is on (it is drawn, and counts the presents, by menu_draw).
 bool menu_open();
 void menu_draw(WGPUCommandEncoder e, WGPUTextureView target, WGPUTextureFormat format, uint32_t w, uint32_t h);
 /// Raw Vulkan commands at this point of the encoder (wgpu-native's wgpuTotkCommandEncoderRaw, deferred like the

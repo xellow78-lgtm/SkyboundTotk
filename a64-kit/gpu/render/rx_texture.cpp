@@ -610,13 +610,31 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
         src = scratch.data();
     }
 
+    // the levels the texture gets: at most a full chain for its size (WebGPU refuses more). The guest's descriptor
+    // can name more (a 5x1 BC1 with 10 levels, a 2x2 BC4 with 10, at the start of TOTK 1.4.3): that texture was
+    // not made at all ("mip level count 10 is invalid, maximum allowed is 4"); now it gets the levels there are.
+    // The guest's layout (layer stride) is still worked out from all of its levels.
+    u32 tex_levels = info.levels;
+    {
+        const u32 dw = decode_any_compressed ? info.size.width : physical_width;
+        const u32 dh = decode_any_compressed ? info.size.height : physical_height;
+        const u32 dd = info.dimension == WGPUTextureDimension_3D ? info.size.depth : 1;
+        u32 m = std::max({dw, dh, dd, 1u}), full = 1;
+        while (m > 1) m >>= 1, full++;
+        if (tex_levels > full) {
+            log_limited("tex_levels", 8, "rx: texture %ux%u format %d: %u levels named, %u made (all its size has)",
+                        info.size.width, info.size.height, (int)info.format, tex_levels, full);
+            tex_levels = full;
+        }
+        if (!tex_levels) tex_levels = 1;
+    }
     auto im = std::make_unique<Image>();
     im->gpu_va = va;
     im->guest = hos_gpu_translate(va);
     im->width = info.size.width;
     im->height = info.size.height;
     im->layers = info.dimension == WGPUTextureDimension_3D ? info.size.depth : info.layers;
-    im->levels = info.levels;
+    im->levels = tex_levels;
     im->pixel_format = info.format;
     im->format = format;
     im->storage = astc_gpu;
@@ -628,7 +646,7 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
     d.size = {decode_any_compressed ? info.size.width : physical_width,
               decode_any_compressed ? info.size.height : physical_height, im->layers};
     d.format = astc_gpu ? WGPUTextureFormat_RGBA8Unorm : format;
-    d.mipLevelCount = info.levels;
+    d.mipLevelCount = tex_levels;
     d.sampleCount = 1;
     const WGPUTextureFormat pair = srgb_pair(d.format);
     if (pair != WGPUTextureFormat_Undefined) {
@@ -660,7 +678,7 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
     if (astc_gpu || swizzle_gpu || astc_bc) {
         std::vector<BlockLinearLevel> lv;
         size_t off = 0;
-        for (u32 level = 0; level < info.levels; level++) {
+        for (u32 level = 0; level < tex_levels; level++) {
             const Extent3D tiles = AdjustTileSize(AdjustMipSize(info.size, level), tile);
             const Extent3D block = AdjustMipBlockSize(tiles, li.block, level, li.num_levels);
             const u32 stride = Common::AlignUpLog2(tiles.width, StrideAlignment(tiles, info.block, gob, li.bpp_log2)) * bpp;
@@ -687,7 +705,7 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
             gpu_force_cpu = true;
             const auto cpu = decode(tic, info, va);
             gpu_force_cpu = false;
-            for (u32 level = 0; cpu && level < info.levels; level++) {
+            for (u32 level = 0; cpu && level < tex_levels; level++) {
                 const Extent3D ls = AdjustMipSize(info.size, level);
                 const Extent3D tiles = AdjustTileSize(ls, tile);
                 // (RGBA8 texels for ASTC; whole blocks as they are otherwise)
@@ -730,7 +748,7 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
             if (!gpu_decoded) to_bc7 = true;
             static std::atomic<int64_t> n, saved;
             uint64_t texels = 0;
-            for (u32 level = 0; level < info.levels; level++) {
+            for (u32 level = 0; level < tex_levels; level++) {
                 const Extent3D ls = AdjustMipSize(info.size, level);
                 texels += (uint64_t)((ls.width + 3) & ~3u) * ((ls.height + 3) & ~3u);
             }
@@ -740,7 +758,7 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
                         (long long)k, (long long)mb, gpu_decoded ? "" : " (this one by the CPU)");
         }
     }
-    for (u32 level = 0; !gpu_decoded && level < info.levels; level++) {
+    for (u32 level = 0; !gpu_decoded && level < tex_levels; level++) {
         const Extent3D level_size = AdjustMipSize(info.size, level);
         const Extent3D tiles = AdjustTileSize(level_size, tile);
         const size_t layer_bytes = (size_t)tiles.width * tiles.height * tiles.depth * bpp;
@@ -790,7 +808,7 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
             for (unsigned t = 1; t < nthreads; t++) threads.emplace_back(work);
             work();
             for (std::thread& t : threads) t.join();
-            if (static const bool log_inplace = env_flag("RX_LOG_INPLACE"); log_inplace && level == info.levels - 1)
+            if (static const bool log_inplace = env_flag("RX_LOG_INPLACE"); log_inplace && level == tex_levels - 1)
                 hos_log("rx: parallel layers %ux%u x%u: thread time unswizzle %.0f ms, ASTC %.0f ms, upload %.0f ms "
                         "(%u threads)", info.size.width, info.size.height, copy_layers, t_swz.exchange(0) / 1e6,
                         t_dec.exchange(0) / 1e6, t_up.exchange(0) / 1e6, nthreads);

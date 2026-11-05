@@ -894,8 +894,322 @@ def heapdef(src, dst, extra_kib):
         print('heapdef: %s %d -> %d KiB' % (name, old, new))
 
 
+
+# ---- the HUD's layouts for another picture shape (hos/totk_ultrawide_ui.c) ----
+# button_icons.py --layout <layout archive .zs> <Pack/ZsDic.pack.zs> <out .zs> <width> <height> <corner|center>
+# The game lays its UI out on a 1920x1080 grid mapped onto its 16:9 frame; shown at another shape (hos/totk_ultrawide.c)
+# every layout comes out stretched by that shape over 16:9. Here, in UI/LayoutArchive/Common.Product.*.blarc, each
+# layout's root pane is squeezed back to 16:9 (scale x wider than 16:9, scale y taller), full-screen backdrops and
+# blurs stretch back to the edges, and with "corner" the HUD's parts move out to the screen's corners and edges
+# (with "center" they stay in the middle 16:9).
+# Adapted from MacNativeGames' games/totk/scripts/ultrawide_layout.py (21:9 and wider) and tall_layout.py (16:10)
+# (MIT License, Copyright (c) 2026 MacNativeGames contributors; the notice at the top of this file): the pane lists,
+# distances and animation keys, checked there against 1.4.3's Common.Product.140 (the pane list was read from what the
+# community TOTK-Ultrawide mod changes; none of that mod's code or files are used, there or here). Changed here: a pane
+# or key that does not hold the value the game ships (another version, or a mod's own layouts) is left alone and
+# reported, instead of stopping, so a mod's archive still gets the root squeeze and every edit that fits.
+LAYOUT_PANES = (b'pan1', b'pic1', b'txt1', b'wnd1', b'bnd1', b'prt1', b'ali1', b'scr1')
+LAYOUT_FIELD = {'x': 44, 'y': 48, 'scale_x': 68, 'scale_y': 72, 'sx': 68, 'sy': 72, 'h': 80}
+LAYOUT_OFF = 10000.0   # (moves a pane out of sight: not checked)
+
+
+def layout_panes(blarc, lo, hi):
+    """pane name -> absolute section offset (first occurrence) of the BFLYT at blarc[lo:hi]."""
+    if blarc[lo:lo + 4] != b'FLYT':
+        return {}
+    head, count = struct.unpack_from('<H', blarc, lo + 6)[0], struct.unpack_from('<H', blarc, lo + 0x10)[0]
+    pos, out = lo + head, {}
+    for _ in range(count):
+        if pos + 8 > hi:
+            break
+        magic, size = bytes(blarc[pos:pos + 4]), struct.unpack_from('<I', blarc, pos + 4)[0]
+        if magic in LAYOUT_PANES:
+            out.setdefault(bytes(blarc[pos + 12:pos + 36]).split(b'\0')[0].decode('utf-8', 'replace'), pos)
+        if size < 8:
+            break
+        pos += size
+    return out
+
+
+class LayoutEdit:
+    def __init__(self, blarc, members):
+        self.blarc, self.members, self.found, self.changed, self.skipped, self.done = blarc, members, {}, set(), [], 0
+
+    def pane(self, layout, pane):
+        member = f'blyt/{layout}.bflyt'
+        if member not in self.members:
+            self.skipped.append(f'no layout {layout}')
+            return None
+        if member not in self.found:
+            self.found[member] = layout_panes(self.blarc, *self.members[member])
+        if pane not in self.found[member]:
+            self.skipped.append(f'{layout}: no pane {pane}')
+            return None
+        self.changed.add(member)
+        return self.found[member][pane]
+
+    def get(self, at):
+        return struct.unpack_from('<f', self.blarc, at)[0]
+
+    def put(self, at, v):
+        struct.pack_into('<f', self.blarc, at, v)
+        self.done += 1
+
+    def field(self, layout, pane, field, shipped, value):
+        """field of the pane set to value if it holds shipped (None: not checked)"""
+        at = self.pane(layout, pane)
+        if at is None:
+            return
+        at += LAYOUT_FIELD[field]
+        if shipped is not None and abs(self.get(at) - shipped) > 1e-3:
+            self.skipped.append(f'{layout} {pane} {field}: {self.get(at):g}, not {shipped:g}')
+            return
+        self.put(at, value)
+
+    def layouts(self):
+        return sorted(m[5:-6] for m in self.members if m.startswith('blyt/') and m.endswith('.bflyt'))
+
+    def anim(self, anim, shipped, value, where):
+        """keys of an animation holding shipped set to value: at these offsets (a tuple), or every one of that value
+        when there are exactly that many (an int)"""
+        member = f'anim/{anim}.bflan'
+        if member not in self.members:
+            self.skipped.append(f'no animation {anim}')
+            return
+        lo, hi = self.members[member]
+        if isinstance(where, tuple):
+            hits = [lo + o for o in where if lo + o + 4 <= hi]
+            if len(hits) != len(where) or any(abs(self.get(i) - shipped) >= 1e-4 for i in hits):
+                self.skipped.append(f'{anim}: not {shipped:g} at {where}')
+                return
+        else:
+            hits = [i for i in range(lo, hi - 3, 4) if abs(self.get(i) - shipped) < 1e-4]
+            if len(hits) != where:
+                self.skipped.append(f'{anim}: {len(hits)} keys of {shipped:g}, not {where}')
+                return
+        for i in hits:
+            self.put(i, value)
+        self.changed.add(member)
+
+
+WIDE_KEEP_ROOT = {'AppMenuBG_00', 'PauseMenuBG_00', 'ShopMenuParasailBG_00', 'ShortCutBG_00', 'TitleMenuBG_00',
+                  'EventFade_00', 'EventFadeWipe_00', 'CameraShutter_00', 'PaAppPictureBookDetail_00',
+                  'AppMenuOverlay_00'}
+
+
+def wide_edits(k, hud_corner):
+    """(layout, pane, field, value) wider than 16:9: k = 16/9 over the aspect (the root's scale), w = how far a
+    1920-wide layout's edge moves out in its own units"""
+    w, OFF, wide = 960 * (1 / k - 1), LAYOUT_OFF, 1 / k
+    out = [
+        ('AppAlbum_00', 'N_FadeInOut_00', 'scale_x', k), ('AppAlbum_00', 'N_Open_01', 'scale_x', wide),
+        *[('AppMap_00', f'N_BlurInOut_0{i}', 'scale_x', wide) for i in range(4)],
+        ('AppMap_00', 'N_MiniMap_00', 'x', -270 * (1 - k)),
+        ('AppMenuOverlay_00', 'N_FadeInOut_00', 'scale_x', k), ('AppMenuOverlay_00', 'N_FadeInOut_01', 'scale_x', k),
+        ('AppMenuOverlay_00', 'N_Icon_00', 'scale_x', k), ('AppMenuOverlay_00', 'N_TitleOne_01', 'scale_x', k),
+        ('AppOpenDemoWindow_00', 'P_BG_00', 'scale_x', wide), ('AutoBuilder_00', 'N_BG_00', 'scale_x', wide),
+        ('CameraPointer_00', 'N_InOutScope_00', 'scale_x', wide), ('CameraPointer_00', 'N_InOutScope_00', 'scale_y', wide),
+        ('CameraPointer_00', 'N_Type_01', 'scale_x', k), ('CameraPointer_00', 'Pa_CameraFocus_00', 'scale_x', wide),
+        ('CameraPointer_00', 'S_Scissor_00', 'scale_x', wide), ('CameraPointer_00', 'W_Shadow_01', 'scale_x', wide),
+        ('CameraSystemWindow_00', 'N_AlbumCon_00', 'scale_x', k), ('CameraSystemWindow_00', 'N_InOut_00', 'scale_x', wide),
+        ('CameraSystemWindow_00', 'Pa_BtnL_00', 'scale_x', k), ('CameraSystemWindow_00', 'Pa_BtnR_00', 'scale_x', k),
+        ('CameraSystemWindow_00', 'T_Text_00', 'scale_x', k),
+        ('ChallengeLog_00', 'C_CaptureUp_00', 'x', OFF), ('ChallengeLog_00', 'C_CaptureUp_01', 'x', OFF),
+        ('GameOver_00', 'P_BG_00', 'scale_x', wide),
+        ('LoadingFade_00', 'N_Base_00', 'scale_x', wide), ('LoadingFade_00', 'N_Logo_00', 'x', w),
+        ('LoadingFade_00', 'N_Status_00', 'x', w), ('LoadingFade_00', 'N_Tips_00', 'x', -w),
+        ('LoadingFade_00', 'P_BG_00', 'scale_x', wide), ('LoadingFade_00', 'P_SideBGDeco_00', 'scale_x', k),
+        ('LoadingFade_00', 'Pa_IconPlayer_00', 'scale_x', k), ('LoadingFade_00', 'Pa_LargeDungeonMap_00', 'scale_x', k),
+        ('LoadingFade_00', 'Pa_LargeDungeonMap_01', 'scale_x', k), ('LoadingFade_00', 'Pa_Map_00', 'scale_x', k),
+        ('LoadingFade_00', 'Pa_Map_01', 'scale_x', k),
+        ('MessageLog_01', 'P_Capture_00', 'scale_x', wide), ('OwnedHorseList_00', 'N_BG_00', 'scale_x', wide),
+        ('PaCommonBtnTitle_00', 'B_Hit_00', 'x', OFF), ('PaCommonBtnTitle_00', 'N_Cursor_00', 'x', OFF),
+        ('PaLargeDungeonMap_00', 'P_BG_00', 'scale_x', wide), ('PaMessageBtn_00', 'B_Hit_00', 'x', OFF),
+        ('PaRecipeCardList_00', 'P_BG_00', 'scale_x', wide),
+        ('SaveLoadIcon_00', 'RootPane', 'x', -960 * (1 - k)),
+        ('ShopMenu_00', 'N_BG_00', 'scale_x', wide), ('StaffRoll_00', 'N_BG_00', 'scale_x', wide),
+    ]
+    # menus framed by two side decorations, a header and a background: the frame stays at the screen's edges
+    for layout, deco in (('PauseMenuOverlay_00', 'P_Deco{}_00'), ('SystemLoadList_00', 'P_Deco{}_00'),
+                         ('SystemOption_00', 'P_Deco{}_00'), ('SystemSaveLoad_00', 'P_Deco{}_00')):
+        out += [(layout, deco.format('L'), 'scale_x', k), (layout, deco.format('L'), 'x', -(675 + w) * k),
+                (layout, deco.format('R'), 'scale_x', k), (layout, deco.format('R'), 'x', (737 + w) * k)]
+        if layout == 'PauseMenuOverlay_00':
+            out += [(layout, 'P_FooterBase_00', 'scale_x', wide), (layout, 'S_DecoScissor_00', 'scale_x', wide)]
+        else:
+            out += [(layout, 'A_Title_00', 'scale_x', k), (layout, 'N_Header_00', 'scale_x', wide),
+                    (layout, 'N_SystemBG_00', 'scale_x', wide)]
+    out += [('SystemActionGuide_00', 'A_Title_00', 'scale_x', k), ('SystemActionGuide_00', 'N_Header_00', 'scale_x', wide),
+            ('SystemActionGuide_00', 'N_SystemBG_00', 'scale_x', wide),
+            ('SystemActionGuide_00', 'P_DecoL_01', 'scale_x', k), ('SystemActionGuide_00', 'P_DecoL_01', 'x', -(675 + w) * k),
+            ('SystemActionGuide_00', 'P_DecoL_02', 'scale_x', k), ('SystemActionGuide_00', 'P_DecoL_02', 'x', (675 + w) * k)]
+    if hud_corner:   # the HUD in the screen's corners instead of the middle 16:9
+        right = 960 * (1 - k)
+        out += [(name, 'RootPane', 'x', right) for name in ('EnvironmentInfo_00', 'EventSkip_00', 'InstantTipsAppMenu_00',
+                                                             'InstantTipsWithPict_00', 'InstantTips_00', 'NumDisplaySecond_00',
+                                                             'NumDisplay_00', 'PickUpWin_00')]
+        out += [('Location_00', 'N_Small_00', 'x', -(388 + w)),
+                ('PlayerStatus3D_00', 'N_ExtraStaminaTarget_01', 'x', -(745 + w)),
+                ('PlayerStatus_00', 'N_DevilDemoTargetC_00', 'x', -(284 + w)),
+                ('PlayerStatus_00', 'N_DevilDemoTargetLT_00', 'x', -(576 + w)),
+                ('PlayerStatus_00', 'N_HeartGaugeTargetLT_00', 'x', -(576 + w)),
+                ('PlayerStatus_00', 'N_HeartPos_00', 'x', -w),
+                ('PlayerStatus_00', 'Pa_CompanionLife_00', 'x', -(840 + w))]
+    return out
+
+
+def wide_anim_edits(k, hud_corner):
+    """(animation, byte offset, value the game ships, new value)"""
+    w = 960 * (1 / k - 1)
+    out = [('PaMapIconDragonTears_00_Zoom', 288, 1.08, 1.08 / k), ('PaMapIconDragonTears_00_Zoom', 300, 1.28, 1.28 / k)]
+    if hud_corner:   # the minimap's slide-in keys end at x 765, the right edge of a 16:9 layout
+        out += [('AppMap_00_MiniMap', o, 765.0, 765 + w) for o in (872, 880, 1628, 1636, 3264, 3272, 3468, 3476)]
+    return out
+
+
+def layout_wide(e, width, height, hud_corner):
+    k = (16 / 9) / (width / height)
+    for layout in e.layouts():
+        if layout not in WIDE_KEEP_ROOT:
+            e.field(layout, 'RootPane', 'scale_x', None, k)
+    # every edit's value at k = 1 is the value the game ships (a scale of 1, the 16:9 position): checked first
+    for (layout, pane, field, value), (_, _, _, shipped) in zip(wide_edits(k, hud_corner), wide_edits(1.0, hud_corner)):
+        e.field(layout, pane, field, None if value == LAYOUT_OFF else shipped, value)
+    for anim, offset, shipped, value in wide_anim_edits(k, hud_corner):
+        e.anim(anim, shipped, value, (offset,))
+
+
+TALL_KEEP_ROOT = {'AppMenuBG_00', 'AppMenuOverlay_00', 'CameraShutter_00', 'EventFade_00', 'EventFadeWipe_00',
+                  'PaAppPictureBookDetail_00', 'PauseMenuBG_00', 'ShopMenuParasailBG_00', 'ShortCutBG_00', 'TitleMenuBG_00'}
+# layouts that hang from the top (UP) or the bottom (DOWN) of the screen: they move out by what the squeeze left free
+TALL_ROOT_UP = ['AppAlbum_00', 'AppPictureBook_00', 'ChallengeLog_00', 'Challenge_00', 'InstantTipsWithPict_00',
+                'InstantTips_00', 'MiniGameTimer_00', 'NumDisplaySecond_00', 'NumDisplay_00', 'PickUpWin_00',
+                'PlayerStatus_00', 'Pouch_00', 'ShopMenu_00', 'SystemActionGuide_00', 'SystemLoadList_00',
+                'SystemOption_00', 'SystemSaveLoad_00']
+TALL_ROOT_DOWN = ['CtrlGuide_00', 'DoCommand_00', 'EnvironmentInfo_00', 'HorseGauge_00', 'MessageDialog_00',
+                  'MessageLog_01', 'PauseMenuOverlay_00', 'SaveLoadIcon_00', 'TreasureFullShortCut_00']
+# (MacNativeGames, checked in the game on 1.4.3) the pause menu's pages with a header and a guide row stay centred
+TALL_CENTERED = ('SystemActionGuide_00', 'SystemLoadList_00', 'SystemOption_00', 'SystemSaveLoad_00')
+# the item lists end at the guide row: their window and scissor grow down (layout, pane, shipped height, shipped y)
+TALL_LIST_EXTENSION = [('PaPouchSlideList_01', 'W_BaseFB_00', 984.0, -71.0), ('PaPouchSlideList_01', 'W_BaseLine_00', 1067.0, -29.0),
+                       ('PaPouchSlideListBtnSet_00', 'N_Scissor_00', 894.0, -24.0),
+                       ('PaPouchSlideListBtnSetLight_00', 'N_Scissor_00', 894.0, -24.0)]
+
+
+def tall_edits(k):
+    """(layout, pane, field, value the game ships, new scale for sx / sy or distance to move for x / y);
+    k = (w / h) / (16 / 9)"""
+    wide, out, half = 1 / k, 540 * (1 / k - 1), 540 * (1 - k)
+    return [
+        ('AppAlbum_00', 'N_Open_01', 'sy', 1.0, wide), ('AppAlbum_00', 'N_PicLoad_01', 'y', 0.0, half * -1),
+        ('AppAlbum_00', 'N_FadeInOut_00', 'sy', 1.0, k),
+        ('AppMap_00', 'N_BlurInOut_00', 'sy', 1.0, wide), ('AppMap_00', 'N_BlurInOut_01', 'sy', 1.0, wide),
+        ('AppMap_00', 'N_BlurInOut_02', 'sy', 1.0, wide), ('AppMap_00', 'N_BlurInOut_03', 'sy', 1.0, wide),
+        ('AppMap_00', 'N_AllMapTime_00', 'y', 0.0, out * -1),
+        ('AppMenuOverlay_00', 'N_FadeInOut_00', 'sy', 1.0, k), ('AppMenuOverlay_00', 'N_TitleTab_00', 'y', 491.0, out),
+        ('AppMenuOverlay_00', 'N_TitleOne_01', 'sy', 1.0, k), ('AppMenuOverlay_00', 'N_FadeInOut_01', 'sy', 1.0, k),
+        ('AppMenuOverlay_00', 'A_Align_00', 'y', -505.0, out * -1),
+        ('AppMenuOverlay_00', 'Pa_GuideLeft_00', 'y', -505.0, out * -1),
+        ('AppMenuOverlay_00', 'N_Icon_00', 'sy', 1.0, k),
+        ('AppOpenDemoWindow_00', 'P_BG_00', 'sy', 1.0, wide), ('AutoBuilder_00', 'N_BG_00', 'sy', 1.0, wide),
+        ('CameraPointer_00', 'N_InOutScope_00', 'sy', 1.0, wide), ('CameraPointer_00', 'S_Scissor_00', 'sy', 1.0, wide),
+        ('CameraPointer_00', 'N_Type_01', 'sy', 1.0, k), ('CameraPointer_00', 'W_Shadow_01', 'sy', 1.0, wide),
+        ('CameraPointer_00', 'Pa_CameraFocus_00', 'sy', 1.0, wide),
+        ('CameraSystemWindow_00', 'N_InOut_00', 'sy', 1.0, wide), ('CameraSystemWindow_00', 'N_FirstOut_00', 'sy', 1.0, k),
+        ('GameOver_00', 'P_BG_00', 'sy', 1.0, wide),
+        ('LoadingFade_00', 'Pa_Map_00', 'sy', 1.0, k), ('LoadingFade_00', 'Pa_LargeDungeonMap_00', 'sy', 1.0, k),
+        ('LoadingFade_00', 'Pa_Map_01', 'sy', 1.0, k), ('LoadingFade_00', 'Pa_LargeDungeonMap_01', 'sy', 1.0, k),
+        ('LoadingFade_00', 'N_Base_00', 'sy', 1.0, wide), ('LoadingFade_00', 'P_BG_00', 'sy', 1.0, wide),
+        ('LoadingFade_00', 'Pa_IconPlayer_00', 'sy', 1.0, k), ('LoadingFade_00', 'N_Logo_00', 'y', 0.0, out * -1),
+        ('LoadingFade_00', 'N_Tips_00', 'y', -360.0, out * -1), ('LoadingFade_00', 'N_Status_00', 'y', 0.0, out),
+        ('LoadingFade_00', 'N_Sage_00', 'y', -477.0, out * -2),
+        ('Location_00', 'N_Large_00', 'y', 270.0, out), ('Location_00', 'N_Small_00', 'y', -395.0, out * -1),
+        ('MessageLog_01', 'P_Capture_00', 'y', 0.0, out), ('MessageLog_01', 'P_Capture_00', 'sy', 1.0, wide),
+        ('OwnedHorseList_00', 'N_BG_00', 'sy', 1.0, wide),
+        ('PaExtraStaminaGauge_00', 'N_BasePattern_00', 'y', 0.0, out),
+        ('PaExtraStaminaGauge_00', 'N_GaugeMainPattern_00', 'y', 0.0, out),
+        ('PaLargeDungeonMap_00', 'P_BG_00', 'sy', 1.0, wide), ('PaRecipeCardList_00', 'P_BG_00', 'sy', 1.0, wide),
+        ('Pouch_00', 'N_Info_00', 'y', 0.0, out * -1), ('Pouch_00', 'Pa_ExtraStamina_00', 'y', 0.0, out * -1),
+        ('ShopMenu_00', 'N_BG_00', 'sy', 1.0, wide), ('ShopMenu_00', 'A_AlignGuide_00', 'y', -477.0, out * -1),
+        ('StaffRoll_00', 'N_BG_00', 'sy', 1.0, wide),
+        ('SystemActionGuide_00', 'N_SystemBG_00', 'y', 0.0, out * -1), ('SystemActionGuide_00', 'N_SystemBG_00', 'sy', 1.0, wide),
+        ('SystemLoadList_00', 'N_SystemBG_00', 'y', 0.0, out * -1), ('SystemLoadList_00', 'N_SystemBG_00', 'sy', 1.0, wide),
+        ('SystemLoadList_00', 'Pa_Guide_00', 'y', -474.0, out * -1),
+        ('SystemOption_00', 'N_SystemBG_00', 'y', 0.0, out * -1), ('SystemOption_00', 'N_SystemBG_00', 'sy', 1.0, wide),
+        ('SystemOption_00', 'A_Guide_00', 'y', -474.0, out * -1),
+        ('SystemSaveLoad_00', 'N_SystemBG_00', 'y', 0.0, out * -1), ('SystemSaveLoad_00', 'N_SystemBG_00', 'sy', 1.0, wide),
+    ]
+
+
+def tall_anim_edits(k):
+    """(animation, shipped value, new value, how many keys hold it or their offsets)"""
+    wide, out = 1 / k, 540 * (1 / k - 1)
+    return [('AppMap_00_MiniMap', -360.0, -360.0 - out, 8), ('Location_00_IsDiscovery', 285.0, 285.0 + out, 2),
+            ('Location_00_IsDiscovery', 260.0, 260.0 + out, 1), ('PaMapIconDragonTears_00_Zoom', 1.08, 1.08 * wide, (324,)),
+            ('PaMapIconDragonTears_00_Zoom', 1.28, 1.28 * wide, (336,))]
+
+
+def layout_tall(e, width, height, hud_corner):
+    k = (width / height) / (16 / 9)
+    for layout in e.layouts():
+        if layout in TALL_KEEP_ROOT:
+            continue
+        e.field(layout, 'RootPane', 'sy', None, k)
+        if hud_corner and (layout in TALL_ROOT_UP or layout in TALL_ROOT_DOWN) and layout not in TALL_CENTERED:
+            e.field(layout, 'RootPane', 'y', None, (1 if layout in TALL_ROOT_UP else -1) * 540 * (1 - k))
+    for layout, pane, field, shipped, value in tall_edits(k):
+        if not hud_corner and field == 'y':
+            continue
+        if layout in TALL_CENTERED and pane == 'N_SystemBG_00' and field == 'y':
+            continue   # (it moved down to make up for the root's shift)
+        e.field(layout, pane, field, shipped, shipped + value if field == 'y' else value)   # a y is a distance
+    if hud_corner:
+        add = 540 * (2 - k) / k - 563   # the list window's bottom reaches the canvas's edge
+        for layout, pane, height_, y in TALL_LIST_EXTENSION:
+            at = e.pane(layout, pane)
+            if at is None:
+                continue
+            if abs(e.get(at + LAYOUT_FIELD['h']) - height_) > 1e-3 or abs(e.get(at + LAYOUT_FIELD['y']) - y) > 1e-3:
+                e.skipped.append(f'{layout} {pane}: not the list window the game ships')
+                continue
+            e.put(at + LAYOUT_FIELD['h'], height_ + add)
+            e.put(at + LAYOUT_FIELD['y'], y - add / 2)
+    for anim, shipped, value, where in tall_anim_edits(k):
+        if not hud_corner and anim != 'PaMapIconDragonTears_00_Zoom':
+            continue
+        e.anim(anim, shipped, value, where)
+
+
+def layout(src, zsdic, dst, width, height, hud):
+    raw = open(src, 'rb').read()
+    did = zframe_dict(raw)
+    d = None
+    if did:
+        pack = zdecompress(open(zsdic, 'rb').read())
+        for lo, hi in sarc_members(pack).values():
+            cand = zdict(pack[lo:hi])
+            if zdict_id(cand) == did:
+                d = cand
+        if d is None:
+            sys.exit(f'layout: {src} needs zstd dictionary {did:#x}, not in {zsdic}')
+    blarc = bytearray(zdecompress(raw, d))
+    e = LayoutEdit(blarc, sarc_members(blarc))
+    if width * 9 > height * 16:
+        layout_wide(e, width, height, hud == 'corner')
+    elif width * 9 < height * 16:
+        layout_tall(e, width, height, hud == 'corner')
+    else:
+        sys.exit('layout: 16:9 needs no layouts')
+    write(os.path.abspath(dst), zcompress(bytes(blarc), d))
+    print(f'layout: {width}x{height}, HUD {hud}: {e.done} values in {len(e.changed)} members; '
+          f'{len(e.skipped)} edits left as they were')
+    for why in e.skipped[:200]:
+        print('  left: ' + why)
+
 if __name__ == '__main__':
     if len(sys.argv) == 5 and sys.argv[1] == '--heapdef':
         heapdef(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+    elif len(sys.argv) == 8 and sys.argv[1] == '--layout':
+        layout(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6]), sys.argv[7])
     else:
         main()

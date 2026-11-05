@@ -51,7 +51,7 @@ const char* const kPageNames[kPages] = {"Graphics", "Mouse", "Controls"};
 
 enum Kind { kOption, kSlider, kToggle, kBinding, kButton, kInfo, kSection };
 enum Id {
-    kOutRes, kRes, kFps, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
+    kOutRes, kAspect, kRes, kFps, kFpsCounter, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
 };
 
 struct Row {
@@ -74,6 +74,8 @@ int fps_index(int v) {
     return 1;
 }
 const char* const kOutResNames[4] = {"1920 x 1080", "Display", "2560 x 1440", "3840 x 2160"};
+const char* const kAspectNames[5] = {"16:9 (the game's own)", "The display's shape", "16:10", "21:9", "32:9"};
+const char* const kCounterNames[3] = {"Off", "FPS", "FPS + frame time"};
 const char* const kButtonNames[5] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Switch"};
 
 // the bindings page: the buttons, the d-pad, the sticks and walk (sections between)
@@ -98,12 +100,17 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
         char now[96];
         std::snprintf(now, sizeof now, "The game's own size. Now %ux%u; at the next start.", hos_out_w, hos_out_h);
         add(kOption, kOutRes, "Output resolution", kOutResNames[std::clamp(b.output_res, 0, 3)], now);
+        add(kOption, kAspect, "Aspect ratio", kAspectNames[std::clamp(b.aspect, 0, 4)],
+            b.aspect ? "At the next start. More of the world at the sides; the HUD keeps its shape."
+                     : "At the next start. Other shapes fill a wide or 16:10 screen.");
         Row& res = add(kOption, kRes, "3D resolution", hos_render_mode_name(b.render_mode),
                        scaler ? "The 3D scene's size before the upscaler." : "Needs FSR 2 or DLSS (set at launch).");
         res.enabled = scaler;
         add(kOption, kFps, "Frame rate limit", kFpsNames[fps_index(b.fps_limit)],
             b.fps_limit == 0 || b.fps_limit > 60 ? "Beta above 60: the camera may turn faster, Link may not climb steps."
                                                  : "The game runs at the right speed at any frame rate.");
+        add(kOption, kFpsCounter, "FPS counter", kCounterNames[std::clamp(b.fps_counter, 0, 2)],
+            "In the top left corner: frames shown a second.");
         add(kOption, kAniso, "Anisotropic filtering", kAnisoNames[std::clamp(b.aniso, 0, 4)],
             "Sharper ground and walls at an angle. Cheap on a PC.");
         Row& rf = add(kOption, kReflex, "NVIDIA Reflex", kReflexNames[std::clamp(b.reflex, 0, 2)],
@@ -186,12 +193,12 @@ Layout layout(int w, int h, int page) {
     Layout l{};
     l.s = std::min(w / 1920.0f, h / 1080.0f);
     if (l.s <= 0) l.s = 1;
-    const float s = l.s, pw = 1120 * s, ph = 800 * s;
+    const float s = l.s, pw = 1120 * s, ph = 920 * s;
     l.panel = {(w - pw) / 2, (h - ph) / 2, pw, ph};
     for (int i = 0; i < kPages; i++) l.tabs[i] = {l.panel.x + 48 * s + i * 186 * s, l.panel.y + 104 * s, 176 * s, 46 * s};
     l.close = {l.panel.x + pw - 48 * s - 44 * s, l.panel.y + 36 * s, 44 * s, 44 * s};
     l.content = {l.panel.x + 48 * s, l.panel.y + 178 * s, pw - 96 * s, ph - 178 * s - 112 * s};
-    l.row_h = (page == kControls ? 50 : page == kGraphics ? 64 : 76) * s;   // (Graphics: its 7 rows without scrolling)
+    l.row_h = (page == kControls ? 50 : page == kGraphics ? 60 : 76) * s;   // (Graphics: its 9 rows without scrolling)
     l.gap = 8 * s;
     return l;
 }
@@ -243,6 +250,8 @@ void change(State& s, const Row& r, int dir) {
     case kReflex: b.reflex = (b.reflex + dir + 3) % 3; break;
     case kFps: b.fps_limit = kFpsValues[(fps_index(b.fps_limit) + dir + 8) % 8]; break;
     case kOutRes: b.output_res = (b.output_res + dir + 4) % 4; break;
+    case kAspect: b.aspect = (b.aspect + dir + 5) % 5; break;
+    case kFpsCounter: b.fps_counter = (b.fps_counter + dir + 3) % 3; break;
     case kButtons: b.button_icons = (b.button_icons + dir + 5) % 5; break;
     case kMouseCam: b.mouse_camera = !b.mouse_camera; break;
     case kInvert: b.mouse_invert_y = !b.mouse_invert_y; break;
@@ -275,6 +284,7 @@ void reset_controls(State& s) {
     hos_bind_defaults(&d);
     d.render_mode = b.render_mode, d.aniso = b.aniso, d.reflex = b.reflex;   // (the graphics settings: kept)
     d.button_icons = b.button_icons, d.output_res = b.output_res, d.fps_limit = b.fps_limit;
+    d.fps_counter = b.fps_counter, d.aspect = b.aspect;
     hos_bind_set(&d);
     set_status(s, "Controls and mouse settings are back to the defaults.");
 }
@@ -860,6 +870,45 @@ void paint(Painter& p, State& s, int w, int h) {
     }
 }
 
+// The FPS counter (fps_counter in input.ini): frames shown a second over the last half second, and with 2 their
+// average time and the longest gap in that time, in a small box in the top left corner. Counted here, at each present
+// (with frame interpolation: the frames shown, interpolated ones included).
+struct Counter {
+    int64_t window_start = 0, last = 0, longest = 0;
+    int frames = 0;
+    float fps = 0, ms = 0, worst = 0;
+} counter;
+void count_present() {
+    Counter& c = counter;
+    const int64_t now = hos_now_ns();
+    if (c.last) c.longest = std::max(c.longest, now - c.last);
+    if (!c.window_start || now - c.last > 1000000000LL) c.window_start = now, c.frames = 0, c.longest = 0;
+    c.last = now;
+    c.frames++;
+    const int64_t span = now - c.window_start;
+    if (span >= 500000000LL && c.frames > 1) {
+        c.fps = (float)((c.frames - 1) * 1e9 / (double)span);
+        c.ms = (float)(span / 1e6 / (c.frames - 1));
+        c.worst = (float)(c.longest / 1e6);
+        c.window_start = now, c.frames = 1, c.longest = 0;
+    }
+}
+void paint_counter(Painter& p, int w, int h, int mode) {
+    const float sc = std::min(w / 1920.0f, h / 1080.0f);
+    char a[32], b[64];
+    std::snprintf(a, sizeof a, "%.0f FPS", counter.fps);
+    std::snprintf(b, sizeof b, "%.1f ms  (longest %.1f)", counter.ms, counter.worst);
+    const float pad = 10 * sc, line = G().fonts[kStrong].height;
+    float bw = p.measure(kStrong, a) + 2 * pad, bh = line + 2 * pad * 0.6f;
+    if (mode == 2) bw = std::max(bw, p.measure(kSmall, b) + 2 * pad), bh += G().fonts[kSmall].height;
+    const Rect box{16 * sc, 16 * sc, bw, bh};
+    const float bg[4] = {0, 0, 0, 0.55f};
+    p.rect(box, bg, 8 * sc);
+    const float* c = counter.fps >= 55 ? kAccent : counter.fps >= 28 ? kGold : kText;
+    p.text(kStrong, box.x + pad, box.y + pad * 0.6f, a, c);
+    if (mode == 2) p.text(kSmall, box.x + pad, box.y + pad * 0.6f + line, b, kText2);
+}
+
 // the mouse over the menu: what it points at
 struct Hit {
     int tab = -1, row = -1, part = kNone;
@@ -915,12 +964,15 @@ bool reserved_key(int vk) { return vk == VK_ESCAPE || vk == VK_F1 || vk == VK_F4
 }  // namespace
 
 // ---- the renderer's side ----
-bool menu_open() { return S().open; }
+bool menu_open() { return S().open || hos_fps_counter; }
 
 void menu_draw(WGPUCommandEncoder e, WGPUTextureView target, WGPUTextureFormat format, uint32_t w, uint32_t h) {
     State& s = S();
-    if (!s.open || !w || !h) return;
+    const int counter_mode = hos_fps_counter;
+    if (counter_mode) count_present();
+    if ((!s.open && !counter_mode) || !w || !h) return;
     Gpu& g = G();
+    if (g.failed) return;
     if (!make_gpu(g, format)) {   // (no menu here: closed, so the game has its input back; F1 opens the old window)
         std::lock_guard lk(s.mu);
         s.open = false;
@@ -943,7 +995,12 @@ void menu_draw(WGPUCommandEncoder e, WGPUTextureView target, WGPUTextureFormat f
     {
         std::lock_guard lk(s.mu);
         s.w = (int)w, s.h = (int)h;
-        paint(p, s, (int)w, (int)h);
+        if (s.open) paint(p, s, (int)w, (int)h);
+    }
+    if (counter_mode) {
+        p.alpha = 1;
+        p.end_clip();
+        paint_counter(p, (int)w, (int)h, counter_mode);
     }
     if (p.inst.empty()) return;
     const uint64_t bytes = p.inst.size() * sizeof(Inst);

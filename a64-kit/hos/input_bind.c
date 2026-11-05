@@ -146,14 +146,17 @@ void hos_bind_defaults(Bindings *b) {
     b->button_icons = 0;
     b->output_res = 0;
     b->fps_limit = 60;
+    b->fps_counter = 0;
+    b->aspect = 0;
 }
 
-volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting, hos_fps_limit = 60;
+volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting, hos_fps_limit = 60, hos_fps_counter;
 static void apply_graphics(const Bindings *b) {
     hos_aniso_level = b->aniso;
     hos_reflex_mode = b->reflex;
     hos_button_icons_setting = b->button_icons;
     hos_fps_limit = b->fps_limit;
+    hos_fps_counter = b->fps_counter;
 }
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -204,6 +207,8 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "button_icons")) { b->button_icons = atoi(v); continue; }
         if (!_stricmp(k, "output_resolution")) { b->output_res = atoi(v); continue; }
         if (!_stricmp(k, "frame_rate_limit")) { b->fps_limit = atoi(v); continue; }
+        if (!_stricmp(k, "fps_counter")) { b->fps_counter = atoi(v); continue; }
+        if (!_stricmp(k, "aspect_ratio")) { b->aspect = atoi(v); continue; }
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -229,6 +234,8 @@ static void load(Bindings *b) {
     if (b->button_icons < 0 || b->button_icons > 4) b->button_icons = 0;
     if (b->output_res < 0 || b->output_res > 3) b->output_res = 0;
     if (b->fps_limit != 0 && (b->fps_limit < 30 || b->fps_limit > 240)) b->fps_limit = 60;
+    if (b->fps_counter < 0 || b->fps_counter > 2) b->fps_counter = 0;
+    if (b->aspect < 0 || b->aspect > 4) b->aspect = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -253,7 +260,12 @@ static void save(const Bindings *b) {
                "# the game's output, at the next start: 0 1920x1080 (its own), 1 the display's (the largest 16:9 that fits),\n"
                "# 2 2560x1440, 3 3840x2160\noutput_resolution = %d\n"
                "# frames a second at most: 30 .. 240, or 0 for the display's refresh rate (above 60: beta)\n"
-               "frame_rate_limit = %d\n\n", b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit);
+               "frame_rate_limit = %d\n"
+               "# the frame counter in the top left corner: 0 off, 1 frames a second, 2 and the frame time\n"
+               "fps_counter = %d\n"
+               "# the picture's shape, at the next start: 0 16:9 (the game's own), 1 the display's, 2 16:10, 3 21:9, 4 32:9\n"
+               "aspect_ratio = %d\n\n", b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit, b->fps_counter,
+               b->aspect);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)

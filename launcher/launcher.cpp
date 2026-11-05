@@ -248,7 +248,7 @@ struct Setting {
 };
 
 enum SettingId {
-    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_SEC_GAME, S_OUTRES, S_RES, S_FPS, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
+    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_FPS, S_FPSCOUNTER, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
     S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_LOG, S_COUNT
 };
 std::vector<Setting> settings_list() {
@@ -264,10 +264,14 @@ std::vector<Setting> settings_list() {
     s[S_SEC_GAME] = {K_SECTION, L"In the game (F1 changes these too)", L""};
     s[S_OUTRES] = {K_OPTION, L"Output resolution", L"The size the game draws its frame and HUD in.",
                    {L"1920 x 1080", L"Display", L"2560 x 1440", L"3840 x 2160"}};
+    s[S_ASPECT] = {K_OPTION, L"Aspect ratio", L"Wider or 16:10 screens: more world at the sides, the HUD keeps its shape.",
+                   {L"16:9 (game's own)", L"Display's shape", L"16:10", L"21:9", L"32:9"}};
     s[S_RES] = {K_OPTION, L"3D resolution", L"The 3D scene's share of it, before the upscaler.",
                 {L"Game's own", L"Quality", L"Balanced", L"Performance", L"Ultra Performance", L"Native (DLAA)"}};
     s[S_FPS] = {K_OPTION, L"Frame rate limit", L"Beta above 60: the camera may turn faster, climbing may fail.",
                 {L"30", L"60", L"90", L"120", L"144", L"165", L"240", L"Display's rate"}};
+    s[S_FPSCOUNTER] = {K_OPTION, L"FPS counter", L"In the top left corner of the game.",
+                       {L"Off", L"FPS", L"FPS + frame time"}};
     s[S_ANISO] = {K_OPTION, L"Anisotropic filtering", L"Sharper ground and walls at an angle.",
                   {L"Game's own", L"2x", L"4x", L"8x", L"16x"}};
     s[S_REFLEX] = {K_OPTION, L"NVIDIA Reflex", L"Less input lag (NVIDIA, with the DLSS library).",
@@ -380,6 +384,8 @@ double setting_value(int id) {
     case S_WINDOW: return c.geti(L"window", 0);
     case S_OUTRES: return g.geti("output_resolution", 0);
     case S_FPS: return fps_index(g.geti("frame_rate_limit", 60));
+    case S_ASPECT: return g.geti("aspect_ratio", 0);
+    case S_FPSCOUNTER: return g.geti("fps_counter", 0);
     case S_RES: return g.geti("render_resolution", 0);
     case S_ANISO: return g.geti("anisotropic_filtering", 0);
     case S_REFLEX: return g.geti("nvidia_reflex", 0);
@@ -408,6 +414,8 @@ void set_setting(int id, double v) {
     case S_OUTRES: g.set("output_resolution", std::to_string((int)v)); return;
     case S_FPS: g.set("frame_rate_limit", std::to_string(kFpsValues[std::clamp((int)v, 0, 7)])); return;
     case S_RES: g.set("render_resolution", std::to_string((int)v)); return;
+    case S_ASPECT: g.set("aspect_ratio", std::to_string((int)v)); return;
+    case S_FPSCOUNTER: g.set("fps_counter", std::to_string((int)v)); return;
     case S_ANISO: g.set("anisotropic_filtering", std::to_string((int)v)); return;
     case S_REFLEX: g.set("nvidia_reflex", std::to_string((int)v)); return;
     case S_BUTTONS: g.set("button_icons", std::to_string((int)v)); return;

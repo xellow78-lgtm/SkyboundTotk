@@ -229,6 +229,8 @@ int main(int argc, char **argv) {
     hos_mods_init(image);   /* mods.c: <exe folder>\mods (RomFS files, exefs data patches) */
     void hos_res_init(void);
     hos_res_init();   /* totk_res.c: the game's resolution (output_resolution), and the memory it needs */
+    void hos_aspect_init(void);
+    hos_aspect_init();   /* totk_ultrawide.c: the picture's shape (aspect_ratio), for the cameras and the HUD */
 
     Ctx *c = hos_boot_main_thread(hos_main_stack_size);
     uint64_t sp = c->x[31];

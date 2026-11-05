@@ -34,6 +34,10 @@ typedef struct {
                                               refresh rate (at most 240) */
     int button_icons;                      /* the button prompts drawn: 0 for the device played with, 1 keyboard and
                                               mouse, 2 Xbox, 3 PlayStation, 4 Switch (buttons.c) */
+    int fps_counter;                       /* the frame counter in a corner (rx_menu.cpp, live): 0 off, 1 frames a
+                                              second, 2 and the frame time */
+    int aspect;                            /* the picture's shape (totk_ultrawide.c, at the start): 0 16:9 (the
+                                              game's own), 1 the display's, 2 16:10, 3 21:9, 4 32:9 */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */
@@ -41,6 +45,7 @@ extern volatile int hos_aniso_level;   /* Bindings.aniso */
 extern volatile int hos_reflex_mode;   /* Bindings.reflex */
 extern volatile int hos_button_icons_setting;   /* Bindings.button_icons */
 extern volatile int hos_fps_limit;              /* Bindings.fps_limit */
+extern volatile int hos_fps_counter;            /* Bindings.fps_counter */
 
 /* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
 int hos_render_mode_count(void);

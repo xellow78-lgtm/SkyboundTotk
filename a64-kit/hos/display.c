@@ -304,12 +304,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             hos_log("display: F12: frame dump of the next frame (RX_DUMP_DIR, default rx_frame)");
         }
         if (renderer && wp >= VK_F6 && wp <= VK_F10 && !(lp & (1 << 30))) {   /* the present settings (F6-F10) */
-            hos_log("present: %s", rx_present_hotkey((int)(wp - VK_F6) + 6));
-            if (wp == VK_F6) {   /* (ultrawide: the aspect from the window's size again) */
-                RECT rc;
-                GetClientRect(w, &rc);
-                rx_resize(rc.right, rc.bottom);
-            }
+            hos_log("present: %s", rx_present_hotkey((int)(wp - VK_F6) + 6));   /* (F6: the line alone) */
             present_notice_until = hos_now_ns() + 4000000000LL;
             update_title();
         }

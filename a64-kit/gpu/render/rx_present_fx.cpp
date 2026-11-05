@@ -30,7 +30,6 @@
 
 extern "C" const char* hos_user_dir;
 extern "C" float hos_view_aspect;   // (hos/totk_ultrawide.c: the game's cameras' aspect; 0 their 16:9)
-extern "C" void hos_ultrawide_apply(void);
 
 namespace rx {
 namespace {
@@ -495,16 +494,18 @@ bool mv_debug_draw(WGPUCommandEncoder e, WGPUTextureView target, WGPUTextureForm
 
 PresentRect present_rect(uint32_t sw, uint32_t sh, uint32_t tw, uint32_t th) {
     const Settings set = current_settings();
-    // (ultrawide: the frame holds the window's field of view, so it is stretched over the window)
-    const bool stretch = set.stretch || (set.ultrawide && hos_view_aspect > 0);
     PresentRect r{0, 0, tw, th};
-    if (stretch || !sw || !sh || !tw || !th) return r;
-    // the largest rectangle of the frame's aspect that fits, centred (pixels: at most one off the exact ratio)
-    if ((uint64_t)tw * sh > (uint64_t)th * sw) {
-        r.w = std::max<uint32_t>(1, (uint32_t)((uint64_t)th * sw / sh));
+    if (set.stretch || !sw || !sh || !tw || !th) return r;
+    // the largest rectangle of the picture's shape that fits, centred: the frame's own, or with another aspect ratio
+    // (hos/totk_ultrawide.c: the cameras see that shape in the 16:9 frame) that one, the frame stretched to it
+    const double a = hos_view_aspect > 0 ? (double)hos_view_aspect : (double)sw / (double)sh;
+    if ((double)tw > (double)th * a) {
+        r.w = std::max<uint32_t>(1, (uint32_t)std::lround(th * a));
+        r.w = std::min(r.w, tw);
         r.x = (tw - r.w) / 2;
     } else {
-        r.h = std::max<uint32_t>(1, (uint32_t)((uint64_t)tw * sh / sw));
+        r.h = std::max<uint32_t>(1, (uint32_t)std::lround(tw / a));
+        r.h = std::min(r.h, th);
         r.y = (th - r.h) / 2;
     }
     return r;
@@ -559,12 +560,8 @@ void present_fx_draw(WGPUCommandEncoder e, WGPUTextureView src, uint32_t sw, uin
 }
 bool present_framegen() { return current_settings().framegen; }
 
-/// The window's size (rx_resize): with ultrawide on, a window wider than 16:9 gives the game's cameras its aspect
-void present_window_size(int32_t w, int32_t h) {
-    const float a = w > 0 && h > 0 ? (float)w / (float)h : 0.0f;
-    hos_view_aspect = current_settings().ultrawide && a > 16.0f / 9.0f + 0.01f ? std::min(a, 4.0f) : 0.0f;
-    hos_ultrawide_apply();
-}
+/// The window's size (rx_resize). (The aspect ratio no longer follows it: aspect_ratio in input.ini, at the start.)
+void present_window_size(int32_t w, int32_t h) { (void)w, (void)h; }
 }  // namespace rx
 
 /* A hotkey (7..10: F7 frame interpolation, F8 FSR, F9 sharpness, F10 fit/stretch; 0: none): the settings after it,
@@ -581,7 +578,6 @@ extern "C" const char* rx_present_hotkey(int key) {
             s.sharpness = kSharpness[(i + 1) % 5];
         }
         if (key == 10) s.stretch = !s.stretch;
-        if (key == 6) s.ultrawide = !s.ultrawide;
         {
             std::lock_guard lk(settings_mu);
             settings = s;
@@ -590,8 +586,8 @@ extern "C" const char* rx_present_hotkey(int key) {
     }
     static thread_local char line[160];
     std::snprintf(line, sizeof line,
-                  "FSR %s (F8), sharpness %.2f (F9), %s (F10), frame interpolation %s (F7), ultrawide %s (F6)",
-                  s.fsr ? "on" : "off", s.sharpness, s.stretch ? "stretched" : "aspect kept", s.framegen ? "on" : "off",
-                  s.ultrawide ? (hos_view_aspect > 0 ? "on" : "on (the window is 16:9)") : "off");
+                  "FSR %s (F8), sharpness %.2f (F9), %s (F10), frame interpolation %s (F7); aspect ratio %s (F1)",
+                  s.fsr ? "on" : "off", s.sharpness, s.stretch ? "stretched" : "shape kept", s.framegen ? "on" : "off",
+                  hos_view_aspect > 0 ? (hos_view_aspect > 16.0f / 9.0f ? "wide" : "tall") : "16:9");
     return line;
 }
