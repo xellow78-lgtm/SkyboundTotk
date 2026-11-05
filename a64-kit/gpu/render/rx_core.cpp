@@ -25,6 +25,8 @@
 
 #include "rx_internal.h"
 #include "video_core/textures/decoders.h"
+/* nn_vi.c: 1 while presents wait for the display's vsync (FIFO), 0 with VSync off (RX_PRESENT=mailbox / immediate) */
+extern "C" { volatile int rx_vsync_on = 1; }
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include <emscripten/threading.h>
@@ -576,6 +578,9 @@ bool init_device(HWND hwnd) {
     wgpuSurfaceCapabilitiesFreeMembers(caps);
 #ifdef __EMSCRIPTEN__
     present_mode = WGPUPresentMode_Fifo;
+#endif
+    ::rx_vsync_on = present_mode == WGPUPresentMode_Fifo;
+#ifdef __EMSCRIPTEN__
     configure_surface(1280, 720);
 #else
     RECT rc;

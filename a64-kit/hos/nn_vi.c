@@ -88,9 +88,14 @@ static double frame_cap_hz(void) {
         }
         if (hz > FPS_MAX) hz = FPS_MAX;
     }
-    /* frame interpolation (F7, F1): the game at most the display's rate / the frames shown per game frame, so every
-       made frame is shown, each for the same time (more than the display shows are thrown away, unevenly) */
-    const int per = rx_framegen_shown_per_frame();
+    /* frame interpolation (F7, F1): with VSync on, the game at most the display's rate / the frames shown per game
+       frame, so every made frame is shown, each for the same time (more than the display shows are thrown away,
+       unevenly). With VSync off (rx_vsync_on 0: RX_PRESENT=mailbox / immediate, the launcher's VSync setting) the
+       game keeps its own cap and the frames shown go above the display's rate (asked for on a 75 Hz school display):
+       the display still shows only its rate of them (mailbox: the newest at each refresh; immediate: parts of
+       several, torn) */
+    extern volatile int rx_vsync_on;
+    const int per = rx_vsync_on ? rx_framegen_shown_per_frame() : 1;
     const char *why = env ? "HOS_FPS_CAP" : hos_fps_limit ? "frame_rate_limit" : "the display's refresh rate";
     if (per > 1) {
         const int64_t p = display_period_ns;
