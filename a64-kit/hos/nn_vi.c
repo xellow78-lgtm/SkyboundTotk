@@ -63,15 +63,19 @@ static double vsync_target_hz(void) {
 
 /* With real-time steps frames are not held to vsync ticks (a grid of ticks turns a 15 ms frame into two ticks: at a
    90 Hz grid, 45 fps): each frame may start 1/cap after the one before, and goes out as soon as it is done (mailbox
-   presents: no tearing). The cap is frame_rate_limit in input.ini (F1 > Graphics, the launcher; live): 30..240, or 0
-   for the display's refresh rate; 60 by default. 240 at most: with a shorter step TOTK 1.4.3's physics runs out of
-   memory or crashes on some loads (totk-pc-recomp's measurements, runtime/frame_rate.c). HOS_FPS_CAP=<hz> overrides. */
+   presents: no tearing). The cap is frame_rate_limit in input.ini (F1 > Graphics, the launcher; live): 30..200, or 0
+   for the display's refresh rate (at most 200); 60 by default. 200 at most (FPS_MAX): above it the game's sound fades
+   out to silence within ~10 s and stays silent (school PC, RTX 5080, 2026-11-05: 30..165 and 200 keep it, 230 and 240
+   lose it; HOS_AUDIO_STATS showed the game's own mixes fading to 0, our output fine; the game code that does it is
+   not found yet). (And with a step under 1/240 s TOTK 1.4.3's physics runs out of memory or crashes on some loads:
+   totk-pc-recomp's measurements, runtime/frame_rate.c.) HOS_FPS_CAP=<hz> overrides, also at most 200. */
+#define FPS_MAX 200
 static volatile LONG64 display_period_ns;   /* (the vsync thread reads the display's timing) */
 static double frame_cap_hz(void) {
     static double env = -1, shown = -1;
     if (env < 0) {
         const char *e = getenv("HOS_FPS_CAP");
-        env = e && atof(e) >= 20 ? (atof(e) > 240 ? 240 : atof(e)) : 0;
+        env = e && atof(e) >= 20 ? (atof(e) > FPS_MAX ? FPS_MAX : atof(e)) : 0;
     }
     double hz = env;
     if (!hz) {
@@ -82,7 +86,7 @@ static double frame_cap_hz(void) {
             hz = p ? 1e9 / (double)p : 60;   /* (the display's rate not known yet: 60) */
             if (hz < 50) hz = 60;
         }
-        if (hz > 240) hz = 240;
+        if (hz > FPS_MAX) hz = FPS_MAX;
     }
     if (hz != shown) {
         hos_log("vi: frames at most %.0f a second (%s)%s", hz,
@@ -359,7 +363,9 @@ static void frame_step_present(int64_t now) {
     const int k = step_frames();
     static int last_k;
     if (k != last_k) n = next = 0, last_k = k;   /* (the setting changed: start over) */
-    samples[next++ % k] = dt < 1.0 / 240 ? 1.0 / 240 : dt > 1.0 / 15 ? 1.0 / 15 : dt;
+    /* (the shortest step 1/FPS_MAX s: a frame shown sooner than that after a slow one still steps the game no less:
+       the sound fades out with shorter steps; see frame_cap_hz) */
+    samples[next++ % k] = dt < 1.0 / FPS_MAX ? 1.0 / FPS_MAX : dt > 1.0 / 15 ? 1.0 / 15 : dt;
     if (n < k) n++;
     double sum = 0;
     for (int i = 0; i < n; i++) sum += samples[i];

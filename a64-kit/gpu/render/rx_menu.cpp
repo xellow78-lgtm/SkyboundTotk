@@ -66,8 +66,8 @@ struct Row {
 
 const char* const kAnisoNames[5] = {"Game's own", "2x", "4x", "8x", "16x"};
 const char* const kReflexNames[3] = {"Off", "On", "On + Boost"};
-const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 240, 0};
-const char* const kFpsNames[8] = {"30", "60", "90", "120", "144", "165", "240", "Display's rate"};
+const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 200, 0};   // (200 at most: nn_vi.c FPS_MAX)
+const char* const kFpsNames[8] = {"30", "60", "90", "120", "144", "165", "200", "Display's rate"};
 int fps_index(int v) {
     for (int i = 0; i < 8; i++)
         if (kFpsValues[i] == v) return i;

@@ -271,7 +271,7 @@ std::vector<Setting> settings_list() {
     s[S_RES] = {K_OPTION, L"3D resolution", L"The 3D scene's share of it, before the upscaler.",
                 {L"Game's own", L"Quality", L"Balanced", L"Performance", L"Ultra Performance", L"Native (DLAA)"}};
     s[S_FPS] = {K_OPTION, L"Frame rate limit", L"Beta above 60: the camera may turn faster, climbing may fail.",
-                {L"30", L"60", L"90", L"120", L"144", L"165", L"240", L"Display's rate"}};
+                {L"30", L"60", L"90", L"120", L"144", L"165", L"200", L"Display's rate"}};
     s[S_FRAMETIMING] = {K_OPTION, L"Frame timing", L"Responsive: no speed-up after a slow frame on G-Sync / FreeSync.",
                         {L"Smooth", L"Responsive"}};
     s[S_FPSCOUNTER] = {K_OPTION, L"FPS counter", L"In the top left corner of the game.",
@@ -385,8 +385,9 @@ void load_all() {
     }
 }
 
-const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 240, 0};   // (input.ini frame_rate_limit; 0 the display's)
+const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 200, 0};   // (input.ini frame_rate_limit; 0 the display's; 200 at most)
 int fps_index(int v) {
+    if (v > 200) v = 200;   // (240 was a choice before: the game takes it as 200)
     for (int i = 0; i < 8; i++)
         if (kFpsValues[i] == v) return i;
     return 1;

@@ -236,7 +236,8 @@ static void load(Bindings *b) {
     if (b->reflex < 0 || b->reflex > 2) b->reflex = 0;
     if (b->button_icons < 0 || b->button_icons > 4) b->button_icons = 0;
     if (b->output_res < 0 || b->output_res > 3) b->output_res = 0;
-    if (b->fps_limit != 0 && (b->fps_limit < 30 || b->fps_limit > 240)) b->fps_limit = 60;
+    if (b->fps_limit > 200) b->fps_limit = 200;   /* (240 was a choice before: the game's sound fades out above 200) */
+    if (b->fps_limit != 0 && b->fps_limit < 30) b->fps_limit = 60;
     if (b->fps_counter < 0 || b->fps_counter > 2) b->fps_counter = 0;
     if (b->aspect < 0 || b->aspect > 4) b->aspect = 0;
     if (b->frame_timing < 0 || b->frame_timing > 1) b->frame_timing = 0;
@@ -263,7 +264,7 @@ static void save(const Bindings *b) {
                "button_icons = %d\n"
                "# the game's output, at the next start: 0 1920x1080 (its own), 1 the display's (the largest 16:9 that fits),\n"
                "# 2 2560x1440, 3 3840x2160\noutput_resolution = %d\n"
-               "# frames a second at most: 30 .. 240, or 0 for the display's refresh rate (above 60: beta)\n"
+               "# frames a second at most: 30 .. 200, or 0 for the display's refresh rate (at most 200; above 60: beta)\n"
                "frame_rate_limit = %d\n"
                "# the frame counter in the top left corner: 0 off, 1 frames a second, 2 and the frame time\n"
                "fps_counter = %d\n"
