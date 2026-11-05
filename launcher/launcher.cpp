@@ -248,7 +248,7 @@ struct Setting {
 };
 
 enum SettingId {
-    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_SEC_GAME, S_RES, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
+    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_SEC_GAME, S_OUTRES, S_RES, S_ANISO, S_REFLEX, S_BUTTONS, S_MOUSECAM,
     S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_LOG, S_COUNT
 };
 std::vector<Setting> settings_list() {
@@ -262,8 +262,10 @@ std::vector<Setting> settings_list() {
     s[S_WINDOW] = {K_OPTION, L"Window size", L"The window's size before fullscreen.",
                    {L"1280 x 720", L"1600 x 900", L"1920 x 1080", L"2560 x 1440"}};
     s[S_SEC_GAME] = {K_SECTION, L"In the game (F1 changes these too)", L""};
-    s[S_RES] = {K_OPTION, L"3D resolution", L"The 3D scene's size before the upscaler.",
-                {L"Game's own", L"Quality", L"Balanced", L"Performance", L"Ultra Performance"}};
+    s[S_OUTRES] = {K_OPTION, L"Output resolution", L"The size the game draws its frame and HUD in.",
+                   {L"1920 x 1080", L"Display", L"2560 x 1440", L"3840 x 2160"}};
+    s[S_RES] = {K_OPTION, L"3D resolution", L"The 3D scene's share of it, before the upscaler.",
+                {L"Game's own", L"Quality", L"Balanced", L"Performance", L"Ultra Performance", L"Native (DLAA)"}};
     s[S_ANISO] = {K_OPTION, L"Anisotropic filtering", L"Sharper ground and walls at an angle.",
                   {L"Game's own", L"2x", L"4x", L"8x", L"16x"}};
     s[S_REFLEX] = {K_OPTION, L"NVIDIA Reflex", L"Less input lag (NVIDIA, with the DLSS library).",
@@ -367,6 +369,7 @@ double setting_value(int id) {
     case S_SHARP: return c.getf(L"sharpness", 0.5);
     case S_DISPLAY: return c.geti(L"fullscreen", 0);
     case S_WINDOW: return c.geti(L"window", 0);
+    case S_OUTRES: return g.geti("output_resolution", 0);
     case S_RES: return g.geti("render_resolution", 0);
     case S_ANISO: return g.geti("anisotropic_filtering", 0);
     case S_REFLEX: return g.geti("nvidia_reflex", 0);
@@ -392,6 +395,7 @@ void set_setting(int id, double v) {
     case S_DISPLAY: c.v[L"fullscreen"] = std::to_wstring((int)v); break;
     case S_WINDOW: c.v[L"window"] = std::to_wstring((int)v); break;
     case S_MODS_ON: c.v[L"mods_on"] = std::to_wstring((int)v); break;
+    case S_OUTRES: g.set("output_resolution", std::to_string((int)v)); return;
     case S_RES: g.set("render_resolution", std::to_string((int)v)); return;
     case S_ANISO: g.set("anisotropic_filtering", std::to_string((int)v)); return;
     case S_REFLEX: g.set("nvidia_reflex", std::to_string((int)v)); return;
@@ -558,9 +562,10 @@ void draw_play(Draw& d, RectF c) {
     card(d, RectF(c.X, cy, cw, ch), L"Upscaler", list[S_UPSCALER].options[std::clamp(up, 0, 2)],
          no_dlss ? L"DLSS library missing: FSR 2 runs" : up ? L"Sharpness " + slider_text(S_SHARP, setting_value(S_SHARP)) : L"Native resolution",
          no_dlss ? kGold : kAccent);
-    card(d, RectF(c.X + cw + 14 * s, cy, cw, ch), L"3D resolution",
-         list[S_RES].options[std::clamp((int)setting_value(S_RES), 0, 4)],
-         (int)setting_value(S_DISPLAY) ? L"Fullscreen" : wstring(L"Windowed, ") + list[S_WINDOW].options[std::clamp((int)setting_value(S_WINDOW), 0, 3)],
+    card(d, RectF(c.X + cw + 14 * s, cy, cw, ch), L"Resolution",
+         list[S_OUTRES].options[std::clamp((int)setting_value(S_OUTRES), 0, 3)],
+         wstring(L"3D: ") + list[S_RES].options[std::clamp((int)setting_value(S_RES), 0, 5)] + L"  \u00B7  " +
+             ((int)setting_value(S_DISPLAY) ? L"Fullscreen" : L"Windowed"),
          kText);
     const wstring mods = app.cfg.get(L"mods");
     const bool mods_on = (int)setting_value(S_MODS_ON) && !mods.empty() && is_dir(mods);

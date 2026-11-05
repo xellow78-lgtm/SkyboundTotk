@@ -215,7 +215,9 @@ HLE(_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE) {
    with each queue is ignored: our GPU (hos/nvdrv.c) completes submissions before the queue arrives. */
 uint64_t hos_hostcall(const char *name, void (*fn)(Ctx *, void *), void *user);
 enum { NW_SLOTS = 8, ANW_SIZE = 0xc0, ANB_SIZE = 0xa8 };
-enum { NW_WIDTH = 1920, NW_HEIGHT = 1080 };
+extern unsigned hos_out_w, hos_out_h;   /* totk_res.c: the game's output (1920x1080 unless set bigger) */
+#define NW_WIDTH ((int)hos_out_w)
+#define NW_HEIGHT ((int)hos_out_h)
 static struct {
     uint64_t buffer[NW_SLOTS];          /* guest ANativeWindowBuffer per slot, 0 = unregistered */
     int64_t free_at[NW_SLOTS];          /* vsync from which the slot may be dequeued again */

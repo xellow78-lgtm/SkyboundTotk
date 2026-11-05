@@ -38,6 +38,8 @@ extern "C" {
 #include "../../hos/input_bind.h"
 }
 
+extern "C" unsigned hos_out_w, hos_out_h;   // hos/totk_res.c
+
 namespace rx {
 bool fsr2_wanted();   // rx_fsr2.cpp
 
@@ -49,7 +51,7 @@ const char* const kPageNames[kPages] = {"Graphics", "Mouse", "Controls"};
 
 enum Kind { kOption, kSlider, kToggle, kBinding, kButton, kInfo, kSection };
 enum Id {
-    kRes, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
+    kOutRes, kRes, kAniso, kReflex, kButtons, kUpscaler, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
 };
 
 struct Row {
@@ -64,6 +66,7 @@ struct Row {
 
 const char* const kAnisoNames[5] = {"Game's own", "2x", "4x", "8x", "16x"};
 const char* const kReflexNames[3] = {"Off", "On", "On + Boost"};
+const char* const kOutResNames[4] = {"1920 x 1080", "Display", "2560 x 1440", "3840 x 2160"};
 const char* const kButtonNames[5] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Switch"};
 
 // the bindings page: the buttons, the d-pad, the sticks and walk (sections between)
@@ -85,6 +88,9 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
     };
     if (page == kGraphics) {
         const bool scaler = fsr2_wanted();
+        char now[96];
+        std::snprintf(now, sizeof now, "The game's own size. Now %ux%u; at the next start.", hos_out_w, hos_out_h);
+        add(kOption, kOutRes, "Output resolution", kOutResNames[std::clamp(b.output_res, 0, 3)], now);
         Row& res = add(kOption, kRes, "3D resolution", hos_render_mode_name(b.render_mode),
                        scaler ? "The 3D scene's size before the upscaler." : "Needs FSR 2 or DLSS (set at launch).");
         res.enabled = scaler;
@@ -225,6 +231,7 @@ void change(State& s, const Row& r, int dir) {
     case kRes: b.render_mode = (b.render_mode + dir + hos_render_mode_count()) % hos_render_mode_count(); break;
     case kAniso: b.aniso = (b.aniso + dir + 5) % 5; break;
     case kReflex: b.reflex = (b.reflex + dir + 3) % 3; break;
+    case kOutRes: b.output_res = (b.output_res + dir + 4) % 4; break;
     case kButtons: b.button_icons = (b.button_icons + dir + 5) % 5; break;
     case kMouseCam: b.mouse_camera = !b.mouse_camera; break;
     case kInvert: b.mouse_invert_y = !b.mouse_invert_y; break;
@@ -256,7 +263,7 @@ void reset_controls(State& s) {
     hos_bind_get(&b);
     hos_bind_defaults(&d);
     d.render_mode = b.render_mode, d.aniso = b.aniso, d.reflex = b.reflex;   // (the graphics settings: kept)
-    d.button_icons = b.button_icons;
+    d.button_icons = b.button_icons, d.output_res = b.output_res;
     hos_bind_set(&d);
     set_status(s, "Controls and mouse settings are back to the defaults.");
 }

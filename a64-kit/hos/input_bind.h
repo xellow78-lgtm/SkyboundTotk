@@ -28,6 +28,8 @@ typedef struct {
                                               Performance (not a binding, but saved with them: F1 shows it) */
     int aniso;                             /* anisotropic filtering: 0 the game's own, 1 2x, 2 4x, 3 8x, 4 16x */
     int reflex;                            /* NVIDIA Reflex: 0 off, 1 on, 2 on + boost */
+    int output_res;                        /* the game's output (totk_res.c, at the start): 0 1920x1080 (its own),
+                                              1 the display's (the largest 16:9 that fits), 2 2560x1440, 3 3840x2160 */
     int button_icons;                      /* the button prompts drawn: 0 for the device played with, 1 keyboard and
                                               mouse, 2 Xbox, 3 PlayStation, 4 Switch (buttons.c) */
 } Bindings;

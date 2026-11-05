@@ -846,5 +846,56 @@ def main():
     print(f'done in {time.time() - t0:.1f} s')
 
 
+# ---- the heap table for a bigger game resolution (hos/totk_res.c): button_icons.py --heapdef <in> <out> <extra KiB> ----
+# As totk-pc-recomp's runtime/resolution.c res_heapdef_build (MIT, Copyright (c) 2026 Valiantsin Dzerakh): in
+# System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs, the sizes of the heaps DynamicTextureAllocatorMem (the render
+# targets of the output and the scene) and Graphics (which it is carved from) grow by the same amount. A BYML (v2..7,
+# little endian "YB"): a hash node is {u8 0xC1, u24 count} then entries {u24 key index, u8 type, u32 value}; an int
+# (type 0xD1) is in the entry itself, so a size changes in place and the file keeps its size.
+def heapdef(src, dst, extra_kib):
+    raw = open(src, 'rb').read()
+    if zframe_dict(raw):
+        sys.exit('heapdef: the table needs a zstd dictionary: not handled')
+    b = bytearray(zdecompress(raw))
+    if b[:2] != b'YB' or not 2 <= struct.unpack_from('<H', b, 2)[0] <= 7:
+        sys.exit('heapdef: not a little-endian BYML v2..7')
+    keys, root = struct.unpack_from('<I', b, 4)[0], struct.unpack_from('<I', b, 12)[0]
+
+    def key_name(k):
+        head = struct.unpack_from('<I', b, keys)[0]
+        if head & 0xff != 0xc2 or k >= head >> 8:
+            return None
+        at = keys + struct.unpack_from('<I', b, keys + 4 + 4 * k)[0]
+        return bytes(b[at:b.index(0, at)]).decode('utf-8', 'replace')
+
+    def field(node, name, typ):
+        head = struct.unpack_from('<I', b, node)[0]
+        if head & 0xff != 0xc1:
+            return 0
+        for i in range(head >> 8):
+            e = struct.unpack_from('<I', b, node + 4 + 8 * i)[0]
+            if key_name(e & 0xffffff) == name:
+                return node + 8 + 8 * i if e >> 24 == typ else 0
+        return 0
+
+    heaps_at = field(root, 'Heaps', 0xc1)
+    heaps = struct.unpack_from('<I', b, heaps_at)[0] if heaps_at else 0
+    out = {}
+    for name in ('DynamicTextureAllocatorMem', 'Graphics'):
+        at = field(heaps, name, 0xc1) if heaps else 0
+        size_at = field(struct.unpack_from('<I', b, at)[0], 'Size', 0xd1) if at else 0
+        if not size_at:
+            sys.exit('heapdef: no %s size in the table' % name)
+        old = struct.unpack_from('<i', b, size_at)[0]
+        struct.pack_into('<i', b, size_at, old + extra_kib)
+        out[name] = (old, old + extra_kib)
+    write(os.path.abspath(dst), zcompress(bytes(b)))
+    for name, (old, new) in out.items():
+        print('heapdef: %s %d -> %d KiB' % (name, old, new))
+
+
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) == 5 and sys.argv[1] == '--heapdef':
+        heapdef(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+    else:
+        main()

@@ -14,6 +14,7 @@
 #include "rx_internal.h"
 
 extern "C" volatile float hos_render_scale;   // (hos/totk_drs.c: the 3D resolution setting; 0 the game's own)
+extern "C" unsigned hos_out_w, hos_out_h;      // (hos/totk_res.c: the game's output size)
 #include "rx_fsr2_shaders.h"
 
 #include <cmath>
@@ -534,7 +535,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     if (dw <= mw && dh <= mh) return false;
     // (and the second shader only into the game's final 1920x1080 image: it also scales 800x448 into 1600x896 on the
     // title screen, and FSR 2 resizing between the two crashed at startup: run_quality.log 2026-11-03 22:08)
-    if (fs_key == hook2 && hook2 != hook && (dw < 1920 || dh < 1080)) return false;
+    if (fs_key == hook2 && hook2 != hook && (dw < hos_out_w || dh < hos_out_h)) return false;
     if (!rw || !rh || rw > mw || rh > mh || wgpuTextureGetWidth(scene_depth) < rw || dw < rw) {
         static int lines;
         if (lines++ < 50)

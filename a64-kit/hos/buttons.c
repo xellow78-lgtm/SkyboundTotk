@@ -38,6 +38,7 @@ void hos_note_device(int style) {
 #ifdef __EMSCRIPTEN__   /* (the browser: the Switch's prompts) */
 int hos_buttons_romfs(const char *rel, char *out, size_t cap) { (void)rel, (void)out, (void)cap; return 0; }
 int hos_button_hud_style(void) { return 4; }
+int hos_run_tool(const char *cwd, const char *args, const char *log_name) { (void)cwd, (void)args, (void)log_name; return 0; }
 int hos_button_hud(uint64_t hash, uint32_t w, uint32_t h, const uint8_t **mask) {
     (void)hash, (void)w, (void)h, (void)mask;
     return 0;
@@ -138,13 +139,14 @@ static void exe_dir(char *out, size_t cap) {
     out[n] = 0;
 }
 
-/* runs the tool on the request; 1 if it ran and finished */
-static int run_tool(const char *cache, const char *request) {
+/* Runs tools/button_icons.py (next to the exe) with `args`, in the folder `cwd`, its output into cwd\<log_name>; 1 if
+   it ran and finished. totk_res.c uses it too (the grown heap table). */
+int hos_run_tool(const char *cwd, const char *args, const char *log_name) {
     char dir[MAX_PATH], tool[MAX_PATH], python[MAX_PATH] = "python";
     exe_dir(dir, sizeof dir);
     snprintf(tool, sizeof tool, "%sbutton_icons.py", dir);
     if (GetFileAttributesA(tool) == INVALID_FILE_ATTRIBUTES) {
-        hos_log("buttons: %s not found (build.py puts it there): the Switch's button prompts", tool);
+        hos_log("tools: %s not found (build.py puts it there)", tool);
         return 0;
     }
     if (getenv("HOS_PYTHON")) snprintf(python, sizeof python, "%s", getenv("HOS_PYTHON"));
@@ -159,9 +161,9 @@ static int run_tool(const char *cache, const char *request) {
             free(s);
         }
     }
-    char log_path[MAX_PATH], cmd[3 * MAX_PATH + 32];
-    snprintf(log_path, sizeof log_path, "%s\\tool.log", cache);
-    snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" \"%s\"", python, tool, request);
+    char log_path[MAX_PATH], cmd[4 * MAX_PATH + 32];
+    snprintf(log_path, sizeof log_path, "%s\\%s", cwd, log_name);
+    snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" %s", python, tool, args);
     SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
     HANDLE log = CreateFileA(log_path, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     STARTUPINFOA si = {0};
@@ -170,16 +172,16 @@ static int run_tool(const char *cache, const char *request) {
     si.hStdOutput = si.hStdError = log;
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION pi;
-    hos_log("buttons: making the button icons (%s)", cmd);
+    hos_log("tools: running %s", cmd);
     const int64_t t0 = hos_now_ns();
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, cache, &si, &pi)) {
-        hos_log("buttons: could not run %s (error %lu): the Switch's button prompts", python, GetLastError());
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, cwd, &si, &pi)) {
+        hos_log("tools: could not run %s (error %lu)", python, GetLastError());
         if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
         return 0;
     }
     DWORD code = 1;
     if (WaitForSingleObject(pi.hProcess, 180000) != WAIT_OBJECT_0) {
-        hos_log("buttons: the tool took over 3 minutes: stopped");
+        hos_log("tools: the tool took over 3 minutes: stopped");
         TerminateProcess(pi.hProcess, 1);
     } else {
         GetExitCodeProcess(pi.hProcess, &code);
@@ -187,7 +189,7 @@ static int run_tool(const char *cache, const char *request) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
-    hos_log("buttons: the tool %s in %.1f s (its output: %s)", code ? "failed" : "finished", (hos_now_ns() - t0) / 1e9,
+    hos_log("tools: the tool %s in %.1f s (its output: %s)", code ? "failed" : "finished", (hos_now_ns() - t0) / 1e9,
             log_path);
     return code == 0;
 }
@@ -296,7 +298,9 @@ static void prepare(void) {
         snprintf(path, sizeof path, "%s\\request.txt", cache);
         FILE *f = fopen(path, "wb");
         if (f) fwrite(req.s, 1, req.n, f), fclose(f);
-        if (f && run_tool(cache, path)) {
+        char args[MAX_PATH + 4];
+        snprintf(args, sizeof args, "\"%s\"", path);
+        if (f && hos_run_tool(cache, args, "tool.log")) {
             snprintf(path, sizeof path, "%s\\stamp.txt", cache);
             have = read_file(path, NULL);
             ok = have && !strncmp(have, stamp, 16);

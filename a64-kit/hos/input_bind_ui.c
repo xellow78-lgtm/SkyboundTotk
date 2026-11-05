@@ -247,7 +247,7 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             const Bindings old = b;   /* (the graphics settings: kept) */
             hos_bind_defaults(&b);
             b.render_mode = old.render_mode, b.aniso = old.aniso, b.reflex = old.reflex;
-            b.button_icons = old.button_icons;
+            b.button_icons = old.button_icons, b.output_res = old.output_res;
             hos_bind_set(&b);
             set_status("All bindings and mouse settings are back to the defaults.");
             refresh();

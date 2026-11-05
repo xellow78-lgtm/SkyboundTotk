@@ -22,26 +22,47 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The scene's size as a fraction of the full size (0 = the game's own dynamic resolution), and its modes for a
-   1920x1080 output (FSR 2 / DLSS names). The setting is "render_resolution" in input.ini (the F1 window's slider,
-   input_bind.c); F4 goes to the next one; HOS_RENDER_SCALE (a number, or quality / balanced / performance / ultra)
-   overrides it at start. The full size is the targets' 1600x896, so nothing above it. */
+/* The 3D scene's size: the game's own dynamic resolution, or a share of the game's output (FSR 2 / DLSS names: Quality
+   1.5x, Balanced 1.7x, Performance 2x, Ultra Performance 3x, Native 1x). The setting is "render_resolution" in
+   input.ini (F1 > Graphics, the launcher; input_bind.c); F4 goes to the next one; HOS_RENDER_SCALE (a number, or
+   quality / balanced / performance / ultra) overrides it at start.
+   The scene's render targets are the game's 5/6 of the output (totk_res.c: 1600x896 at 1080p, 2133x1200 at 1440p),
+   or the whole output when Native was chosen at the start (totk_res.c: the scene splice); a mode draws into that share
+   of them (hos_render_scale, the view box below). Native without the scene splice is the targets' full 5/6. */
 #include "input_bind.h"
-static const struct { const char *name; float scale; } modes[] = {
-    {"the game's own (dynamic, up to 1600x896)", 0},
-    {"Quality (1.5x: 1280x720)", 0.8f},
-    {"Balanced (1.7x: 1129x635)", 0.70588f},
-    {"Performance (2x: 960x540)", 0.6f},
-    {"Ultra Performance (3x: 640x360)", 0.4f},
+static const struct { const char *name; float share; } modes[] = {
+    {"Game's own", 0}, {"Quality", 2.0f / 3.0f}, {"Balanced", 1.0f / 1.7f}, {"Performance", 0.5f},
+    {"Ultra Performance", 1.0f / 3.0f}, {"Native (DLAA)", 1.0f},
 };
 enum { NMODES = sizeof modes / sizeof *modes };
+extern unsigned hos_out_w, hos_out_h;   /* totk_res.c */
+float hos_res_scene_share(void);
+int hos_res_native(void);
 volatile float hos_render_scale = -1;
 int hos_render_mode_count(void) { return NMODES; }
-const char *hos_render_mode_name(int m) { return modes[m < 0 || m >= NMODES ? 0 : m].name; }
+static float mode_scale(int m) {   /* (of the targets) */
+    if (m <= 0 || m >= NMODES) return 0;
+    const float s = modes[m].share / hos_res_scene_share();
+    return s > 1 ? 1 : s;
+}
+const char *hos_render_mode_name(int m) {
+    static char names[NMODES][64];
+    if (m < 0 || m >= NMODES) m = 0;
+    const float share = hos_res_scene_share();
+    if (m == 0)
+        snprintf(names[m], 64, "Game's own (up to %ux%u)", (unsigned)(hos_out_w * share), (unsigned)(hos_out_h * share));
+    else if (m == NMODES - 1 && !hos_res_native())
+        snprintf(names[m], 64, "Native (DLAA) - at the next start");
+    else
+        snprintf(names[m], 64, "%s (%ux%u)", modes[m].name, (unsigned)(hos_out_w * modes[m].share + 0.5f),
+                 (unsigned)(hos_out_h * modes[m].share + 0.5f));
+    return names[m];
+}
 void hos_render_mode_apply(int m) {
     if (m < 0 || m >= NMODES) m = 0;
-    if (hos_render_scale != modes[m].scale) hos_log("drs: 3D resolution: %s", modes[m].name);
-    hos_render_scale = modes[m].scale;
+    const float s = mode_scale(m);
+    if (hos_render_scale != s) hos_log("drs: 3D resolution: %s", hos_render_mode_name(m));
+    hos_render_scale = s;
 }
 /* (the modes need FSR 2: the game's own scale-up draws a smaller scene into a corner of the screen, see below) */
 static int fsr2_enabled(void) {
@@ -62,8 +83,8 @@ static float render_scale(void) {
             char low[16] = {0};
             for (int i = 0; i < 15 && e[i]; i++) low[i] = (char)(e[i] | 0x20);
             float s = 0;
-            for (int i = 1; i < NMODES; i++)
-                if (!strncmp(low, keys[i], strlen(keys[i]))) s = modes[i].scale;
+            for (int i = 1; i < 5; i++)
+                if (!strncmp(low, keys[i], strlen(keys[i]))) s = mode_scale(i);
             if (!s) s = (float)atof(e);
             hos_render_scale = s > 0.2f && s <= 1 ? s : 0;
             hos_log("drs: the 3D scene at %.3g of its full size (HOS_RENDER_SCALE)", hos_render_scale);
@@ -82,7 +103,7 @@ const char *hos_render_mode_cycle(void) {
     b.render_mode = (b.render_mode + 1) % NMODES;
     hos_bind_set(&b);   /* (applies it) */
     static char t[96];
-    snprintf(t, sizeof t, "3D resolution: %s", modes[b.render_mode].name);
+    snprintf(t, sizeof t, "3D resolution: %s", hos_render_mode_name(b.render_mode));
     return t;
 }
 

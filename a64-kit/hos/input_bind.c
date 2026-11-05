@@ -144,6 +144,7 @@ void hos_bind_defaults(Bindings *b) {
     b->aniso = 0;
     b->reflex = 0;
     b->button_icons = 0;
+    b->output_res = 0;
 }
 
 volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting;
@@ -199,6 +200,7 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "anisotropic_filtering")) { b->aniso = atoi(v); continue; }
         if (!_stricmp(k, "nvidia_reflex")) { b->reflex = atoi(v); continue; }
         if (!_stricmp(k, "button_icons")) { b->button_icons = atoi(v); continue; }
+        if (!_stricmp(k, "output_resolution")) { b->output_res = atoi(v); continue; }
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -222,6 +224,7 @@ static void load(Bindings *b) {
     if (b->aniso < 0 || b->aniso > 4) b->aniso = 0;
     if (b->reflex < 0 || b->reflex > 2) b->reflex = 0;
     if (b->button_icons < 0 || b->button_icons > 4) b->button_icons = 0;
+    if (b->output_res < 0 || b->output_res > 3) b->output_res = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -236,13 +239,16 @@ static void save(const Bindings *b) {
     fprintf(f, "mouse_camera = %d\nmouse_sensitivity = %.3f\nmouse_vertical_speed = %.2f\n"
                "mouse_ultrahand_holding_speed = %.2f\nmouse_invert_y = %d\nwalk_speed = %.2f\n\n", b->mouse_camera,
                b->mouse_sens, b->mouse_pitch, b->mouse_hold, b->mouse_invert_y, b->walk_scale);
-    fprintf(f, "# 3D resolution: 0 the game's own (dynamic, up to 1600x896), 1 Quality (1280x720), 2 Balanced\n"
-               "# (1129x635), 3 Performance (960x540), 4 Ultra Performance (640x360); FSR 2 scales it up\n"
-               "render_resolution = %d\n", b->render_mode);
+    fprintf(f, "# 3D resolution (of the output): 0 the game's own (dynamic, up to 5/6), 1 Quality (2/3), 2 Balanced\n"
+               "# (1/1.7), 3 Performance (1/2), 4 Ultra Performance (1/3), 5 Native (DLAA; chosen at the start: the full\n"
+               "# output); FSR 2 or DLSS scales it up\nrender_resolution = %d\n", b->render_mode);
     fprintf(f, "# anisotropic filtering: 0 the game's own, 1 2x, 2 4x, 3 8x, 4 16x\nanisotropic_filtering = %d\n"
                "# NVIDIA Reflex: 0 off, 1 on, 2 on + boost (NVIDIA GPUs, Vulkan)\nnvidia_reflex = %d\n"
                "# button prompts: 0 the device played with, 1 keyboard and mouse, 2 Xbox, 3 PlayStation, 4 Switch\n"
-               "button_icons = %d\n\n", b->aniso, b->reflex, b->button_icons);
+               "button_icons = %d\n"
+               "# the game's output, at the next start: 0 1920x1080 (its own), 1 the display's (the largest 16:9 that fits),\n"
+               "# 2 2560x1440, 3 3840x2160\noutput_resolution = %d\n\n", b->aniso, b->reflex, b->button_icons,
+               b->output_res);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)
