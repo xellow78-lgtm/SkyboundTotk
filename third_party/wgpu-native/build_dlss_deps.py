@@ -116,7 +116,12 @@ def build_wgpu(work):
     env["CARGO_TARGET_DIR"] = os.path.join(work, "target")
     crate = os.path.join(work, "wgpu-native")
     print("  cargo build --release (10-20 minutes the first time)", flush=True)
-    subprocess.run(["cargo", "build", "--release"], cwd=crate, env=env, check=True)
+    # (by its full path: Windows looks a bare name up in this process's PATH, not env's)
+    cargo = shutil.which("cargo", path=env.get("PATH")) or shutil.which(
+        "cargo", path=os.path.join(env.get("CARGO_HOME", os.path.expanduser("~/.cargo")), "bin"))
+    if not cargo:
+        sys.exit("no cargo: install Rust (rustup), or set CARGO_HOME to where it is")
+    subprocess.run([cargo, "build", "--release"], cwd=crate, env=env, check=True)
     out = os.path.join(work, "target", "release")
     lib = os.path.join(HERE, "lib")
     for name in ("wgpu_native.dll", "wgpu_native.dll.lib"):

@@ -307,7 +307,11 @@ def tools(a, env):
     say("using %s" % bat)
     for k, v in vs.items():
         if k.upper() not in ("EMSDK", "TEMP", "TMP", "PYTHONIOENCODING", "PYTHONUNBUFFERED"):
-            env[k] = v
+            # (Windows' names are case-blind, but `set` prints "Path" and Python's environment has "PATH": both in the
+            # dict, the child got one of them, and cargo, added to "PATH" later, was not found)
+            for old in [x for x in env if x.upper() == k.upper()]:
+                del env[old]
+            env["PATH" if k.upper() == "PATH" else k] = v
     return "done"
 
 
