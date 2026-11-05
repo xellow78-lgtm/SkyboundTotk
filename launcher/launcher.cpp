@@ -1227,7 +1227,9 @@ void start_build(bool fetch = false) {
     }
     if (fresh) fetch = true;   // (the release package's first build: the source from GitHub first)
     CreateDirectoryW(app.source.c_str(), nullptr);
-    if (!python_ok()) {   // (no Python: the launcher's own, then the build)
+    // (no Python: the launcher's own, then the build; launcher.ini own_python = 1: its own even when the PC has one)
+    const bool own_wanted = app.cfg.geti(L"own_python", 0) && !exists(parent(app.source) + L"\\python\\python.exe");
+    if (own_wanted || !python_ok()) {
         app.pending_fetch = fetch;
         start_python_download();
         return;
