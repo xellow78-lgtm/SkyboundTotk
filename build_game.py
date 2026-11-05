@@ -125,6 +125,10 @@ def package(romfs):
         if not src.is_file():
             fail(f"Required build output is missing: {src}")
         shutil.copy2(src, DIST / name)
+    # (the button icons for the device played with: the game runs this tool with that Python: hos/buttons.c)
+    for name in ("button_icons.py", "python.txt"):
+        if (native / name).is_file():
+            shutil.copy2(native / name, DIST / name)
     print(f"Copying RomFS to {DIST / 'romfs'}; this may take several minutes.", flush=True)
     shutil.copytree(romfs, DIST / "romfs", symlinks=False)
     print(f"\nBuild complete. Open {DIST / 'SkyboundTOTK.exe'} to play.")
