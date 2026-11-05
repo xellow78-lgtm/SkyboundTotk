@@ -1,8 +1,11 @@
-# The release package (launcher/package): on a tag v*, or by hand (Actions > Release package > Run workflow).
+# The release package (launcher/package): when a release is published on GitHub (its zip is attached to it), on a
+# pushed tag v* (a release is made), or by hand (Actions > Release package > Run workflow).
 # The launcher is built with MinGW on Linux (static: no runtime DLLs), then zipped with pipeline.py and the readme; its
 # first build on the player's PC fetches everything else. Nothing of the game is in it.
 name: Release package
 on:
+  release:
+    types: [published]
   push:
     tags: ["v*"]
   workflow_dispatch:
@@ -25,12 +28,16 @@ jobs:
             -lgdiplus -ldwmapi -lole32 -lshell32 -luuid -static
       - name: Package
         run: |
-          V="${{ github.event.inputs.version || github.ref_name }}"
+          V="${{ github.event.release.tag_name || github.event.inputs.version || github.ref_name }}"
           echo "V=$V" >> "$GITHUB_ENV"
           python3 launcher/package/make_package.py --exe "SkyboundTOTK Launcher.exe" --version "$V" --out out
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if gh release view "$V" >/dev/null 2>&1; then
+            gh release upload "$V" out/*.zip --clobber
+            exit 0
+          fi
           gh release create "$V" out/*.zip --target "$GITHUB_SHA" --title "SkyboundTOTK $V" \
             --notes "Extract the zip, start SkyboundTOTK Launcher.exe and follow README.txt: the first build downloads what it needs. Nothing of the game is included: you need your own dumped copy of Tears of the Kingdom 1.4.3."
