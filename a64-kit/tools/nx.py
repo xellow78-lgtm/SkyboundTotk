@@ -1,7 +1,9 @@
-"""Switch container reader: NSP (PFS0) -> NCA -> ExeFS (PFS0) / RomFS.
+"""Switch container reader: NSP (PFS0) or XCI (gamecard image: HFS0) -> NCA -> ExeFS (PFS0) / RomFS.
 
-Formats (switchbrew.org "NCA", "PFS0", "RomFS", "Ticket"):
+Formats (switchbrew.org "NCA", "PFS0", "HFS0", "XCI", "RomFS", "Ticket"):
   - NSP is a PFS0: the NCAs, plus a .tik/.cert per rights ID for titlekey-encrypted content.
+  - XCI: a gamecard header ("HEAD" at 0x100; the root HFS0's offset at 0x130), the root HFS0's partitions (update,
+    normal, secure, ...), the game's NCAs in "secure" (an HFS0 too). Gamecard NCAs use their key area (no tickets).
   - An NCA's first 0xC00 bytes are AES-128-XTS with header_key, 0x200 sectors, and a BIG-endian sector tweak.
   - Each NCA section is AES-128-CTR. The IV is the section's 8-byte counter (fs header +0x140, read little-endian,
     stored big-endian) followed by (offset within the NCA >> 4) big-endian.
@@ -87,6 +89,23 @@ class Pfs0:
     def get(self, name):
         off, size = self.files[name]
         return self.read(off, size)
+
+
+class Hfs0:
+    """An HFS0 (a gamecard partition) read through `read(off, size)`; offsets in `files` are from its start."""
+
+    def __init__(self, read):
+        self.read = read
+        magic, n, strsz, _ = struct.unpack("<4sIII", read(0, 0x10))
+        if magic != b"HFS0":
+            raise ValueError("not an HFS0")
+        ents = read(0x10, 0x40 * n)
+        strs = read(0x10 + 0x40 * n, strsz)
+        self.data_off = 0x10 + 0x40 * n + strsz
+        self.files = {}
+        for i in range(n):
+            off, size, name_off = struct.unpack_from("<QQI", ents, 0x40 * i)
+            self.files[_cstr(strs, name_off)] = (self.data_off + off, size)
 
 
 class Nca:
@@ -360,9 +379,22 @@ class Ivfc:
 
 
 class Nsp:
+    """An NSP, or an XCI (its secure partition's NCAs; `pfs` then holds that partition's files at file offsets)"""
+
     def __init__(self, path, keys):
         self.f = open(path, "rb")
-        self.pfs = Pfs0(self._read)
+        if self._read(0x100, 4) == b"HEAD":
+            root_off = struct.unpack("<Q", self._read(0x130, 8))[0]
+            root = Hfs0(lambda o, n: self._read(root_off + o, n))
+            if "secure" not in root.files:
+                raise ValueError("XCI without a secure partition: " + ", ".join(root.files))
+            sec_off = root_off + root.files["secure"][0]
+            sec = Hfs0(lambda o, n: self._read(sec_off + o, n))
+            sec.files = {name: (sec_off + off, size) for name, (off, size) in sec.files.items()}
+            sec.get = lambda name: self._read(*sec.files[name])
+            self.pfs = sec
+        else:
+            self.pfs = Pfs0(self._read)
         titlekeys = {}
         for name in self.pfs.files:
             if name.endswith(".tik"):
