@@ -850,6 +850,10 @@ void trim_decoded_textures();
 /// VRAM pressure (rx_core.cpp vram_pressure): the decoded textures not used for `idle_frames`, oldest first, until
 /// `want` bytes are freed. Returns the bytes freed (*count: how many textures).
 uint64_t trim_decoded_textures_for_vram(uint64_t want, int64_t idle_frames, int* count);
+/// (rx_core.cpp, any thread) WebGPU refused a texture or buffer for want of video memory: the render thread frees what
+/// it can at the next frame's end. is_out_of_memory: whether an error scope's message says so.
+void request_vram_trim(const char* what);
+bool is_out_of_memory(const std::string& error);
 /// This process's graphics-card memory and Windows' budget for it (DXGI; false when unknown).
 bool vram_query(uint64_t* used, uint64_t* budget, uint64_t* shared = nullptr);   // (shared: in system memory)
 uint64_t image_bytes(const Image& im);

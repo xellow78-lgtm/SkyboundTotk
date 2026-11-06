@@ -296,6 +296,7 @@ BigRange* big_range_new(uint64_t guest, uint64_t size) {
                     (unsigned long long)(size >> 20), e.c_str());
         if (b) wgpuBufferRelease(b);
         trim_big_storage(0);   // (what was not bound this frame: the memory is short)
+        if (is_out_of_memory(e)) request_vram_trim("a big storage copy");
         return nullptr;
     }
     big_ranges.push_back(BigRange{b, guest, size, 0, frame_number});

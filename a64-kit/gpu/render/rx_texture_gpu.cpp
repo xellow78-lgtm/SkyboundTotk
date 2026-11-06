@@ -1321,11 +1321,23 @@ WGPUBindGroup bind(const Pass& p, WGPUBuffer in, uint64_t in_size, WGPUBuffer ou
     return wgpuDeviceCreateBindGroup(dev.device, &gd);
 }
 
-void submit(WGPUCommandEncoder enc) {
+/// The decode's commands to the queue, unless they are invalid: a scratch texture or buffer WebGPU refused (out of
+/// video memory: a teleport into the Depths) made their views and bind groups invalid, and wgpu-native ends the
+/// process on a failed submit. False then: the caller decodes on the CPU.
+bool submit(WGPUCommandEncoder enc) {
+    scope_push();
     WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
-    wgpuQueueSubmit(dev.queue, 1, &cb);
-    wgpuCommandBufferRelease(cb);
+    const std::string error = scope_pop();
+    if (error.empty()) {
+        wgpuQueueSubmit(dev.queue, 1, &cb);
+    } else {
+        static std::atomic<int> logged{0};
+        if (logged++ < 8) hos_log("rx: a texture decode on the GPU was not submitted: %s", error.c_str());
+        if (is_out_of_memory(error)) request_vram_trim("a texture decode on the GPU");
+    }
+    if (cb) wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
+    return error.empty();
 }
 
 } // namespace
@@ -1375,13 +1387,13 @@ bool astc_gpu_decode(WGPUTexture tex, const uint8_t* src, uint64_t total, const 
     }
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
-    submit(enc);
+    const bool ok = submit(enc);
     for (WGPUBindGroup g : groups) wgpuBindGroupRelease(g);
     for (WGPUTextureView v : views) wgpuTextureViewRelease(v);
     wgpuBufferRelease(ubuf);
     wgpuBufferRelease(data);
-    count("tex_astc_gpu");
-    return true;
+    if (ok) count("tex_astc_gpu");
+    return ok;
 }
 
 bool astc_gpu_decode_bc7(WGPUTexture tex, const uint8_t* src, uint64_t total, const BlockLinearLevel* levels,
@@ -1488,7 +1500,7 @@ bool astc_gpu_decode_bc7(WGPUTexture tex, const uint8_t* src, uint64_t total, co
             const WGPUExtent3D extent{params[l].bx * 4, params[l].by * 4, n};
             wgpuCommandEncoderCopyBufferToTexture(enc, &bsrc, &to, &extent);
         }
-        submit(enc);
+        ok = submit(enc);
     }
     for (WGPUBindGroup g : groups) wgpuBindGroupRelease(g);
     for (WGPUTextureView v : views) wgpuTextureViewRelease(v);
@@ -1551,13 +1563,13 @@ bool unswizzle_gpu(WGPUTexture tex, const uint8_t* src, uint64_t total, const Bl
         const WGPUExtent3D extent{levels[l].tiles_w * block_w, levels[l].tiles_h * block_h, layers};
         wgpuCommandEncoderCopyBufferToTexture(enc, &from, &to, &extent);
     }
-    submit(enc);
+    const bool ok = submit(enc);
     for (WGPUBindGroup g : groups) wgpuBindGroupRelease(g);
     wgpuBufferRelease(ubuf);
     wgpuBufferRelease(out);
     wgpuBufferRelease(data);
-    count("tex_unswizzle_gpu");
-    return true;
+    if (ok) count("tex_unswizzle_gpu");
+    return ok;
 }
 
 std::vector<uint8_t> read_level(WGPUTexture tex, uint32_t level, uint32_t layer, uint32_t width, uint32_t height,

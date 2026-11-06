@@ -486,6 +486,7 @@ struct StreamedUpload {
     DeferredUpload upload;
 };
 thread_local DeferredTexture* deferring;
+thread_local bool decode_out_of_memory;   // the last decode() failed for want of video memory (not: undecodable)
 thread_local bool gpu_force_cpu;   // (RX_GPU_VERIFY: the CPU decode to compare with)
 std::unordered_set<WGPUSampler> nonfiltering_samplers;   // (debugging the browser's sampler checks)
 std::unordered_set<uint64_t> rewritten_textures;   // guest addresses whose background decode was rewritten meanwhile
@@ -533,6 +534,7 @@ bool odd_bc_decoded() {
 
 /// Decodes the texture into a new WebGPU texture.
 std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t va) {
+    decode_out_of_memory = false;
     const Convert cv = conversion(info.format);
     if (cv == Convert::Unsupported) {
         log_limited("tex_format", 24, "rx: texture format %d not decoded", (int)info.format);
@@ -663,6 +665,10 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
     if (const std::string error = deferring ? std::string() : scope_pop(); !error.empty()) {
         log_limited("tex_create", 16, "rx: texture %ux%u x%u format %d not created: %s", info.size.width,
                     info.size.height, info.layers, (int)info.format, error.c_str());
+        if (is_out_of_memory(error)) {   // (not "undecodable": tried again once memory is freed)
+            decode_out_of_memory = true;
+            request_vram_trim("a texture");
+        }
         return nullptr;
     }
 
@@ -687,12 +693,21 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
             off += CalculateLevelSize(li, level);
         }
         const int64_t t0 = hos_now_ns();
+        // (in an error scope: a scratch texture or buffer WebGPU refuses for want of video memory is reported here,
+        // not as an uncaptured error, and the CPU decodes the texture instead)
+        scope_push();
         gpu_decoded = astc_bc    ? astc_gpu_decode_bc7(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers,
                                                        layer_stride, tile.width, tile.height)
                       : astc_gpu ? astc_gpu_decode(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers,
                                                  layer_stride, tile.width, tile.height)
                                : unswizzle_gpu(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers, layer_stride,
                                                li.bpp_log2, tile.width, tile.height);
+        if (const std::string error = scope_pop(); !error.empty()) {
+            log_limited("tex_gpu_decode", 16, "rx: texture %ux%u x%u format %d: the GPU decode failed (%s), the CPU "
+                        "decodes it", info.size.width, info.size.height, info.layers, (int)info.format, error.c_str());
+            if (is_out_of_memory(error)) request_vram_trim("a texture decode on the GPU");
+            gpu_decoded = false;
+        }
         if (static const bool log_inplace = env_flag("RX_LOG_INPLACE"); log_inplace && total > (1u << 20))
             hos_log("rx: %s %ux%u x%u levels %u format %d on the GPU: %.2f ms, %llu KB",
                     astc_bc ? "ASTC to BC7" : astc_gpu ? "ASTC" : "unswizzle",
@@ -1060,6 +1075,7 @@ struct DecodeJob {
     TexInfo info{};
     std::unique_ptr<Image> im;
     std::unique_ptr<DeferredTexture> deferred;   // (web)
+    bool out_of_memory = false;                  // not made for want of video memory: tried again later
 };
 std::deque<DecodeJob*> decode_queue;
 std::vector<DecodeJob*> decode_done;
@@ -1085,6 +1101,7 @@ void decode_worker() {
             deferring = j->deferred.get();
         }
         j->im = decode(j->tic, j->info, j->va);
+        j->out_of_memory = decode_out_of_memory;
         deferring = nullptr;
         static const bool trace = env_flag("RX_TRACE_DECODE");
         if (trace)
@@ -1199,8 +1216,10 @@ void install_decoded_textures() {
                             j->info.size.width, j->info.size.height, j->info.layers, j->info.levels,
                             (int)j->info.format, (unsigned long long)j->va);
             }
-            decoded[j->key] = std::move(j->im);   // (null: known undecodable)
-            decoded_generation++;
+            if (im || !j->out_of_memory) {   // (out of video memory: not remembered, decoded again on a later use)
+                decoded[j->key] = std::move(j->im);   // (null: known undecodable)
+                decoded_generation++;
+            }
             count("tex_decoded_async");
         }
         if (j->deferred && j->deferred->tex) wgpuTextureRelease(j->deferred->tex);   // (dropped)
@@ -1994,6 +2013,7 @@ BoundTexture texture_for_handle_uncached(const Regs& r, uint32_t raw, const Shad
                         info.size.height, info.layers, info.levels, (int)info.format, (int)info.linear,
                         (hos_now_ns() - t0) / 1e6, (unsigned long long)(guest_size(info) >> 10));
             im = fresh.get();
+            if (!im && decode_out_of_memory) return dummy_texture(desc);   // (not remembered: decoded again later)
             if (im) remember(im);
             decoded[key] = std::move(fresh);
             decoded_generation++;
@@ -2319,6 +2339,7 @@ BoundTexture nvn_texture_resolve(const NvnState& s, uint64_t tex_handle, uint64_
             count("t_decode", hos_now_ns() - t0);
             spike.decode_ns += hos_now_ns() - t0;
             im = fresh.get();
+            if (!im && decode_out_of_memory) return dummy_texture(desc);   // (not remembered: decoded again later)
             if (im) remember(im);
             decoded[key] = std::move(fresh);
             decoded_generation++;

@@ -2408,10 +2408,36 @@ static void commit_guard() {
 /// it is ~1 GB under, and the kept DLSS features not in use. (run_vram.log: what is freed is not always given back
 /// to Windows; wgpu keeps its memory blocks. Not the whole answer.) (They come back when needed: a texture is decoded again on its next use.)
 /// RX_VRAM_TRIM=0: off.
+/// Out of video memory (request_vram_trim: WebGPU refused a texture or buffer, seen when a teleport into the Depths
+/// loaded its area at once): at the next frame's end the decoded textures not used for 5 s go (up to 1 GB), the big
+/// storage copies not bound for 1 s and the DLSS features not in use, whatever the 10 s spacing.
+static std::atomic<int> vram_trim_requests{0};
+void request_vram_trim(const char* what) {   // (any thread)
+    static std::atomic<int> logged{0};
+    if (vram_trim_requests++ == 0 && logged++ < 40) hos_log("rx: out of video memory (%s)", what);
+}
+bool is_out_of_memory(const std::string& error) {
+    return error.find("memory") != std::string::npos || error.find("Memory") != std::string::npos;
+}
+
 static void vram_pressure() {
     static const bool off = getenv("RX_VRAM_TRIM") && *getenv("RX_VRAM_TRIM") == '0';
     static const uint64_t margin = (uint64_t)(getenv("RX_VRAM_MARGIN_MB") ? atoll(getenv("RX_VRAM_MARGIN_MB")) : 600) << 20;
     static int64_t last_trim = -100000;
+    if (const int asked = vram_trim_requests.exchange(0); asked && !off) {
+        uint64_t used = 0, budget = 0;
+        vram_query(&used, &budget);
+        int n = 0;
+        const uint64_t freed = trim_decoded_textures_for_vram(1024ull << 20, 300, &n);
+        const uint64_t big_freed = trim_big_storage(60);
+        dlss_trim();
+        last_trim = frame_number;
+        log_limited("vram_oom", 60, "rx: out of video memory (%d refusals; VRAM %llu of %llu MB): %d decoded textures not "
+                    "used for 5 s released, %llu MB; big storage copies not bound for 1 s released, %llu MB",
+                    asked, (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), n,
+                    (unsigned long long)(freed >> 20), (unsigned long long)(big_freed >> 20));
+        return;
+    }
     if (off || frame_number % 120 != 60) return;
     uint64_t used = 0, budget = 0;
     if (!vram_query(&used, &budget) || !budget || used + margin <= budget) return;
@@ -3109,6 +3135,7 @@ Image* find_render_target(uint64_t gpu_va, uint32_t width, uint32_t height, Pixe
     if (const std::string error = scope_pop(); !error.empty()) {
         log_limited("rt_create", 16, "rx: render target %ux%u format %d not created: %s", width, height, (int)pf,
                     error.c_str());
+        if (is_out_of_memory(error)) request_vram_trim("a render target");
         return nullptr;
     }
     Image* raw = im.get();
