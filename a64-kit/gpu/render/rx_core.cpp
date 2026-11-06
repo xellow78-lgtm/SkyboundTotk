@@ -156,6 +156,21 @@ const char* backend_name(WGPUBackendType t) {
     }
 }
 
+#ifndef __EMSCRIPTEN__
+/* The window's client size in pixels from any thread: the threads that present are not DPI aware, and their
+   GetClientRect is scaled down (1706x1066 for a 2560x1600 window at 150%: a surface remade at that size after an
+   Outdated present stayed there, the window's size from the display thread not known yet, and the game froze in
+   fullscreen with VSync off on such a display). So the call runs per-monitor DPI aware (V2), as the display thread. */
+bool client_size_px(HWND w, RECT* rc) {
+    typedef void*(WINAPI * SetCtx)(void*);
+    static const SetCtx set = (SetCtx)(void*)GetProcAddress(GetModuleHandleA("user32.dll"), "SetThreadDpiAwarenessContext");
+    void* old = set ? set((void*)(intptr_t)-4) : nullptr;
+    const bool ok = GetClientRect(w, rc) && rc->right > 0 && rc->bottom > 0;
+    if (set && old) set(old);
+    return ok;
+}
+#endif
+
 void configure_surface(uint32_t w, uint32_t h) {
     if (!surface || !w || !h) return;
     WGPUSurfaceConfiguration c{};
@@ -583,10 +598,12 @@ bool init_device(HWND hwnd) {
 #ifdef __EMSCRIPTEN__
     configure_surface(1280, 720);
 #else
-    RECT rc;
-    GetClientRect(hwnd, &rc);
+    RECT rc{};
+    client_size_px(hwnd, &rc);
     configure_surface((uint32_t)std::max<LONG>(rc.right, 1), (uint32_t)std::max<LONG>(rc.bottom, 1));
     present_window_size(rc.right, rc.bottom);   // (ultrawide's aspect before the game makes its cameras)
+    // (the window's size until the display thread reports one: presents pass it, so the surface keeps it)
+    if (!want_w && rc.right > 0 && rc.bottom > 0) InterlockedExchange(&want_w, rc.right), InterlockedExchange(&want_h, rc.bottom);
 #endif
 
     create_blit();
@@ -2472,11 +2489,10 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
 #ifndef __EMSCRIPTEN__
         static const bool remake = !getenv("RX_SURFACE_REMAKE") || atoi(getenv("RX_SURFACE_REMAKE")) != 0;
         RECT rc{};
-        const bool sized = surface_hwnd && !IsIconic(surface_hwnd) && GetClientRect(surface_hwnd, &rc) &&
-                           rc.right > 0 && rc.bottom > 0;
+        const bool sized = surface_hwnd && !IsIconic(surface_hwnd) && client_size_px(surface_hwnd, &rc);
         if (!sized) return;   // (minimized: the next present tries again)
-        // (the window's size in pixels as the display thread has it: this thread is not DPI aware, and its
-        // GetClientRect gave 1706x996 for a 2560x1494 window at 150%)
+        // (the window's size in pixels as the display thread has it, else from client_size_px: this thread is not
+        // DPI aware, and its own GetClientRect gave 1706x996 for a 2560x1494 window at 150%)
         if (ww > 0 && wh > 0) rc.right = ww, rc.bottom = wh;
         if (remake) {
             WGPUSurfaceSourceWindowsHWND src{};
