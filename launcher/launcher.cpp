@@ -652,8 +652,11 @@ void draw_play(Draw& d, RectF c) {
         line2 = L"For " + std::to_wstring(secs / 60) + L" min " + std::to_wstring(secs % 60) + L" s. Close the game's window to stop.";
     } else if (app.game_exit != STILL_ACTIVE) {
         line1 = app.game_exit == 0 ? L"Game closed" : L"The game stopped";
-        wchar_t b[96];
-        swprintf(b, 96, app.game_exit == 0 ? L"Exit code 0." : L"Exit code 0x%08X: its log says what happened.", app.game_exit);
+        wchar_t b[160];
+        if (app.game_exit == 3)   // (rx_core.cpp's commit guard: Windows was nearly out of memory)
+            swprintf(b, 160, L"Windows was nearly out of memory, so the game stopped itself. Close other programs, or make the page file bigger.");
+        else
+            swprintf(b, 160, app.game_exit == 0 ? L"Exit code 0." : L"Exit code 0x%08X: its log says what happened.", app.game_exit);
         line2 = b;
     } else if (ok) {
         line1 = L"Ready";
@@ -1126,6 +1129,14 @@ void play() {
         if (k.rfind(L"env.", 0) == 0 && k.size() > 4) env[k.substr(4)] = v;
     auto block = env_block(env);
     const wstring log = app.cfg.get(L"log", app.dist + L"\\skybound.log");
+    // (the last run's log is kept as <name>.prev<.ext>: a run that crashed is still there after the next start)
+    if (exists(log)) {
+        const size_t slash = log.find_last_of(L"\\/"), dot = log.find_last_of(L'.');
+        const wstring prev = dot != wstring::npos && (slash == wstring::npos || dot > slash)
+                                 ? log.substr(0, dot) + L".prev" + log.substr(dot)
+                                 : log + L".prev";
+        MoveFileExW(log.c_str(), prev.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE out = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, 0, nullptr);
     STARTUPINFOW si{};
