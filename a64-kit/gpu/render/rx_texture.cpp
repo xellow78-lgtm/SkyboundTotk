@@ -693,21 +693,13 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info, uint64_t
             off += CalculateLevelSize(li, level);
         }
         const int64_t t0 = hos_now_ns();
-        // (in an error scope: a scratch texture or buffer WebGPU refuses for want of video memory is reported here,
-        // not as an uncaptured error, and the CPU decodes the texture instead)
-        scope_push();
+        // (false when a scratch texture or buffer was refused, out of video memory: the CPU decodes it below)
         gpu_decoded = astc_bc    ? astc_gpu_decode_bc7(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers,
                                                        layer_stride, tile.width, tile.height)
                       : astc_gpu ? astc_gpu_decode(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers,
                                                  layer_stride, tile.width, tile.height)
                                : unswizzle_gpu(im->tex, src, total, lv.data(), (int)lv.size(), copy_layers, layer_stride,
                                                li.bpp_log2, tile.width, tile.height);
-        if (const std::string error = scope_pop(); !error.empty()) {
-            log_limited("tex_gpu_decode", 16, "rx: texture %ux%u x%u format %d: the GPU decode failed (%s), the CPU "
-                        "decodes it", info.size.width, info.size.height, info.layers, (int)info.format, error.c_str());
-            if (is_out_of_memory(error)) request_vram_trim("a texture decode on the GPU");
-            gpu_decoded = false;
-        }
         if (static const bool log_inplace = env_flag("RX_LOG_INPLACE"); log_inplace && total > (1u << 20))
             hos_log("rx: %s %ux%u x%u levels %u format %d on the GPU: %.2f ms, %llu KB",
                     astc_bc ? "ASTC to BC7" : astc_gpu ? "ASTC" : "unswizzle",

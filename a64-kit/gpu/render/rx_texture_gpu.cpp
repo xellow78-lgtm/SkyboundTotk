@@ -1268,13 +1268,35 @@ bool pass_on(const Pass& p, const char* off_switch) {
     return p.pipeline != nullptr;
 }
 
+/// A decode's scratch buffer or texture, made in an error scope: null when WebGPU refused it (out of video memory,
+/// as a teleport into the Depths was). An invalid one in the decode's commands made wgpu-native end the process at
+/// their submit; now the decode gives up and the CPU decodes the texture.
+WGPUBuffer made_buffer(const WGPUBufferDescriptor& d) {
+    scope_push();
+    WGPUBuffer b = wgpuDeviceCreateBuffer(dev.device, &d);
+    const std::string error = scope_pop();
+    if (error.empty()) return b;
+    if (b) wgpuBufferRelease(b);
+    if (is_out_of_memory(error)) request_vram_trim("a texture decode's buffer");
+    return nullptr;
+}
+WGPUTexture made_texture(const WGPUTextureDescriptor& d) {
+    scope_push();
+    WGPUTexture t = wgpuDeviceCreateTexture(dev.device, &d);
+    const std::string error = scope_pop();
+    if (error.empty()) return t;
+    if (t) wgpuTextureRelease(t);
+    if (is_out_of_memory(error)) request_vram_trim("a texture decode's scratch texture");
+    return nullptr;
+}
+
 /// The guest bytes in a new storage buffer (written in whole words)
 WGPUBuffer upload_storage(const uint8_t* src, uint64_t total, uint64_t* size) {
     *size = (total + 15) & ~15ull;
     WGPUBufferDescriptor bd{};
     bd.size = *size;
     bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
-    WGPUBuffer data = wgpuDeviceCreateBuffer(dev.device, &bd);
+    WGPUBuffer data = made_buffer(bd);
     if (!data) return nullptr;
     wgpuQueueWriteBuffer(dev.queue, data, 0, src, total & ~3ull);
     if (total & 3) {
@@ -1292,8 +1314,8 @@ template <typename P> WGPUBuffer uniforms(const std::vector<P>& per_level) {
     WGPUBufferDescriptor bd{};
     bd.size = bytes.size();
     bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-    WGPUBuffer u = wgpuDeviceCreateBuffer(dev.device, &bd);
-    wgpuQueueWriteBuffer(dev.queue, u, 0, bytes.data(), bytes.size());
+    WGPUBuffer u = made_buffer(bd);
+    if (u) wgpuQueueWriteBuffer(dev.queue, u, 0, bytes.data(), bytes.size());
     return u;
 }
 
@@ -1363,6 +1385,10 @@ bool astc_gpu_decode(WGPUTexture tex, const uint8_t* src, uint64_t total, const 
         params.push_back({block_w, block_h, layer_stride, levels[l].block_size, levels[l].x_shift, levels[l].block_height,
                           (1u << levels[l].block_height) - 1, levels[l].offset});
     WGPUBuffer ubuf = uniforms(params);
+    if (!ubuf) {
+        wgpuBufferRelease(data);
+        return false;
+    }
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
     wgpuComputePassEncoderSetPipeline(pass, gpu.astc.pipeline);
@@ -1411,7 +1437,7 @@ bool astc_gpu_decode_bc7(WGPUTexture tex, const uint8_t* src, uint64_t total, co
     sd.format = WGPUTextureFormat_RGBA8Unorm;
     sd.mipLevelCount = (uint32_t)nlevels;
     sd.sampleCount = 1;
-    WGPUTexture scratch = wgpuDeviceCreateTexture(dev.device, &sd);
+    WGPUTexture scratch = made_texture(sd);
     if (!scratch) return false;
     // per level: the blocks, each row padded to 256 bytes, the chunk's layers one after another in one output buffer
     struct Params {
@@ -1434,8 +1460,13 @@ bool astc_gpu_decode_bc7(WGPUTexture tex, const uint8_t* src, uint64_t total, co
     WGPUBufferDescriptor bd{};
     bd.size = out_size;
     bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
-    WGPUBuffer out = wgpuDeviceCreateBuffer(dev.device, &bd);
-    WGPUBuffer ubuf = uniforms(params);
+    WGPUBuffer out = made_buffer(bd);
+    WGPUBuffer ubuf = out ? uniforms(params) : nullptr;
+    if (!out || !ubuf) {
+        if (out) wgpuBufferRelease(out);
+        wgpuTextureRelease(scratch);
+        return false;
+    }
     std::vector<WGPUTextureView> views;
     for (int l = 0; l < nlevels; l++) {
         WGPUTextureViewDescriptor vd{};
@@ -1536,8 +1567,13 @@ bool unswizzle_gpu(WGPUTexture tex, const uint8_t* src, uint64_t total, const Bl
     WGPUBufferDescriptor bd{};
     bd.size = out_size;
     bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
-    WGPUBuffer out = wgpuDeviceCreateBuffer(dev.device, &bd);
-    WGPUBuffer ubuf = uniforms(params);
+    WGPUBuffer out = made_buffer(bd);
+    WGPUBuffer ubuf = out ? uniforms(params) : nullptr;
+    if (!out || !ubuf) {
+        if (out) wgpuBufferRelease(out);
+        wgpuBufferRelease(data);
+        return false;
+    }
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
     wgpuComputePassEncoderSetPipeline(pass, gpu.unswizzle.pipeline);
