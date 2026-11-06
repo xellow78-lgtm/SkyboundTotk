@@ -4059,6 +4059,31 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         // elements' values
         static const std::vector<uint64_t> attrs_vs = dump_attrs_programs();
         if (std::find(attrs_vs.begin(), attrs_vs.end(), prog->vs.key) != attrs_vs.end()) {
+            // (RX_CHECK_ATTRS=1: the draw's index list and whole vertex streams (the GPU's copies) also go to
+            // <RX_DUMP_DIR>\\attrs_<vs>_<n>.bin, for replaying its vertex program elsewhere: sections of
+            // {char tag[4]; u32 a, b, c, d, e; u32 bytes} and the bytes; "IDX " a type b count c first d base vertex,
+            // "ATTR" a attribute b stride c offset d size code e type code)
+            static int attrs_files;
+            std::string attrs_path;
+            if (env_flag("RX_CHECK_ATTRS")) {
+                const char* dir = getenv("RX_DUMP_DIR");
+                char name[96];
+                std::snprintf(name, sizeof name, "\\attrs_%016llx_%d.bin", (unsigned long long)prog->vs.key, attrs_files++);
+                attrs_path = std::string(dir && *dir ? dir : "rx_frame") + name;
+                if (FILE* f = std::fopen(attrs_path.c_str(), "wb")) {
+                    const uint32_t isize = d.index_type == 2 ? 4 : d.index_type == 1 ? 2 : 1;
+                    std::vector<uint8_t> idx(indexed ? (size_t)d.count * isize : 0);
+                    if (!idx.empty()) gpu_read(d.index_gpu + (uint64_t)d.first * isize, idx.data(), idx.size());
+                    const uint32_t h[7] = {(uint32_t)d.index_type, d.count, d.first, (uint32_t)d.base_vertex, 0,
+                                           (uint32_t)idx.size()};
+                    std::fwrite("IDX ", 1, 4, f);
+                    std::fwrite(h, 4, 6, f);
+                    if (!idx.empty()) std::fwrite(idx.data(), 1, idx.size(), f);
+                    std::fclose(f);
+                } else {
+                    attrs_path.clear();
+                }
+            }
             for (uint32_t i = 0; i < 16; i++) {
                 if (!(prog->vs.generic_loads() >> i & 1)) continue;
                 const Regs::VertexAttribute a = nvn_attribute(s.vattr[i]);
@@ -4085,6 +4110,15 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
                         wait_submitted();
                         read_buffer(ref.buffer, ref.offset, gpu_copy.data(), bytes);
                         gpu_vals = gpu_copy;
+                        if (!attrs_path.empty())
+                            if (FILE* f = std::fopen(attrs_path.c_str(), "ab")) {
+                                const uint32_t h[6] = {i, st.stride, (uint32_t)a.offset.Value(), (uint32_t)a.size.Value(),
+                                                       (uint32_t)a.type.Value(), (uint32_t)bytes};
+                                std::fwrite("ATTR", 1, 4, f);
+                                std::fwrite(h, 4, 6, f);
+                                std::fwrite(gpu_copy.data(), 1, bytes, f);
+                                std::fclose(f);
+                            }
                         uint32_t diff = 0, first = ~0u;
                         for (uint64_t k = 0; k + 16 <= bytes; k += 16)
                             if (std::memcmp(gpu_copy.data() + k, mem.data() + k, 16)) {
