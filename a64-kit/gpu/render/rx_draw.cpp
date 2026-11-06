@@ -3124,6 +3124,88 @@ void dump_words(const char* what, uint32_t index, const uint8_t* p, uint64_t byt
     }
 }
 
+/// RX_DUMP_DRAW=<program key>[,...] (with a frame dump; RX_DUMP_UB's keys count too): a draw whose vertex or pixel
+/// program is listed logs both stages' uniform blocks (vs / fs ub[i]) and, before it runs, saves each storage buffer
+/// it binds, as the GPU holds it then, to <frame dump dir>/ssbo_<n>_<vs|fs><binding>_<address>.bin (logged)
+bool nvn_dump_draw_ub = false;
+bool dump_draw_wanted(const ProgramPair* prog) {
+    static const std::vector<uint64_t> keys = [] {
+        std::vector<uint64_t> v;
+        for (const char* name : {"RX_DUMP_DRAW", "RX_DUMP_UB"})
+            for (const char* p = getenv(name); p && *p;) {
+                char* e = nullptr;
+                v.push_back(strtoull(p, &e, 16));
+                if (!e || *e != ',') break;
+                p = e + 1;
+            }
+        return v;
+    }();
+    if (keys.empty() || !prog) return false;
+    for (uint64_t k : keys)
+        if (k == prog->vs.key || (prog->has_fs && k == prog->fs.key)) return true;
+    return false;
+}
+
+void dump_ub_words(int stage, const uint8_t* p, uint64_t bytes) {
+    for (uint64_t i = 0; i < std::min<uint64_t>(bytes / 16, 512); i++) {
+        uint32_t w[4];
+        float f[4];
+        std::memcpy(w, p + i * 16, 16);
+        std::memcpy(f, p + i * 16, 16);
+        hos_log("rx-frame:     %s ub[%llu] %08x %08x %08x %08x  (%g %g %g %g)", stage ? "fs" : "vs", (unsigned long long)i,
+                w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]);
+    }
+}
+
+/// (before the draw's resources are built: the batch is submitted and waited for, so nothing of this draw is in it)
+void nvn_dump_draw_storage(const NvnState& s, const ProgramPair* prog) {
+    static int files;
+    hos_log("rx-frame:   (RX_DUMP_DRAW: the next draw, vs %016llx fs %016llx)", (unsigned long long)prog->vs.key,
+            (unsigned long long)(prog->has_fs ? prog->fs.key : 0));
+    struct Range { int stage; uint32_t binding; uint64_t va, size; };
+    std::vector<Range> ranges;
+    for (int stage = 0; stage < (prog->has_fs ? 2 : 1); stage++) {
+        NvnBanks banks;
+        banks.c1 = nvn_c1(s, stage);
+        const Shader::Info& info = stage ? prog->fs.info : prog->vs.info;
+        uint32_t binding = 0;
+        for (const auto& d : info.storage_buffers_descriptors) {
+            uint64_t raw_va = 0;
+            uint32_t raw_size = 0;
+            banks.read(s, stage, d.cbuf_index, d.cbuf_offset, &raw_va, 8);
+            banks.read(s, stage, d.cbuf_index, d.cbuf_offset + 8, &raw_size, 4);
+            if (raw_va && raw_size) ranges.push_back({stage, binding, raw_va, std::min<uint64_t>(raw_size, 4u << 20)});
+            binding++;
+        }
+    }
+    if (ranges.empty() || files >= 400) return;
+    flush_batch();
+    wait_submitted();
+    const std::string dir = frame_dump_dir();
+    for (const Range& r : ranges) {
+        if (gpu_written(r.va, r.size)) buffer_cache_sync_to_guest(r.va, r.size);
+        std::vector<uint8_t> bytes((size_t)r.size);
+        gpu_read(r.va, bytes.data(), r.size);
+        char name[96];
+        std::snprintf(name, sizeof name, "/ssbo_%03d_%s%u_%llx.bin", files++, r.stage ? "fs" : "vs", r.binding,
+                      (unsigned long long)r.va);
+        const std::string path = dir + name;
+        bool saved = false;
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            saved = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+            std::fclose(f);
+        }
+        size_t nonzero = 0;
+        for (uint8_t v : bytes) nonzero += v != 0;
+        uint32_t w[8]{};
+        std::memcpy(w, bytes.data(), std::min<size_t>(sizeof w, bytes.size()));
+        hos_log("rx-frame:     %s ssbo %u %llx+%llx before the draw: %zu of %zu bytes nonzero; %s %s | %08x %08x %08x %08x "
+                "%08x %08x %08x %08x", r.stage ? "fs" : "vs", r.binding, (unsigned long long)r.va,
+                (unsigned long long)r.size, nonzero, bytes.size(), saved ? "saved as" : "NOT saved to", name + 1, w[0], w[1],
+                w[2], w[3], w[4], w[5], w[6], w[7]);
+    }
+}
+
 /// One stage's uniform block, constant / storage buffers and textures for an NVN draw (stage_resources' twin; the
 /// layout is the WGSL backend's)
 void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, const Shader::Info& info,
@@ -3357,6 +3439,7 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
     }
     if (!slot_bytes.empty()) std::memcpy(block + 64, slot_bytes.data(), slot_bytes.size());
     if (nvn_dump_vs_ub && stage == 0) dump_words("ub", 0, block, (uint64_t)ub_size * 16);
+    else if (nvn_dump_draw_ub) dump_ub_words(stage, block, (uint64_t)ub_size * 16);
     // the same bytes as a block this batch already holds: that one is bound and this space given back (draws of a
     // material often carry equal blocks; then their bind group's offsets repeat and the group is not set again, and
     // less is uploaded: the browser's GPU process was the limit on the web. RX_NO_UB_DEDUPE=1 off)
@@ -3532,6 +3615,12 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     ProgramPair* prog = nvn_programs(s, out_types);
     if (!prog) return skip("programs");
     if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) return;   // (rx_fsr2.cpp)
+    // RX_DUMP_DRAW (debugging): before anything of this draw is in the batch
+    nvn_dump_draw_ub = frame_dump_active() && dump_draw_wanted(prog);
+    struct DumpDrawReset {
+        ~DumpDrawReset() { nvn_dump_draw_ub = false; }
+    } dump_draw_reset;
+    if (nvn_dump_draw_ub) nvn_dump_draw_storage(s, prog);
 
     // ---- vertices and indices ----
     WGPUPrimitiveTopology topology{};
@@ -3781,9 +3870,19 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         const bool test = s.ds.dt != 0;
         ds.depthWriteEnabled = test && s.ds.dw ? WGPUOptionalBool_True : WGPUOptionalBool_False;
         ds.depthCompare = test ? nvn_compare(s.ds.df) : WGPUCompareFunction_Always;
-        // RX_DEBUG_DEPTH_ALWAYS=<pixel program key> (debugging; with RX_NO_PIPELINE_CACHE=1): it passes the depth test
-        if (static const uint64_t depth_always = getenv("RX_DEBUG_DEPTH_ALWAYS") ? strtoull(getenv("RX_DEBUG_DEPTH_ALWAYS"), nullptr, 16) : 0;
-            depth_always && prog->fs.key == depth_always)
+        // RX_DEBUG_DEPTH_ALWAYS=<pixel program key>[,...] (debugging; with RX_NO_PIPELINE_CACHE=1): they pass the depth
+        // test
+        static const std::vector<uint64_t> depth_always = [] {
+            std::vector<uint64_t> v;
+            for (const char* p = getenv("RX_DEBUG_DEPTH_ALWAYS"); p && *p;) {
+                char* e = nullptr;
+                v.push_back(strtoull(p, &e, 16));
+                if (!e || *e != ',') break;
+                p = e + 1;
+            }
+            return v;
+        }();
+        if (prog->has_fs && std::find(depth_always.begin(), depth_always.end(), prog->fs.key) != depth_always.end())
             ds.depthCompare = WGPUCompareFunction_Always;
         if (s.ds.st && has_stencil(ds.format)) {
             ds.stencilFront = {nvn_compare(s.ds.sf_f), nvn_stencil_op(s.ds.fail_f), nvn_stencil_op(s.ds.zfail_f),

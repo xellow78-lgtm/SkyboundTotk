@@ -232,6 +232,9 @@ void dump_draw(const char* what);
 /// logged as rows of four floats after `tag`; false when the range is not cached. dump_floats: words already in hand.
 bool dump_gpu_range(const char* tag, uint64_t va, uint64_t size);
 void dump_floats(const char* tag, const uint32_t* w, size_t n);
+/// (frame dumps) The directory this frame's images go to, made if missing: RX_DUMP_DIR (default rx_frame), with
+/// RX_DUMP_COUNT its subdirectory named for the frame
+std::string frame_dump_dir();
 /// RX_DUMP_SAMPLED=1 (with a frame dump): render targets sampled by draws are saved with the frame's targets.
 void dump_sampled(const Image* im);
 /// A dispatch wrote this range in the buffer cache (RX_SYNC_DISPATCH_WRITES=1: copied to guest memory at the present).

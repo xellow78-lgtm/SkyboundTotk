@@ -646,6 +646,17 @@ void dump_texture(WGPUTexture tex, uint64_t va, uint32_t width, uint32_t height,
     save(&t, dir, order);
 }
 
+std::string frame_dump_dir() {
+    const char* d = getenv("RX_DUMP_DIR");
+    std::string dir = d && *d ? d : "rx_frame";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    if (getenv("RX_DUMP_COUNT")) {
+        dir += "/" + std::to_string((long long)frame_number);
+        CreateDirectoryA(dir.c_str(), nullptr);
+    }
+    return dir;
+}
+
 void dump_frame_images(const char* dir) {
     if (!frame_dump_active()) return;
     if (pass_open) hos_log("rx-frame:   %d draws", pass_draws);
