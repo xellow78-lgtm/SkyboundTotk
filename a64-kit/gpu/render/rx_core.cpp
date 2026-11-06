@@ -617,6 +617,19 @@ bool init_device(HWND hwnd) {
     astc_gpu_on();   // (its pipeline made here: error scopes belong to the device, not to a thread)
     hos_log("rx: WebGPU on %s; %zu optional features; surface %ux%u format %#x present mode %d", desc, have.size(),
             surface_w, surface_h, (unsigned)surface_format, (int)present_mode);
+#if !RX_WEB && defined(_WIN32)
+    // (the patched wgpu_native.dll's video memory blocks: RX_WGPU_MEMORY there; an older library has no such call)
+    if (HMODULE m = GetModuleHandleA("wgpu_native.dll")) {
+        if (auto hints = (uint32_t (*)())(void*)GetProcAddress(m, "wgpuTotkMemoryHints")) {
+            static const char* names[] = {"wgpu's default 256 MB", "8-64 MB", "RX_WGPU_MEMORY's"};
+            const uint32_t h = hints();
+            hos_log("rx: video memory blocks: %s", h < 3 ? names[h] : "?");
+        } else {
+            hos_log("rx: video memory blocks: wgpu's default 256 MB (the WebGPU library predates the smaller blocks: "
+                    "Build with \"DLSS library\" ticked makes it again)");
+        }
+    }
+#endif
     return true;
 }
 

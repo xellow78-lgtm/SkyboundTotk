@@ -130,7 +130,7 @@ def build_wgpu(work):
             shutil.copyfile(dst, dst + ".orig")
         shutil.copyfile(os.path.join(out, name), dst)
     data = open(os.path.join(lib, "wgpu_native.dll.lib"), "rb").read()
-    for sym in (b"wgpuTotkCommandEncoderRaw", b"wgpuTotkCreateRenderPipelineCapture"):
+    for sym in (b"wgpuTotkCommandEncoderRaw", b"wgpuTotkCreateRenderPipelineCapture", b"wgpuTotkMemoryHints"):
         if sym not in data:
             sys.exit("the new wgpu_native.dll.lib has no %s: the patch did not apply?" % sym.decode())
     print("  wgpu_native.dll (%.1f MB) and its import library are in %s" % (

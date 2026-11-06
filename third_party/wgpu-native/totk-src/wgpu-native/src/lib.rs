@@ -875,6 +875,8 @@ pub unsafe extern "C" fn wgpuAdapterRequestDevice(
     {
         desc.required_features |= wgt::Features::PASSTHROUGH_SHADERS;
     }
+    // (TOTK port) smaller video memory blocks (totk_memory_hints)
+    desc.memory_hints = totk_memory_hints();
     let result = context.adapter_request_device(adapter_id, &desc, None, None);
     match result {
         Ok((device_id, queue_id)) => {
@@ -4556,6 +4558,40 @@ pub unsafe extern "C" fn wgpuTotkPassthroughShaders(device: native::WGPUDevice) 
         .context
         .device_features(device.id)
         .contains(wgt::Features::PASSTHROUGH_SHADERS)
+}
+
+/// (TOTK port) how the device's video memory is suballocated. wgpu's default (Performance) takes 256 MB blocks from
+/// the driver, and gpu-allocator gives a block back only when nothing in it is left: after an hour of texture
+/// streaming one small texture still in each block kept the process at its high-water mark (7.5 GB on an 8 GB card
+/// with ~1.4 GB of resources alive), over Windows' budget, and Windows moved part of it to system memory (8 fps).
+/// MemoryUsage takes 8 MB blocks growing to 64 MB: four times finer, and a resource over 64 MB gets a block of its
+/// own, given back when it is destroyed. RX_WGPU_MEMORY=performance: wgpu's default; =<MB>: blocks up to that size.
+fn totk_memory_hints() -> wgt::MemoryHints {
+    const MB: u64 = 1024 * 1024;
+    match std::env::var("RX_WGPU_MEMORY") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("performance") => wgt::MemoryHints::Performance,
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(n) if n >= 4 => {
+                let max = n.min(256);
+                wgt::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: (max / 8).max(4) * MB..max * MB,
+                }
+            }
+            _ => wgt::MemoryHints::MemoryUsage,
+        },
+        Err(_) => wgt::MemoryHints::MemoryUsage,
+    }
+}
+
+/// (TOTK port) the memory hints the device was made with (the renderer logs it): 0 Performance, 1 MemoryUsage,
+/// 2 Manual. Its presence in the import library also tells the launcher that this build has them.
+#[no_mangle]
+pub extern "C" fn wgpuTotkMemoryHints() -> u32 {
+    match totk_memory_hints() {
+        wgt::MemoryHints::Performance => 0,
+        wgt::MemoryHints::MemoryUsage => 1,
+        wgt::MemoryHints::Manual { .. } => 2,
+    }
 }
 
 #[no_mangle]

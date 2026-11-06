@@ -535,13 +535,15 @@ def tools(a, env):
 
 
 def has_reflex_lib():
-    """The patched WebGPU library, as new as the sources want: Reflex (wgpuTotkReflexSleep) and the SPIR-V cache
-    (wgpuTotkCreateRenderPipelineCapture). An older one is rebuilt (cargo rebuilds only the changed crates)."""
+    """The patched WebGPU library, as new as the sources want: Reflex (wgpuTotkReflexSleep), the SPIR-V cache
+    (wgpuTotkCreateRenderPipelineCapture) and the smaller video memory blocks (wgpuTotkMemoryHints). An older one is
+    rebuilt (cargo rebuilds only the changed crates)."""
     lib = SOURCE / "third_party/wgpu-native/lib/wgpu_native.dll.lib"
     if not lib.is_file():
         return False
     data = lib.read_bytes()
-    return b"wgpuTotkReflexSleep" in data and b"wgpuTotkCreateRenderPipelineCapture" in data
+    return all(s in data for s in (b"wgpuTotkReflexSleep", b"wgpuTotkCreateRenderPipelineCapture",
+                                   b"wgpuTotkMemoryHints"))
 
 
 def dlss(a, env):
