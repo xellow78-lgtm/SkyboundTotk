@@ -1111,7 +1111,18 @@ void play() {
     env[L"HOS_MODS"] = (int)setting_value(S_MODS_ON) && !mods.empty() ? mods : L"";
     // (the save folder: the game copies this install's saves into it the first time, unless it already holds some)
     env[L"HOS_SAVE_DIR"] = app.cfg.get(L"saves");
-    for (auto& [k, v] : app.cfg.v)   // (env.NAME = value: more for the game)
+    // (env.NAME = value: more for the game, as launcher.ini and launcher.defaults.ini say now: lines written while
+    // the launcher was open count, and ones taken out are gone. It used to pass the ones read when it opened.)
+    {
+        Config now;
+        now.load(app.cfg.path, false);
+        now.load(app.dir + L"\\launcher.defaults.ini", true);
+        for (auto it = app.cfg.v.begin(); it != app.cfg.v.end();)
+            it = it->first.rfind(L"env.", 0) == 0 && !now.v.count(it->first) ? app.cfg.v.erase(it) : std::next(it);
+        for (auto& [k, v] : now.v)
+            if (k.rfind(L"env.", 0) == 0) app.cfg.v[k] = v;
+    }
+    for (auto& [k, v] : app.cfg.v)
         if (k.rfind(L"env.", 0) == 0 && k.size() > 4) env[k.substr(4)] = v;
     auto block = env_block(env);
     const wstring log = app.cfg.get(L"log", app.dist + L"\\skybound.log");
