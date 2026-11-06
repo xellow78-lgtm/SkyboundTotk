@@ -721,9 +721,27 @@ void stage_resources(StageResources& out, const Channel& ch, const Regs& r, cons
         const uint64_t ckey = cb.address ^ size << 44;
         const uint64_t guest = memory_seq() ? hos_gpu_translate(cb.address) : 0;
         uint64_t off = UINT64_MAX;
-        if (auto it = copies.find(ckey); it != copies.end() && guest &&
+        // RX_CBUF_REUSE=0: copied for every draw (a test: a copy reused while the memory changed unseen would give a
+        // draw another one's constants - skinning matrices: a mesh flung across the screen)
+        static const bool reuse = !getenv("RX_CBUF_REUSE") || atoi(getenv("RX_CBUF_REUSE")) != 0;
+        bool reused = false;
+        if (auto it = copies.find(ckey); reuse && it != copies.end() && guest &&
                                          !memory_written_since(guest, size, it->second.second))
-            off = it->second.first;
+            off = it->second.first, reused = true;
+        // (F12 with RX_CHECK_ATTRS=1: each vertex program's storage constants, reused or copied, against memory now)
+        if (reused && frame_dump_active() && stage == 0)
+            if (static const bool check = env_flag("RX_CHECK_ATTRS"); check) {
+                const uint64_t n = cb.enabled ? std::min<uint64_t>(size, cb.size) : 0;
+                std::vector<uint8_t> now(n);
+                if (n) gpu_read(cb.address, now.data(), n);
+                uint32_t diff = 0;
+                for (uint64_t k = 0; k + 16 <= n; k += 16) diff += std::memcmp(now.data() + k, stream_ro.at(off + k), 16) != 0;
+                char line[200];
+                std::snprintf(line, sizeof line, "  vs cbuf%u storage %llx+%llx: a copy reused from this batch, %u of %llu "
+                              "rows differ from memory now", (unsigned)d.index, (unsigned long long)cb.address,
+                              (unsigned long long)n, diff, (unsigned long long)(n / 16));
+                dump_draw(line);
+            }
         if (off == UINT64_MAX) {
             off = stream_ro.alloc(size, dev.limits.minStorageBufferOffsetAlignment);
             if (off == UINT64_MAX) {
@@ -735,6 +753,14 @@ void stage_resources(StageResources& out, const Channel& ch, const Regs& r, cons
             if (n < size) std::memset(stream_ro.at(off + n), 0, size - n);
             count("up_cbuf_storage", (int64_t)size);
             if (guest) copies[ckey] = {off, memory_seq()};
+            if (n && frame_dump_active() && stage == 0 && gpu_written(cb.address, n))
+                if (static const bool check = env_flag("RX_CHECK_ATTRS"); check) {
+                    char line[200];
+                    std::snprintf(line, sizeof line, "  vs cbuf%u storage %llx+%llx: copied from memory the GPU wrote "
+                                  "(the copy may be older than the GPU's)", (unsigned)d.index, (unsigned long long)cb.address,
+                                  (unsigned long long)n);
+                    dump_draw(line);
+                }
         }
         const bool dynamic = dynamic_storage > 0;
         dynamic_storage -= dynamic;
@@ -4026,7 +4052,9 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
                 // RX_CHECK_ATTRS=1: the GPU's copy of the stream (the buffer cache's, as this draw read it) against
                 // guest memory now: 16-byte records that differ
                 if (static const bool check = env_flag("RX_CHECK_ATTRS"); check && st.stride) {
-                    const uint64_t bytes = (uint64_t)(d.base_instance + d.instances) * st.stride;
+                    // (per instance: the instances drawn; per vertex: the stream as bound, at most 1 MB)
+                    const uint64_t bytes = st.instanced ? (uint64_t)(d.base_instance + d.instances) * st.stride
+                                                        : std::min<uint64_t>(st.size, 1u << 20) & ~15ull;
                     const BufferRef ref = guest_buffer(st.addr, bytes);
                     if (ref.buffer) {
                         std::vector<uint8_t> gpu_copy(bytes), mem(bytes);
