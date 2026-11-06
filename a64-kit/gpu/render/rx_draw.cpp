@@ -1412,6 +1412,7 @@ struct VertexInput {
 struct CachedDraw {
     bool on = false, indexed = false;
     uint32_t first = 0, count = 0;
+    int64_t last_vertex = -1;   // (NVN, indexed: the highest vertex the draw fetches, index + base vertex; -1 unknown)
 };
 
 bool vertex_input(VertexInput& vi, const Regs& r, const Shader::Info& info, uint32_t v0, uint32_t v1,
@@ -2813,6 +2814,22 @@ bool nvn_vertex_input(VertexInput& vi, const NvnState& s, const Shader::Info& in
         uint32_t end = 0;
         for (const Attr& a : streams[st]) end = std::max(end, a.offset + a.size);
         if (cached.on) {
+            /* Past a stream's size the hardware fetches zeros (its limit). Bound in place, a fetch past it reads on
+               into the memory after the stream (Vulkan binds the whole buffer): a TOTK mesh drawn with a base vertex
+               that puts every vertex past its streams (2603 + indices 2603..4255 of 4256: on the Switch all zeros,
+               one point, nothing drawn) was drawn from its own normals and texture coordinates read as positions -
+               giant orange triangles over the screen. Such draws are copied instead: the copy is zero past the size. */
+            if (stride && !instanced && vs.size) {
+                const int64_t last = cached.indexed ? cached.last_vertex : (int64_t)cached.first + cached.count - 1;
+                if (last < 0 || (uint64_t)last * stride + end > vs.size) {
+                    count("nc_past_stream");
+                    return false;
+                }
+            }
+            if (stride && instanced && vs.size && (uint64_t)(base_instance + instances - 1) * stride + end > vs.size) {
+                count("nc_past_stream");
+                return false;
+            }
             uint64_t bytes;
             if (!stride) bytes = end;
             else if (instanced) bytes = (uint64_t)(base_instance + instances - 1) * stride + end;
@@ -3480,6 +3497,34 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         cd.indexed = d.indexed;
         cd.first = d.first;
         cd.count = d.count;
+        if (d.indexed) {
+            // the highest index (remembered per index list while its memory is unchanged) + the base vertex: the
+            // streams must hold that vertex for the draw to be bound in place (nvn_vertex_input)
+            struct MaxIndex {
+                uint32_t max;
+                uint64_t seq;
+            };
+            static std::unordered_map<uint64_t, MaxIndex> max_index;
+            const uint64_t ibytes = (uint64_t)d.count * index_size;
+            const uint64_t key = d.index_gpu ^ (uint64_t)d.count << 40 ^ (uint64_t)index_size << 61;
+            const uint64_t guest = memory_seq() ? hos_gpu_translate(d.index_gpu) : 0;
+            auto it = max_index.find(key);
+            if (it == max_index.end() || !guest || memory_written_since(guest, ibytes, it->second.seq)) {
+                if (max_index.size() > 65536) max_index.clear();
+                std::vector<uint8_t> raw((size_t)ibytes);
+                gpu_read(d.index_gpu, raw.data(), raw.size());
+                uint32_t mx = 0;
+                for (uint32_t i = 0; i < d.count; i++) {
+                    const uint8_t* q = raw.data() + (size_t)i * index_size;
+                    const uint32_t v = index_size == 2 ? (uint32_t)(q[0] | q[1] << 8)
+                                                       : (uint32_t)(q[0] | q[1] << 8 | q[2] << 16 | (uint32_t)q[3] << 24);
+                    if (s.restart && v == s.restart_index) continue;
+                    mx = std::max(mx, v);
+                }
+                it = max_index.insert_or_assign(key, MaxIndex{mx, memory_seq()}).first;
+            }
+            cd.last_vertex = (int64_t)it->second.max + d.base_vertex;
+        }
         cached = nvn_vertex_input(vi, s, prog->vs.info, prog->vs.generic_loads(), 0, 0, d.base_instance, d.instances, cd,
                                   &plan);
         if (cached && d.indexed) {
