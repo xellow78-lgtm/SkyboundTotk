@@ -1,141 +1,346 @@
 # SkyboundTOTK
 
-SkyboundTOTK is an experimental Windows x64 static recompilation project for *The Legend of Zelda: Tears of the Kingdom*, **base game version 1.0.0**. It is not affiliated with Nintendo. Expect graphical problems and incomplete compatibility; a successful build does not guarantee a complete playthrough.
+**An experimental native Windows PC port of *The Legend of Zelda: Tears of the Kingdom*, made by static
+recompilation.** The game's Switch (AArch64) code is translated ahead of time into C and compiled on your PC into a
+normal `.exe`. A runtime provides the Switch services the game calls, and a renderer runs its graphics through WebGPU
+(wgpu-native on Vulkan). It is a port of this one game, not a Switch emulator. It is not affiliated with Nintendo.
 
-The project's AArch64 game code is translated ahead of time into C and compiled locally into a native executable. A runtime implements the services the game expects, and the renderer translates its graphics work and shaders for WebGPU. This is a game-specific port, not a general-purpose Switch emulator. Some graphics translation still happens at runtime.
+This branch (`update-1.4.3`) targets **TOTK 1.4.3** (the base game plus the 1.4.3 update). The original 1.0.0 build
+still exists; most PC features below are 1.4.3-only.
 
-## Game files and distribution
+> **Status: playable, with known bugs.** The game boots, loads saves, plays in the open world, shrines, the sky and
+> the Depths, with sound and cutscene videos. Graphics bugs remain (see [Known issues](#known-issues)), and a full
+> playthrough has not been verified yet. Expect rough edges.
 
-You must supply your own legally obtained, already-extracted, **unmodified 1.0.0 base-game ExeFS and RomFS**. No game files, generated game code, keys, firmware or saves are included in this source project. The build does not extract NSP or XCI files, and other versions or updates are not supported by the game-specific hooks.
+No game files are included. You need your own dump of the game (see [Game files](#game-files-and-legal)).
 
-Keep your game files, generated code, executable package and saves private. The `game/`, `build/` and `dist/` directories are Git-ignored, but check what you are publishing rather than relying on ignore rules alone. The generated standalone package contains copyrighted game-derived data and must not be shared or committed.
+---
 
-## Download (release package)
+## Contents
 
-The [Releases](https://github.com/xellow78-lgtm/SkyboundTotk/releases) page has a small zip: the launcher, its build
-script and a readme, nothing of the game. Extract it to a drive with plenty of room, start `SkyboundTOTK Launcher.exe`,
-choose your dumped ExeFS and RomFS folders on the Build page and click Build. The first build downloads what it needs into
-that folder (no admin, nothing system-wide): Python if the PC has none ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)),
-the source from GitHub, clang (emsdk's LLVM), and Microsoft's C++ Build Tools from Microsoft after you accept their
-license in the launcher; with "Make the DLSS library" ticked, Rust too. The rest of this section is for building from a
-checkout of the source.
+- [Status at a glance](#status-at-a-glance)
+- [What works](#what-works)
+- [Known issues](#known-issues)
+- [Not done yet / roadmap](#not-done-yet--roadmap)
+- [Download and play](#download-and-play)
+- [Keys and settings](#keys-and-settings)
+- [Mods](#mods)
+- [Reporting a bug](#reporting-a-bug)
+- [Building from source](#building-from-source)
+- [Game files and legal](#game-files-and-legal)
+- [Source and licenses](#source-and-licenses)
 
-## Build on Windows
+---
 
-### Requirements
+## Status at a glance
 
-- Windows 10/11 x64 and a GPU and driver supported by wgpu-native. Allow **at least 45 GB free in addition to the original game dump** for intermediate files and the separate packaged RomFS; the build is CPU- and memory-intensive.
-- Python 3.10 or newer on PATH, with `lz4` installed: `python -m pip install lz4`.
-- Visual Studio 2022 Build Tools with the MSVC C++ tools and Windows SDK. Use an **x64 Native Tools Command Prompt** so the compiler can find the Windows headers and libraries.
-- Clang, clang++ and lld. The build previously used emsdk 6.0.9: install it separately and set `EMSDK` to its directory (the lookup defaults to `C:\emsdk`), or put these LLVM tools on PATH. The build script does not download compilers or Python packages.
+| Area | State |
+| --- | --- |
+| Boot, menus, saves | Working |
+| Open world, sky islands, Depths, shrines | Playable; graphics bugs in some places |
+| Full playthrough start to credits | **Not verified yet** |
+| Audio | Working (fades to silence above 200 fps, so the frame rate is capped at 200) |
+| Cutscene videos | Working (Windows Media Foundation) |
+| Graphics | Mostly right; open bugs listed below |
+| Upscaling | FSR 1, FSR 2.2, NVIDIA DLSS Super Resolution (DLSS needs an RTX card) |
+| Resolution and aspect ratio | Output up to 4K; 16:9, 16:10, 21:9, 32:9 with the HUD laid out for the shape |
+| Frame rate | 30 to 200 fps; above ~63 fps is beta |
+| Frame generation | Own interpolation, 2x / 3x / 4x, any GPU (experimental) |
+| Keyboard and mouse | Working, rebindable, native mouse camera |
+| Controllers | XInput and SDL (Xbox, PlayStation, Switch Pro and others), matching button prompts |
+| Gyro / motion controls | Not implemented |
+| Game language | English (US) only for now |
+| amiibo | Not implemented |
+| Mods | RomFS mods (TKMM output or emulator-style folders); code patches need a rebuild |
+| Launcher and installer | Working: builds from your dump, updates itself from GitHub |
+| Windows | Supported (10/11 x64) |
+| Linux / Steam Deck | Not supported (separate effort) |
 
-### Prepare and build
+---
 
-1. Put the extracted files in the project's `game` folder. The paths must look like this, not `game/exefs/exefs/main` or `game/romfs/romfs/Event`:
+## What works
 
-   ```text
-   SkyboundTOTK/
-     build.bat
-     game/
-       exefs/
-         main
-         main.npdm
-         rtld
-         sdk
-         ...
-       romfs/
-         ActorSystem/
-         Event/
-         ...
-   ```
+### Running the game
 
-2. Open an **x64 Native Tools Command Prompt**, change to the SkyboundTOTK directory and run `build.bat`. The launcher pauses at the end so you can read any errors.
-3. The script checks the `main` and `sdk` module build IDs and a few RomFS directories, lifts the game code, compiles the native executable and copies the runtime and RomFS into `dist/SkyboundTOTK/`. The checks do **not** verify the entire RomFS or guarantee that a dump is complete.
-4. Open `dist/SkyboundTOTK/SkyboundTOTK.exe` to run it. No command-line arguments are needed. Keep `image.bin`, `image.json`, `romfs/`, `wgpu_native.dll` and `SDL2.dll` alongside the executable. The standalone folder can be moved as a unit and does not need the original `game/` folder to launch.
+- **Static recompilation of TOTK 1.4.3.** The whole game executable is translated to C once and compiled with
+  clang, so the game's own code runs natively.
+- **Switch services** the game needs, written for Windows: file system (RomFS, saves, cache storage), threads and
+  synchronization, memory (an 8 GB guest address window, regions above 4 GB committed as the game makes them),
+  audio renderer, input, video playback (Media Foundation), display and timing.
+- **The game's graphics API (NVN) natively**, translated to WebGPU. The game's shaders are translated (Maxwell to
+  WGSL) as it uses them.
+- **Saves** in the install's `user/save`, or in a folder you choose (see the launcher's [Save folder](#the-launcher)).
 
-The first lift and compile can take a long time. The builder reuses a completed lift only when its recorded game and lifter inputs match. If the lift was interrupted or those inputs change, move the existing `build/` directory aside before retrying. The script refuses to overwrite a nonempty `dist/SkyboundTOTK/`: move the existing package aside before a new build. Copy its `user/` folder into the new package if you want to retain its saves and settings. Do not delete your only save backup.
+### Graphics and upscaling
 
-The package normally creates its own `user/` directory beside the executable; it does not automatically use the saves from another installation. Native renderer pipeline cache data is kept in `rxcache/` beside the executable. The executable also accepts an image path and `--romfs` / `--user` overrides for advanced use, but they are not needed for normal launching.
+- **FSR 2.2** (AMD's passes converted to WGSL) in place of the game's own scale-up: motion vectors from depth and
+  the game's camera, jitter, and a reactive mask from the G-buffer so Link doesn't ghost.
+- **NVIDIA DLSS Super Resolution** in FSR 2's place on RTX cards (needs the "DLSS library" build step). You can
+  pick the DLSS model: NVIDIA's default, K, M, L or J.
+- **FSR 1** (EASU + RCAS) when the final picture is enlarged to the window.
+- **3D resolution modes:** Game's own, Quality, Balanced, Performance, Ultra Performance, Native (DLAA). The game's
+  own dynamic resolution is turned off so the 3D resolution stays fixed.
+- **Output resolution** above the Switch's 1920x1080: 2560x1440, 3840x2160 or the display's size. The game's
+  texture heap and memory grow to fit.
+- **Aspect ratios:** 16:9 (the game's own), the display's shape, 16:10, 21:9, 32:9. The game's cameras take the
+  shape, so wider screens see more of the world, and the HUD layouts are rebuilt for the shape (HUD in the corners,
+  or centered).
+- **Anisotropic filtering** 2x to 16x.
+- **Colour textures compressed on the GPU:** ASTC textures are decoded on the GPU and re-encoded to BC7, a quarter
+  of the video memory of RGBA8.
+- **VRAM management:** unused textures and render targets are given back near Windows' video memory budget (this
+  fixed the fps drop after menus).
+
+### Frame rate, pacing and latency
+
+- **Frame rate limit** 30 to 200 fps, or the display's refresh rate. The game steps by real frame time, so it
+  runs at the right speed at any frame rate. Fixes for fades, hair and cloth, the equipment-switch cooldown and
+  trampolines above 30 fps.
+- **Frame timing:** Smooth (the step averages the last 5 frames) or Responsive (the last frame; better with
+  G-Sync / FreeSync).
+- **VSync:** On, Off (no tearing), Off (tearing). With VSync off the game can go past a 60 Hz screen's rate. If the
+  window keeps going out of date with tearing (seen with a system-wide ReShade), it falls back to no tearing by
+  itself.
+- **NVIDIA Reflex** On / On + Boost (VK_NV_low_latency2).
+- **Frame generation (frame interpolation):** the project's own, on any GPU. 2x, 3x or 4x. Each made pixel uses
+  block matching on the images, the camera's motion vectors (with FSR 2 or DLSS on) or no motion (the HUD). With
+  VSync on, made frames are paced to the display; with VSync off, the frames shown can go above the display's
+  refresh rate. It does not lower input lag. It adds about one game frame of delay, which is noticeable when the
+  base frame rate is low.
+- **FPS counter:** FPS, or FPS + frame time and the longest gap.
+
+### Shader stutter
+
+- **Pipeline cache** (`rxcache/pipelines.bin`): every pipeline the game used is remembered and rebuilt while the
+  title screen shows, the most recently used first (up to 8000 by default). It is compacted instead of deleted when
+  it grows large.
+- **SPIR-V cache** (`rxcache/spirv.bin`): the compiled form of each shader stage is kept, so later launches skip the
+  WGSL compile (needs the "DLSS library" build step's WebGPU library).
+- A shader seen for the first time is still translated during play, so new areas can hitch the first time.
+
+### Controls
+
+- **Keyboard and mouse** with every action rebindable (F1), mouse sensitivity, invert Y, walk speed.
+- **Native mouse camera:** the mouse drives the game's own camera input. Ultrahand holding, aiming cameras and the
+  ability wheel are handled.
+- **Controllers** through XInput and SDL (Xbox, DualSense, DualShock 4, Switch Pro and more), mapped by button
+  position.
+- **Button prompts that match your device:** keyboard (showing your own bindings), Xbox, PlayStation or Switch,
+  automatically or fixed.
+
+### Mods
+
+- **RomFS mods:** point the launcher at TKMM's output folder, or a folder of emulator-style mods (each with a
+  `romfs/`). Several mods load in name order; a later folder wins.
+- `.pchtxt` / `.ips` **data** patches apply. Patches to the game's **code** need the code translated again with
+  the mods (see [Mods](#mods)).
 
 ### The launcher
 
-After the first build, `dist/SkyboundTOTK/SkyboundTOTK Launcher.exe` does the rest from one window:
+`SkyboundTOTK Launcher.exe` does everything from one window:
 
-- **Build** takes your game files, either the extracted ExeFS and RomFS folders (the RomFS is linked, not copied) or the base game and 1.4.3 update `.nsp` files with your own `prod.keys`. It then runs the build steps with their progress: game files, source changes, build tools, the optional DLSS library, translating the game's code, compiling and installing. Steps that are already done are skipped, and a stopped build continues where it left off. The build itself is `launcher/pipeline.py`, and its log is `launcher_build.log` in the game folder.
-- **Settings** sets the upscaler (off, FSR 2 or DLSS), FSR 2 sharpness, fullscreen and window size. It also changes the game's own settings that F1 changes (3D resolution, the DLSS model, anisotropic filtering, NVIDIA Reflex, button icons, the mouse), the mods folder, the save folder and the log file. **Save folder:** empty keeps the saves in the install's `user/save`; a folder that OneDrive or Google Drive syncs shares them between PCs (`HOS_SAVE_DIR`). The first time it is used, the install's saves are copied into it (the originals stay), unless it already holds saves, which are then used. Settings and caches stay per PC. Do not play on two PCs at once with the same save folder. The launcher's own settings are in `launcher.ini` next to it. `env.NAME = value` lines there add environment variables for the game.
-- **Play** starts the game with those settings and writes what it prints to the log file.
-- **Updates:** at start the launcher asks GitHub for the newest commit of `update_repo` (`xellow78-lgtm/SkyboundTotk`) on `update_branch` (`update-1.4.3`); both can be changed in `launcher.ini`, and `update_check = 0` turns the check off. When there is a newer one, **Update and build** downloads that commit as a zip (no git needed), writes the changed files over the source, removes files the previous update brought that are gone, and runs the build, which redoes only what changed. Your game files, build folder, game folder, saves and mods are not touched. The installed version is in `.skybound_version` in the source folder.
+- **Build** from your own dump: the base game and 1.4.3 update `.nsp` files (or gamecard `.xci`) with your own
+  `prod.keys`, or already-extracted ExeFS and RomFS folders. Steps already done are skipped, and a stopped build
+  carries on where it left off.
+- **Installs what the build needs, without admin:** Python (if the PC has none), clang (emsdk's LLVM), Microsoft's C++
+  Build Tools (after you accept Microsoft's license in the launcher) and, for DLSS, Rust. Everything stays in the
+  install folder.
+- **Updates itself:** it checks this branch on GitHub at start. **Update and build** downloads the new source and
+  rebuilds only what changed. Your game files, saves and mods are not touched.
+- **Settings:** upscaler, sharpness, display mode, window size, VSync, output resolution, aspect ratio, 3D
+  resolution, DLSS model, frame rate limit, frame timing, FPS counter, anisotropic filtering, Reflex, button icons,
+  mouse camera and sensitivity, mods folder, save folder, log file.
+- **Save folder:** pick a folder that OneDrive or Google Drive syncs to share saves between PCs. The first time, the
+  install's saves are copied into it (the originals stay), unless it already has saves, which are then used.
+  Settings stay per PC. Don't play on two PCs at once with the same save folder.
+- `launcher.ini` next to it holds the launcher's settings. `env.NAME = value` lines there pass environment variables
+  to the game (debugging options).
 
-The launcher needs the same tools as `build.bat` (Python, Visual Studio's C++ tools, clang from emsdk). Python packages it lacks are installed. It does not install compilers.
+### Debugging tools (for bug hunting)
 
-### Build and launch troubleshooting
+- **F12 frame dump:** every render target of the next frame as PNG, and every draw in the log.
+- **Pixel probe** (`RX_PIXEL`): which draw wrote a pixel.
+- **Draw capture** (`RX_DUMP_ATTRS` + `RX_CHECK_ATTRS`): a draw's constants, vertex data and index list, checked
+  against the game's memory and saved to a file so its vertex shader can be replayed off the PC.
+- Memory, VRAM, stall and pipeline logs; hardware data breakpoints on game addresses; a sampling profiler (F5).
 
-- **Python or `lz4` missing:** install them for the Python on PATH, then reopen the tools prompt. Run `python -m pip install lz4` with that same Python.
-- **Compiler, headers or libraries missing:** open the x64 Native Tools prompt and check that the C++ tools, Windows SDK, Clang, clang++ and lld are installed and discoverable. Set `EMSDK` if the LLVM tools are in a non-default emsdk directory.
-- **Wrong module or missing RomFS:** check the extracted folder layout and version. A base-game ID match is not a complete integrity check.
-- **Existing output or stale/incomplete lift:** move the indicated package or build directory aside, preserving `user/` first, then retry. An interrupted copy can also leave a nonempty package that needs to be moved aside.
-- **First launch or new scene stutters:** shader translation and pipeline compilation may happen as scenes are encountered. The native pipeline cache helps prepare previously encountered pipelines on later launches; it cannot guarantee stutter-free play.
-  - **SPIR-V shader cache** (`rxcache/spirv.bin`): with the rebuilt WebGPU library (the launcher's "DLSS library" step), the SPIR-V each shader stage was compiled to is kept, and later launches build those stages straight from it instead of parsing and validating the WGSL again. The first time a shader is seen it is still compiled; it is the second launch onwards that gains. The log's `pipeline compilers:` line shows how many stages came from it. The file is tied to the `wgpu_native.dll` that wrote it and starts over when that changes. `RX_NO_SPIRV_CACHE=1` turns it off (try this first if a scene draws wrong after an update). It holds data made from the game's shaders, so it stays on your PC.
-  - `rxcache/pipelines.bin` is compacted at start once it passes 80,000 pipelines or 250 MB: the 50,000 most recently used are kept. Before, it was deleted outright at 400 MB.
-- **Crash or graphics issue:** note the game version, hardware, driver, location and settings. The standalone startup test initialized the renderer and loaded the packaged RomFS, but did not verify full gameplay or graphics correctness.
+---
 
-## Controls and display features
+## Known issues
 
-Focus the game window before using the keys. The renderer briefly reports display settings in the window title; changes are saved in `user/present.txt` for the next launch.
-
-| Key | Action |
-| --- | --- |
-| F7 | Toggle experimental frame interpolation (frame generation; F1 > Graphics sets 2x / 3x / 4x). |
-| F8 | Toggle FSR 1 upscaling. |
-| F9 | Cycle FSR sharpening. |
-| F10 | Toggle aspect-preserving presentation versus stretching the image to fill the window. |
-| F11 | Toggle fullscreen/windowed mode. |
-
-**FSR:** The current implementation is FidelityFX Super Resolution **1**, with EASU upscaling and RCAS sharpening in the presentation pass. It is enabled by default and is used when the presented frame is enlarged; otherwise the renderer uses the normal sampling path. FSR 1 is spatial upscaling, not FSR 2/3 temporal upscaling or AMD frame generation, and does not increase the game's internal render resolution. F9 cycles sharpening from sharper to softer values.
-
-**Output resolution (TOTK 1.4.3):** `output_resolution` in `user/input.ini` (F1 > Graphics, or the launcher) makes the game compose its frame and HUD at 2560x1440, 3840x2160, or the largest 16:9 size that fits the main display, instead of 1920x1080. `HOS_OUTPUT_RES=<w>x<h>` overrides it. It takes effect at the next start. The 3D scene follows at the game's own 5/6 of that size, or at the full size with the **Native (DLAA)** 3D resolution chosen before starting. The game's texture heap and memory grow to fit, using the sizes from totk-pc-recomp (MIT), whose patch sites come from MacNativeGames (MIT). Without Python and its packages (the heap table is rewritten by `tools/button_icons.py`) the game keeps 1920x1080. The output stays 16:9; other picture shapes are the aspect ratio setting below. Bigger sizes need more video memory.
-
-**Frame rate (TOTK 1.4.3):** the game steps by the time its frames really take, so it runs at the right speed at any frame rate. `frame_rate_limit` in `user/input.ini` (F1 > Graphics, or the launcher; it changes live) caps it at 30 to 200 fps, or at the display's refresh rate with 0 (at most 200: above that the game's sound fades out to silence; the cause in the game is not found yet). The default is 60. Above 30 fps, fades, hair and cloth, the equipment-switch cooldown and trampolines are fixed for the faster frames (`hos/totk_highfps.c`, from totk-pc-recomp's and MacNativeGames' patch lists, both MIT). Above about 63 fps it is beta: as in other ports, the camera may turn faster and Link may not climb steps. `HOS_STEP_FRAMES=1..8` sets how many frame times the step averages (5).
-
-**Texture memory:** colour (sRGB) ASTC textures are decoded on the GPU and encoded again to BC7 there, so they take a quarter of the video memory RGBA8 took (`gpu/render/rx_bc7_gpu.wgsl.h`; the log line `ASTC to BC7 on the GPU` counts the textures and the memory saved). The encoder uses BC7 mode 6 only, which fits each 4x4 block to one colour line: fine for colour, poor for bumpy normal maps, so linear ASTC textures (normals, masks) stay RGBA8. `RX_ASTC_BC=0` turns it off, `RX_ASTC_BC=2` includes linear textures, `RX_ASTC_BC_ARRAYS=0` leaves texture arrays as RGBA8.
-
-**Frame interpolation (frame generation):** This is the project's own experimental image-based interpolation, not AMD's or NVIDIA's frame generation, so it runs on any GPU. Turn it on with F7 or F1 > Graphics > Frame generation (Off, 2x, 3x or 4x; remembered in `user/present.txt`). It inserts made frames between the game's frames. It does not make the game simulate more frames or reduce input latency: what you see runs about one game frame behind. Each made pixel takes the motion that blends the two frames best: block matching on the images (for what moves by itself, like Link and enemies), the camera's per-pixel motion vectors when FSR 2 or DLSS is on (exact for the world around you), or none (the HUD). With the upscaler off, only the block matching is used. With VSync On, the game's frame rate is held to the display's refresh rate divided by the multiplier (e.g. 82 fps for 2x on 165 Hz), so every made frame is shown, each for the same time; this paces them most evenly on a display without G-Sync / FreeSync. With VSync Off (the launcher's VSync setting), the game keeps its own frame rate cap and the frames shown go above the display's refresh rate (e.g. 75 game fps shown as 150 on a 75 Hz display). The display still shows only its refresh rate: with Off (no tearing) the newest frame at each refresh, with Off (tearing) parts of several. With NVIDIA Reflex on, the game's frames keep their Reflex frame IDs and markers and the made frames carry none, so Reflex keeps measuring the game's own frames. UI over moving scenery and fast motion can still smear; long frame gaps (loading) are not interpolated. `RX_FRAMEGEN_NO_CAMERA=1`: block matching only (to compare).
-
-**Aspect ratio (ultrawide and 16:10):** `aspect_ratio` in `user/input.ini` (F1 > Graphics, or the launcher; at the next start): 16:9 (the game's own, the default), the display's shape, 16:10, 21:9 or 32:9. `HOS_ASPECT=<w>:<h>` (or `<w>x<h>`, or a ratio) overrides it. The game's cameras take that shape (`hos/totk_ultrawide.c`: four sites on 1.4.3, from MacNativeGames, MIT), so a wider screen shows more of the world at the sides and a 16:10 one keeps the vertical view; the picture is shown at that shape, with black bars only if the window is another shape. The HUD's layouts are made for the shape at the start by `tools/button_icons.py --layout` (pane lists from MacNativeGames, MIT, checked there on 1.4.3), from your own game files or your mod's: the HUD keeps its proportions, with its parts in the screen's corners (`HOS_HUD=center` keeps them in the middle 16:9). The game's frame takes the shape too (`hos/totk_res.c`): 16:10 keeps the output's width (2560x1440 becomes 2560x1600), wider shapes keep its height (3440x1440 at 21:9), and "Display" uses the display's own size. The 3D scene follows the same shape, so nothing is stretched. If the game's heap table cannot be grown, the output stays 1920x1080 and that 16:9 frame is stretched to the shape instead. Markers that follow things in the world (enemy and quest markers) may sit a little off.
-
-**FPS counter:** `fps_counter` in `user/input.ini` (F1 > Graphics, or the launcher; it changes live): off, FPS, or FPS with the average frame time and the longest gap of the last half second, in the top left corner. It counts the frames shown (with frame interpolation, interpolated ones too).
-
-Keyboard and mouse controls are experimental. Press **F1** in the game to rebind any key or mouse button (and the wheel), set mouse sensitivity, invert Y and walk speed; the bindings are saved to `user/input.ini`. Defaults: WASD moves, IJKL controls the camera, Space jumps, E is action, Shift or Q is run/cancel, F or left click attacks, Z/R are L/R, C or right click is ZL, V is ZR, Ctrl crouches, middle click is the right-stick click, Alt walks, Enter is Plus, Tab is Minus and the arrow keys are the D-pad. Click the window to capture the mouse, Esc to release it, and use `-` / `=` to adjust sensitivity. The mouse turns the camera as the right stick would (by its speed). XInput and SDL-supported controllers are also handled; buttons map by physical position.
-
-### Why WebGPU?
-
-The renderer targets the WebGPU API and WGSL so the same general renderer and shader backend can be used by native wgpu and by browser WebGPU experiments rather than maintaining wholly separate graphics implementations. On Windows, wgpu-native translates this API to an available native backend, such as Vulkan or Direct3D 12; choosing WebGPU does not mean the desktop game runs inside a browser. It also has portability and validation tradeoffs, and translation, pipeline compilation and API overhead still require optimization. The root `build.bat` described here builds the **Windows native** package; browser functionality and packaging are not promised or validated by that launcher.
-
-## Known issues and limitations
-
-These are reports and investigation notes, not a complete compatibility list. Some were observed in earlier TOTKPort builds rather than independently reproduced in standalone Skybound.
+Tested mainly on an RTX 5080 (1080p, 75 Hz) and an RTX 3060 Ti (2560x1600, 165 Hz). Other GPUs and AMD / Intel cards
+are less tested.
 
 | Issue | Status | Details |
 | --- | --- | --- |
-| Shadows / shaders | **Reported** | Shadow shader problems have been reported. The standalone startup log also showed three shader-decoder assertions; their visual effect and relationship to the shadow issue are unknown. |
-| Stretched terrain | **Reported** | Terrain can appear randomly stretched; cause and reproducibility need investigation. |
-| Incorrect terrain textures | **Reported** | Some areas have wrong terrain textures; locations and causes need investigation. |
-| Weapon and shield wheel background | **Reported** | The background can be black instead of blurred. An ability-wheel workaround was recorded earlier, but the weapon/shield behavior has not been verified fixed in standalone Skybound. |
-| Aspect ratio | **New; needs testing** | The old F6 ultrawide stretched the view on 1.4.3: only the two viewport sites were hooked, and MacNativeGames found the same stretched result until the camera's own update and setup sites were patched too. Those are in now; 16:10 and 21:9 need a report. |
-| Zonai Portable Pot particles | **Workaround; retest** | A workaround greatly reduced disappearing-effect spikes in an earlier build, but short stray lines remained and the underlying cause is unknown. Retest in Skybound. |
-| Depths gloom | **Earlier fix; retest** | Missing or incorrect ground gloom was reported on the path to Ganon. Earlier notes record a fix for a reproduced case; standalone Skybound and other locations need verification. |
-| Fused-weapon inventory icons | **Workaround; retest** | Black icons were seen in earlier testing. A cache-retry workaround was recorded, but the underlying timing issue remains unexplained; retest in Skybound. |
-| Browser new-game loading | **Previously reported; retest** | Earlier web experiments had an intermittent loading-screen hang. This is not a verified Windows-launcher issue; the root build does not package a browser release. |
-| Browser interpolation judder | **Earlier fix; retest** | Earlier web experiments had interpolation judder; notes record a pacing fix. Browser behavior is not validated by the Windows launcher. |
-| Performance and compatibility | **Ongoing limitation** | Frame pacing, shader warm-up and rendering vary by scene and hardware. A build and startup test are not a full-game compatibility test. |
+| Orange sky / giant orange triangles over the screen | **Fixed (Nov 5); needs testing** | A mesh drawn with a base vertex that puts every vertex past its vertex data. The Switch reads zeros there and draws nothing; we read the memory after it (the mesh's normals and texture coordinates as positions). Draws like that are now copied with zeros past the end. Confirmed by replaying the captured draw. The "randomly stretched terrain" reports may be the same bug; retest. |
+| Depths gloom displacement | **Open (next up)** | The gloom on the ground in the Depths can look displaced or wrong. An earlier fix covered one case; needs an F12 capture where it happens. |
+| Sky flicker | **Open** | Reported, not investigated yet. |
+| Dark ground patch (Hateno) | **Open** | Captured with F12, not investigated yet. |
+| Incorrect terrain textures | **Reported** | Some areas show wrong terrain textures. |
+| Shadows | **Reported** | Shadow shader problems reported. Three shader-decoder assertions appear at startup; their effect is unknown. |
+| Weapon and shield wheel background | **Reported** | Can be black instead of blurred. |
+| Zonai Portable Pot particles | **Workaround** | Disappearing-effect spikes greatly reduced; short stray lines remain. |
+| Fused-weapon inventory icons | **Workaround** | Icons rendered transparent; a cache workaround redraws them. |
+| Crashes | **Rare, open** | One crash on a loading screen (no log). One GPU device loss after ~16 minutes with frame generation 3x and VSync off (cause unknown). |
+| Above ~63 fps | **Beta** | As in other ports: the camera can turn faster and Link may fail to climb steps. |
+| Above 200 fps | **Capped** | The game's own audio mix fades to silence at 230+ fps; the cause in the game isn't found yet, so 200 is the limit. |
+| Frame generation latency | **By design** | Adds about one game frame of delay. On slower GPUs (low base fps) it feels laggy. |
+| Startup "Not Responding" | **Minor** | Windows can mark the window not responding for a few seconds while the pipeline cache warms up. Wait it out. |
+| Code mods | **Limitation** | `.ips` / exefs code patches are left out unless the code is translated again with the mods. |
 
-## To-do
+---
 
-- [ ] Add support for other TOTK versions beyond the 1.0.0 base game.
-- [ ] Fix all current issues and bugs.
+## Not done yet / roadmap
+
+**Needs doing (in this project):**
+
+- [ ] Verify a full playthrough on 1.4.3, start to credits.
+- [ ] Fix the open graphics issues above (Depths gloom next, then sky flicker, terrain textures, shadows, the wheel
+      background).
+- [ ] Find why audio fades above 200 fps, and fix climbing steps at high frame rates.
+- [ ] Port the remaining 1.0.0-only optimizations to 1.4.3: native frustum culling (~5% of the busiest frames on
+      1.0.0) and the job-pool core count.
+- [ ] Game language selection (fixed to English (US)).
+- [ ] BC5 / better compression for normal maps (the GPU BC7 encoder is colour-only, so normal maps stay RGBA8).
+- [ ] Cache shader translations across launches (first-time shaders are still translated during play).
+- [ ] A frame replay tool: record a frame's GPU work and replay it off the PC, to test graphics fixes without the
+      game.
+- [ ] amiibo.
+
+**Left to others / separate efforts:**
+
+- [ ] Linux and Steam Deck builds.
+- [ ] Gyro and motion controls.
+- [ ] Textures prepared at build time.
+- [ ] Other game languages' testing.
+
+---
+
+## Download and play
+
+1. Get the zip from [Releases](https://github.com/xellow78-lgtm/SkyboundTotk/releases). It holds the launcher, its
+   build script and a readme: nothing of the game.
+2. Extract it to a drive with **at least 45 GB free** (an SSD loads much faster and stutters less while exploring).
+3. Start `SkyboundTOTK Launcher.exe`. On the **Build** page, choose your base game and 1.4.3 update (`.nsp` or
+   `.xci`) and your `prod.keys`, or your extracted ExeFS and RomFS folders. Tick **DLSS library** if you have an
+   RTX card (it also enables Reflex and the SPIR-V cache).
+4. Click **Build**. The first build downloads its tools first; it took about 15 minutes on a fast PC and takes
+   longer on slower ones.
+5. Set things up on **Settings**, then **Play**.
+
+To update later: click **Update and build** when the launcher says an update is available.
+
+---
+
+## Keys and settings
+
+| Key | Action |
+| --- | --- |
+| F1 | Settings menu in the game (graphics, controls, bindings) |
+| F4 | Cycle 3D resolution modes |
+| F7 | Frame generation on / off |
+| F8 | FSR 1 on / off |
+| F9 | FSR sharpening |
+| F10 | Keep the picture's shape / stretch to the window |
+| F11 | Fullscreen / windowed |
+| F12 | Frame dump of the next frame (for bug reports) |
+| Esc | Free the mouse (click the window to capture it again) |
+
+**Default keyboard controls:** WASD move, IJKL camera (or the mouse), Space jump, E action, Shift or Q run / cancel,
+F or left click attack, Z / R = L / R, C or right click = ZL, V = ZR, Ctrl crouch, middle click = right-stick click,
+Alt walk, Enter = Plus, Tab = Minus, arrow keys = D-pad. `-` / `=` change mouse sensitivity. Everything can be
+rebound with F1.
+
+The game's own settings are saved in `user/input.ini`; display toggles in `user/present.txt`. Some useful
+environment variables (in `launcher.ini` as `env.NAME = value`):
+
+| Variable | What it does |
+| --- | --- |
+| `RX_NO_SPIRV_CACHE=1` | Turn the SPIR-V cache off (try this first if a scene draws wrong after an update) |
+| `RX_NO_PIPELINE_CACHE=1` | Neither read nor write the pipeline cache |
+| `RX_ASTC_BC=0` / `2` | No BC7 encoding / also linear textures |
+| `HOS_OUTPUT_RES=<w>x<h>` | Override the output resolution |
+| `HOS_ASPECT=<w>:<h>` | Override the aspect ratio |
+| `HOS_HUD=center` | Keep the HUD in the middle 16:9 on wide screens |
+| `RX_FRAMEGEN_NO_CAMERA=1` | Frame generation with block matching only |
+| `RX_DUMP_DIR=<folder>` | Where F12 frame dumps go (default `rx_frame`) |
+
+---
+
+## Mods
+
+- Set the launcher's **Mods folder** to TKMM's output folder, or to a folder holding emulator-style mods (each mod
+  a folder with `romfs/` and/or `exefs/`). They load in name order, so `zz-My Mod` wins over `merged`.
+- RomFS files and `.pchtxt` / `.ips` data patches apply at start; the log lists what was used.
+- **Code patches** (patches to `main`) are left out because the code is compiled ahead of time. The log prints the
+  command to translate the code again with your mods folder, then build again.
+
+---
+
+## Reporting a bug
+
+1. Note what happened, where (map coordinates help), your GPU, driver and settings.
+2. While the problem is on screen, press **F12** once and wait a few seconds (the game hitches while it saves).
+3. Close the game **without pressing Play again**: the launcher overwrites the log file at each start.
+4. Send the log (the launcher's **Open the log**) and, if asked, the F12 folder (`rx_frame` or `RX_DUMP_DIR`).
+
+The F12 folder and the `rxcache` files contain data made from your game: share them privately, never publicly.
+
+---
+
+## Building from source
+
+The launcher is the easy way (it installs everything). To build by hand:
+
+**Requirements:** Windows 10/11 x64; a GPU supported by wgpu-native (Vulkan); 45 GB free on top of the game dump;
+Python 3.10+ with `lz4` (`python -m pip install lz4`); Visual Studio 2022 Build Tools (MSVC C++ and Windows SDK);
+clang, clang++ and lld (emsdk 6.0.9's LLVM: set `EMSDK`, default `C:\emsdk`, or put them on PATH).
+
+1. Put your extracted game in `game/` as `game/exefs/main`, `game/exefs/sdk`... and `game/romfs/...` (not
+   `game/exefs/exefs/main`). For 1.4.3, the RomFS is the base game's with the update applied
+   (`python a64-kit/tools/nx.py romfs <base.nsp> <out> --update <update.nsp>`), and `SKYBOUND_EXPERIMENTAL=1` must
+   be set.
+2. In an **x64 Native Tools Command Prompt**, run `build.bat` in the SkyboundTOTK folder. It checks the `main` and
+   `sdk` build IDs and a few RomFS folders (not a full integrity check), translates the code, compiles it and puts
+   the game in `dist/SkyboundTOTK/`.
+3. Run `dist/SkyboundTOTK/SkyboundTOTK.exe` (or the launcher next to it). Keep `image.bin`, `image.json`, `romfs/`,
+   `wgpu_native.dll` and `SDL2.dll` beside the exe.
+
+`SKYBOUND_JOBS=<n>` limits parallel compiles if you run out of memory. A completed translation is reused while its
+inputs match. If one was interrupted, move `build/` aside and retry. The script won't overwrite a non-empty
+`dist/SkyboundTOTK/`: move it aside first and keep its `user/` folder (your saves and settings).
+
+**Troubleshooting:** Python or `lz4` missing → install them for the Python on PATH. Headers or libraries missing →
+use the x64 Native Tools prompt and check the C++ tools, Windows SDK, clang and lld. "Wrong module" → check the
+folder layout and version. DLSS starts as FSR 2 → build with **DLSS library** ticked (the WebGPU library has to be
+rebuilt when it changes).
+
+### Why WebGPU?
+
+One renderer and shader backend (WGSL) serves native wgpu and browser WebGPU experiments, instead of separate
+graphics backends. On Windows, wgpu-native runs it on Vulkan; the desktop game does not run in a browser. The cost is
+some translation and API overhead that still needs optimizing.
+
+---
+
+## Game files and legal
+
+You must supply your own legally obtained copy of the game: the base game and the 1.4.3 update, dumped from your own
+Switch, with your own keys. **No game files, generated game code, keys, firmware or saves are included or
+downloaded.**
+
+Keep your game files, the generated code, the built game, its caches (`rxcache/`), frame dumps and saves private. The
+`game/`, `build/` and `dist/` folders are Git-ignored, but check what you publish rather than relying on that. A
+built game contains copyrighted, game-derived data and must not be shared.
 
 ## Source and licenses
 
-NotRexed's original project code is offered under the [MIT License](LICENSE). The required AArch64 lifting/runtime and renderer sources originated in NotRexed's Rexcomp-based TOTKPort; unrelated Rexcomp kits and applications are not included.
+NotRexed's original project code is offered under the [MIT License](LICENSE). The AArch64 lifting/runtime and renderer
+sources originated in NotRexed's Rexcomp-based TOTKPort; unrelated Rexcomp kits and applications are not included.
 
-**The whole repository and combined build are not MIT-only.** The AArch64 kit includes GPL-licensed suyu/yuzu components and other third-party code under their own licenses. Their licenses and applicable GPL obligations still apply; see [NOTICE.md](NOTICE.md) and the individual license files. MIT does not grant rights to the game. Before publishing, verify that every contributor whose code is being offered under MIT has agreed, and review the applicable source and binary distribution obligations.
+**The whole repository and combined build are not MIT-only.** The AArch64 kit includes GPL-licensed suyu/yuzu
+components and other third-party code under their own licenses (see [NOTICE.md](NOTICE.md) and the license files).
+Several PC features use findings and patch sites from totk-pc-recomp and MacNativeGames (both MIT), credited in the
+files that use them. MIT does not grant rights to the game. Before publishing, verify that every contributor whose code
+is offered under MIT has agreed, and review the source and binary distribution obligations.
