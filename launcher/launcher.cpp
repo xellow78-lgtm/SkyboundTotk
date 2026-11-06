@@ -136,6 +136,17 @@ struct Config {
         }
     }
     void save() {
+        // (env.NAME lines belong to the file: the launcher has no setting for them, so ones written while it was open
+        // - by hand, or by a helper - are kept, and ones taken out stay out)
+        Config now, defaults;
+        now.load(path, false);
+        defaults.load(parent(path) + L"\\launcher.defaults.ini", false);
+        for (auto it = v.begin(); it != v.end();)
+            it = it->first.rfind(L"env.", 0) == 0 && !now.v.count(it->first) && !defaults.v.count(it->first)
+                     ? v.erase(it)
+                     : std::next(it);
+        for (auto& [k, val] : now.v)
+            if (k.rfind(L"env.", 0) == 0) v[k] = val;
         std::string s = "# SkyboundTOTK Launcher's settings (the launcher writes this; env.NAME = value adds a variable)\n";
         for (auto& [k, val] : v) s += narrow(k) + " = " + narrow(val) + "\n";
         write_file(path, s);

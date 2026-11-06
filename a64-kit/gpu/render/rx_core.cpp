@@ -103,6 +103,7 @@ HWND surface_hwnd;   // the window the surface is on (made again from it: surfac
 #endif
 WGPUTextureFormat surface_format = WGPUTextureFormat_BGRA8Unorm;
 WGPUPresentMode present_mode = WGPUPresentMode_Fifo;
+bool surface_mailbox_ok;   // (the surface offers mailbox: a fallback for immediate, surface_present)
 uint32_t surface_w, surface_h;
 volatile LONG want_w, want_h;
 WGPURenderPipeline blit_pipeline;
@@ -581,6 +582,7 @@ bool init_device(HWND hwnd) {
     // after the game window lost the foreground once (F1's bindings window, the Start menu) while the game ran on;
     // FIFO did not (a player's test, TOTK 1.4.3). RX_PRESENT=mailbox / immediate: those.
     (void)mailbox, (void)immediate;
+    surface_mailbox_ok = mailbox;
     present_mode = WGPUPresentMode_Fifo;
     if (const char* want = getenv("RX_PRESENT")) {
         if (!std::strcmp(want, "fifo")) present_mode = WGPUPresentMode_Fifo;
@@ -2486,6 +2488,25 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
             hos_log("rx: no surface texture (status %d, %d in a row)", (int)st.status, fails_in_row);
         if (st.texture) wgpuTextureRelease(st.texture);
         if (view) wgpuTextureViewRelease(view);
+        /* Outdated over and over, every other present (immediate, a 3060 Ti at 2560x1600 with ReShade's layer: the
+           surface made again, one present, Outdated again, ~700 times, windowed too; FIFO on the same PC did not): a
+           few in two seconds, and immediate gives way to mailbox (VSync off without tearing), mailbox to FIFO */
+#ifndef __EMSCRIPTEN__
+        {
+            static uint64_t burst_from;
+            static int burst;
+            const uint64_t now = GetTickCount64();
+            if (now - burst_from > 2000) burst_from = now, burst = 0;
+            if (++burst >= 6 && present_mode != WGPUPresentMode_Fifo) {
+                const bool to_mailbox = present_mode == WGPUPresentMode_Immediate && surface_mailbox_ok;
+                present_mode = to_mailbox ? WGPUPresentMode_Mailbox : WGPUPresentMode_Fifo;
+                ::rx_vsync_on = present_mode == WGPUPresentMode_Fifo;
+                hos_log("rx: the window's surface keeps going out of date: present mode %s from now on",
+                        to_mailbox ? "mailbox (VSync off, no tearing)" : "fifo (VSync on)");
+                burst = 0;
+            }
+        }
+#endif
 #ifndef __EMSCRIPTEN__
         static const bool remake = !getenv("RX_SURFACE_REMAKE") || atoi(getenv("RX_SURFACE_REMAKE")) != 0;
         RECT rc{};
