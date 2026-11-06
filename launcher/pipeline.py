@@ -45,6 +45,10 @@ STEPS = [("update", "Updates"), ("files", "Game files"), ("overlay", "Source cha
          ("dlss", "DLSS library"), ("lift", "Translate the game's code"), ("compile", "Compile"),
          ("install", "Install")]
 LOG = None
+# this pipeline's own text as it started: the update rewrites launcher/pipeline.py in place (the file this process
+# runs from), so reading __file__ after it gave the new text, equal to itself, and the old code ran the rest of the
+# build (a new wgpu_native.dll requirement was never seen: the DLSS library step said skip)
+SELF = Path(__file__).read_bytes()
 
 
 def say(line):
@@ -725,7 +729,7 @@ def main():
         step(key, state)
         if key == "update" and state == "done":
             new = SOURCE / "launcher/pipeline.py"
-            if new.is_file() and new.read_bytes() != Path(__file__).read_bytes():
+            if new.is_file() and new.read_bytes() != SELF:
                 # (the update brought another pipeline: the rest of the build is its, in this process's place)
                 args = [sys.executable, "-u", str(new)] + [x for x in sys.argv[1:]]
                 i = args.index("--fetch")
