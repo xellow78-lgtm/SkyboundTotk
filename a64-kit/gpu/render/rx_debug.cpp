@@ -411,6 +411,58 @@ void watch_buffer_read(const char* when, int64_t tag) {
 }
 }  // namespace
 
+bool dump_gpu_range(const char* tag, uint64_t va, uint64_t size) {
+    size = std::min<uint64_t>(size, 4096) & ~3ull;
+    const BufferRef ref = size ? guest_buffer(va, size) : BufferRef{};
+    if (!ref.buffer) return false;
+    flush_batch();   // (the uploads guest_buffer queued, and the work before)
+    wait_submitted();
+    WGPUBufferDescriptor bd{};
+    bd.size = size;
+    bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+    WGPUBuffer staging = wgpuDeviceCreateBuffer(dev.device, &bd);
+    WGPUCommandEncoder e = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
+    wgpuCommandEncoderCopyBufferToBuffer(e, ref.buffer, ref.offset, staging, 0, size);
+    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(e, nullptr);
+    wgpuQueueSubmit(dev.queue, 1, &cb);
+    wgpuCommandBufferRelease(cb);
+    wgpuCommandEncoderRelease(e);
+    bool complete = false, ok = false;
+    struct Done { bool* complete; bool* ok; } done{&complete, &ok};
+    WGPUBufferMapCallbackInfo mc{};
+    mc.mode = WGPUCallbackMode_AllowSpontaneous;
+    mc.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+        auto* d = static_cast<Done*>(u1);
+        *d->ok = status == WGPUMapAsyncStatus_Success;
+        *d->complete = true;
+    };
+    mc.userdata1 = &done;
+    wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size, mc);
+    while (!complete) wgpuDevicePoll(dev.device, true, nullptr);
+    if (ok) {
+        dump_floats(tag, static_cast<const uint32_t*>(wgpuBufferGetConstMappedRange(staging, 0, size)), size / 4);
+        wgpuBufferUnmap(staging);
+    }
+    wgpuBufferRelease(staging);
+    return ok;
+}
+
+void dump_floats(const char* tag, const uint32_t* w, size_t n) {
+    std::string line;
+    size_t nonzero = 0;
+    for (size_t i = 0; i < n; i++) nonzero += w[i] != 0;
+    for (size_t r = 0; r < n; r += 4) {
+        char b[96];
+        float f[4] = {};
+        std::memcpy(f, w + r, 4 * std::min<size_t>(4, n - r));
+        std::snprintf(b, sizeof b, " [%zu] %g %g %g %g", r / 4, f[0], f[1], f[2], f[3]);
+        line += b;
+    }
+    char head[160];
+    std::snprintf(head, sizeof head, "    %s (%zu of %zu words nonzero):", tag, nonzero, n);
+    dump_draw((std::string(head) + line).c_str());
+}
+
 /// RX_WATCH_BUF=<GPU VA hex>:<size hex>[:<frames>] (debugging): at each present the buffer cache's copy of that range
 /// (what the GPU's draws read) is read back, and the 16-byte records that changed since the last present are logged
 /// (rx-buf lines), for that many frames (default 600) from RX_WATCH_BUF_AFTER=<seconds> on.

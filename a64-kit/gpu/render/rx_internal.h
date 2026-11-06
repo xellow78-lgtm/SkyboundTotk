@@ -41,6 +41,7 @@ bool wgpuDevicePoll(WGPUDevice device, bool wait, const void* submission);   // 
 
 extern "C" {
 void hos_log(const char* fmt, ...);
+void hos_log_flush(void);
 void hos_process_memory(uint64_t* private_bytes, uint64_t* working_set);
 void hos_memory_map_log(void);
 uint64_t hos_gpu_translate(uint64_t va);
@@ -227,6 +228,10 @@ void dump_on_targets(const Attachments& at);
 void watch_buffer_frame();
 void watch_buffer_after_draw(const char* what);
 void dump_draw(const char* what);
+/// (frame dumps, rx_debug.cpp) The buffer cache's copy of a guest range (up to 4 KB) read back, a GPU round trip, and
+/// logged as rows of four floats after `tag`; false when the range is not cached. dump_floats: words already in hand.
+bool dump_gpu_range(const char* tag, uint64_t va, uint64_t size);
+void dump_floats(const char* tag, const uint32_t* w, size_t n);
 /// RX_DUMP_SAMPLED=1 (with a frame dump): render targets sampled by draws are saved with the frame's targets.
 void dump_sampled(const Image* im);
 /// A dispatch wrote this range in the buffer cache (RX_SYNC_DISPATCH_WRITES=1: copied to guest memory at the present).

@@ -746,11 +746,22 @@ void cond_recheck_present() {
             const auto c = payload<nvn_p_copy_bb>(a, avail);
             if (frame_dump_active()) {
                 char b[160];
-                std::snprintf(b, sizeof b, "nvn copy buffer %llx -> %llx, %llu bytes", (unsigned long long)c.src,
-                              (unsigned long long)c.dst, (unsigned long long)c.size);
+                std::snprintf(b, sizeof b, "nvn copy buffer %llx -> %llx, %llu bytes%s", (unsigned long long)c.src,
+                              (unsigned long long)c.dst, (unsigned long long)c.size,
+                              gpu_written(c.src, c.size) ? " (source GPU-written)" : "");
                 dump_draw(b);
+                if (c.size <= 4096) {   // (what each side holds: the GPU's copy and guest memory's)
+                    std::vector<uint32_t> w((c.size + 3) / 4, 0);
+                    if (nvn_gpu_read(c.src, w.data(), c.size)) dump_floats("source in guest memory", w.data(), w.size());
+                    if (gpu_written(c.src, c.size)) dump_gpu_range("source on the GPU", c.src, c.size);
+                }
             }
-            if (gpu_copy_buffer(c.src, c.dst, c.size)) break;
+            if (gpu_copy_buffer(c.src, c.dst, c.size)) {
+                if (frame_dump_active() && c.size <= 4096)
+                    dump_gpu_range("destination on the GPU, copied there", c.dst, c.size);
+                break;
+            }
+            if (frame_dump_active()) dump_draw("    (copied in guest memory)");
             for (uint64_t done = 0; done < c.size;) {
                 uint8_t buf[65536];
                 const uint64_t k = std::min<uint64_t>(sizeof buf, c.size - done);

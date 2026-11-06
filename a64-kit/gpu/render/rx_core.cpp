@@ -2378,6 +2378,28 @@ static std::string vram_text() {
 #endif
 }
 
+#if !RX_WEB && defined(_WIN32)
+/// Windows' commit (RAM + page file) nearly gone: the game stops before allocations start failing in every program
+/// and in the graphics driver. (A build whose batches were all dropped grew ~70 MB/s until Windows was out and the
+/// PC restarted itself, 2026-11-06.) Checked every 30 frames; RX_MIN_FREE_COMMIT_MB (default 1024; 0: never).
+static void commit_guard() {
+    static const uint64_t min_free =
+        (uint64_t)(getenv("RX_MIN_FREE_COMMIT_MB") ? atoll(getenv("RX_MIN_FREE_COMMIT_MB")) : 1024) << 20;
+    if (!min_free) return;
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms) || ms.ullAvailPageFile >= min_free) return;
+    uint64_t priv = 0, ws = 0;
+    hos_process_memory(&priv, &ws);
+    hos_log("rx: Windows is nearly out of memory (%llu of %llu MB of commit free; this game holds %llu MB): the game "
+            "stops here, before other programs and the graphics driver start failing (RX_MIN_FREE_COMMIT_MB=0: never)",
+            (unsigned long long)(ms.ullAvailPageFile >> 20), (unsigned long long)(ms.ullTotalPageFile >> 20),
+            (unsigned long long)(priv >> 20));
+    hos_log_flush();
+    TerminateProcess(GetCurrentProcess(), 3);
+}
+#endif
+
 /// Over Windows' VRAM budget, the driver moves some of the game's GPU memory into system memory, and every pass that
 /// reads it gets much slower whatever the resolution (seen: the main 3D pass 1 -> 13 ms a frame, 60 -> 28 fps, after
 /// the inventory loaded its textures near the budget, and it stayed so). The decoded-texture cache only trimmed
@@ -4471,6 +4493,9 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
     }
     trim_decoded_textures();
     vram_pressure();
+#if !RX_WEB && defined(_WIN32)
+    if (frame_number % 30 == 0) commit_guard();
+#endif
     if (frame_number % 600 == 300) retire_unused_segments();
     if (frame_number % 600 == 500) trim_big_storage(1200);
     if (frame_number % 600 == 450) reset_idle_stream_memory();
