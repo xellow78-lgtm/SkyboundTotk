@@ -518,6 +518,22 @@ uint64_t copy_span(const CopySurface& s, const CopyBox& b) {
     return b.layers ? (uint64_t)(b.d - 1) * s.layer_size + s.level_size : s.level_size;
 }
 
+/// (WebGPU copies only between two buffers: within one, through this)
+WGPUBuffer copy_scratch(uint64_t size) {
+    static WGPUBuffer b = nullptr;
+    static uint64_t cap = 0;
+    if (size > cap) {
+        if (b) release_buffer_later(b);
+        cap = (size + 65535) & ~65535ull;
+        WGPUBufferDescriptor bd{};
+        bd.label = sv("rx buffer copy scratch");
+        bd.size = cap;
+        bd.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+        b = wgpuDeviceCreateBuffer(dev.device, &bd);
+    }
+    return b;
+}
+
 /* buffer -> buffer from memory shaders wrote: on the GPU, in command order, into the buffer cache's copy of the
    destination, which then counts as GPU-written (draws read it there; guest memory gets it by readback). False when
    it cannot be (the copy is then made in guest memory).
@@ -535,8 +551,14 @@ bool gpu_copy_buffer(uint64_t src, uint64_t dst, uint64_t size) {
     if (!s.buffer) return false;
     const BufferRef d = guest_buffer(dst, size);
     if (!d.buffer || s.offset % 4 || d.offset % 4) return false;
-    if (s.buffer == d.buffer && s.offset < d.offset + size && d.offset < s.offset + size) return false;
-    ce_copy_buffer_to_buffer(encoder(), s.buffer, s.offset, d.buffer, d.offset, size);
+    if (s.buffer == d.buffer) {   // (the same buffer-cache segment: a copy needs two buffers)
+        WGPUBuffer t = copy_scratch(size);
+        if (!t) return false;
+        ce_copy_buffer_to_buffer(encoder(), s.buffer, s.offset, t, 0, size);
+        ce_copy_buffer_to_buffer(encoder(), t, 0, d.buffer, d.offset, size);
+    } else {
+        ce_copy_buffer_to_buffer(encoder(), s.buffer, s.offset, d.buffer, d.offset, size);
+    }
     buffer_cache_gpu_written(BufferRef{d.buffer, d.offset, size});
     writeback_in_place(d.buffer, d.offset, size, dst);
     count("gpu_buffer_copies", (int64_t)size);
