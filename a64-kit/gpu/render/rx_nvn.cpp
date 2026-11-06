@@ -518,6 +518,31 @@ uint64_t copy_span(const CopySurface& s, const CopyBox& b) {
     return b.layers ? (uint64_t)(b.d - 1) * s.layer_size + s.level_size : s.level_size;
 }
 
+/* buffer -> buffer from memory shaders wrote: on the GPU, in command order, into the buffer cache's copy of the
+   destination, which then counts as GPU-written (draws read it there; guest memory gets it by readback). False when
+   it cannot be (the copy is then made in guest memory).
+   TOTK computes its ambient light each frame in a pixel and a compute program and copies the result (304 bytes) into
+   the environment's constant buffer. Copied in guest memory, that read what the readbacks had left there, and those
+   come after the batch and only the words a batch changed: a dispatch that zeroes the fields at the frame's start
+   and one that refills them with the same values left them zero. Cave ambient was black (only placed lights and
+   emissive surfaces showed), and shade outdoors had no fill light. RX_NO_GPU_BUFFER_COPY=1: in guest memory. */
+bool gpu_copy_buffer(uint64_t src, uint64_t dst, uint64_t size) {
+    static const bool off = env_flag("RX_NO_GPU_BUFFER_COPY");
+    if (off || !size || (size | src | dst) % 4 || !buffer_cache_active() || !gpu_written(src, size)) return false;
+    if (src < dst + size && dst < src + size) return false;   // (overlapping)
+    end_render_pass("pe_buffer_copy");   // (a pixel program of the open pass may have written the source)
+    const BufferRef s = guest_buffer(src, size);
+    if (!s.buffer) return false;
+    const BufferRef d = guest_buffer(dst, size);
+    if (!d.buffer || s.offset % 4 || d.offset % 4) return false;
+    if (s.buffer == d.buffer && s.offset < d.offset + size && d.offset < s.offset + size) return false;
+    ce_copy_buffer_to_buffer(encoder(), s.buffer, s.offset, d.buffer, d.offset, size);
+    buffer_cache_gpu_written(BufferRef{d.buffer, d.offset, size});
+    writeback_in_place(d.buffer, d.offset, size, dst);
+    count("gpu_buffer_copies", (int64_t)size);
+    return true;
+}
+
 /* buffer <-> texture: the buffer's rows `row_stride` apart (0: packed), its slices / layers row_stride * rows apart */
 void nvn_copy_buffer_texture(const nvn_p_copy_bt& c, int64_t row_stride, bool to_texture) {
     CopySurface s;
@@ -703,6 +728,7 @@ void cond_recheck_present() {
                               (unsigned long long)c.dst, (unsigned long long)c.size);
                 dump_draw(b);
             }
+            if (gpu_copy_buffer(c.src, c.dst, c.size)) break;
             for (uint64_t done = 0; done < c.size;) {
                 uint8_t buf[65536];
                 const uint64_t k = std::min<uint64_t>(sizeof buf, c.size - done);
