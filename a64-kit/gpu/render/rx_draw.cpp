@@ -3108,6 +3108,28 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
                     banks.read(s, stage, d.index, 0, tmp.data(), tmp.size());
                     dump_words("cbuf", d.index, tmp.data(), tmp.size());
                 }
+                // (F12 with RX_CHECK_ATTRS=1: a vertex program's constants as the buffer cache holds them against
+                // memory now - a mesh whose skinning matrices the cache holds stale is drawn flung across the screen)
+                if (nvn_dump_vs_ub && stage == 0)
+                    if (static const bool check = env_flag("RX_CHECK_ATTRS"); check) {
+                        const size_t n = (size_t)std::min<uint64_t>(size, 0x10000);
+                        std::vector<uint8_t> mem(n), gpu(n);
+                        banks.read(s, stage, d.index, 0, mem.data(), n);
+                        flush_batch();
+                        wait_submitted();
+                        read_buffer(c.buffer, c.offset, gpu.data(), n);
+                        uint32_t diff = 0, first = ~0u;
+                        for (size_t k = 0; k + 16 <= n; k += 16)
+                            if (std::memcmp(mem.data() + k, gpu.data() + k, 16)) {
+                                diff++;
+                                if (first == ~0u) first = (uint32_t)(k / 16);
+                            }
+                        char line[200];
+                        std::snprintf(line, sizeof line, "  vs cbuf%u in place %llx+%llx: %u of %zu rows differ from memory "
+                                      "(first %d)", (unsigned)d.index, (unsigned long long)s.ubo[stage][d.index - 3].addr,
+                                      (unsigned long long)size, diff, n / 16, first == ~0u ? -1 : (int)first);
+                        dump_draw(line);
+                    }
                 const bool dynamic = dynamic_storage > 0;
                 dynamic_storage -= dynamic;
                 buffer_entry(b, WGPUBufferBindingType_ReadOnlyStorage, dynamic, c.buffer, c.offset, size);
