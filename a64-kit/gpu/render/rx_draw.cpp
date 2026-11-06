@@ -245,6 +245,81 @@ bool fetchable(const Regs::VertexAttribute& a, const Regs::VertexStream& vs) {
            !(!stride && a.offset + size > 2048);
 }
 
+// ---- read-only storage ranges too big for the buffer cache's segments (> 8 MB): GPU copies of their own ----
+// TOTK binds one big pool from offsets that move along it, each binding running to the pool's end. Each new
+// (offset, size) used to get a copy of its own, released only after a minute unused and only past 64 of them: on
+// the way into a new area ~160 copies, 2.8 GB in 50 s, until an 8 GB card was out of memory, a buffer came back
+// invalid, and the submit that bound it ended the game (wgpu panics on an invalid submit). Now a copy that holds the
+// range serves it at an offset, the copies have a budget (RX_BIG_SSBO_MB, default 1024), ones not bound for ~10 s
+// go, and a failed creation falls back to the per-draw copy.
+namespace {
+struct BigRange {
+    WGPUBuffer buffer = nullptr;
+    uint64_t guest = 0, size = 0, seq = 0;
+    int64_t frame = 0;
+};
+std::vector<BigRange> big_ranges;
+uint64_t big_range_bytes = 0;
+
+void big_range_release(size_t i) {
+    retire_buffer(big_ranges[i].buffer);   // (the cached bind groups naming it go first: trim_bind_groups)
+    big_range_bytes -= big_ranges[i].size;
+    big_ranges.erase(big_ranges.begin() + (ptrdiff_t)i);
+}
+
+/// A new copy of guest memory [guest, guest + size), or null (over the budget with every copy bound this frame, or
+/// the device would not make it).
+BigRange* big_range_new(uint64_t guest, uint64_t size) {
+    static const uint64_t budget = (uint64_t)(getenv("RX_BIG_SSBO_MB") ? atoll(getenv("RX_BIG_SSBO_MB")) : 1024) << 20;
+    trim_big_storage(1200);
+    for (size_t i = big_ranges.size(); i-- > 0;)   // the ones it holds are not needed any more
+        if (big_ranges[i].frame < frame_number && guest <= big_ranges[i].guest &&
+            big_ranges[i].guest + big_ranges[i].size <= guest + size)
+            big_range_release(i);
+    while (big_range_bytes + size > budget) {   // the least recently bound go (not ones bound this frame)
+        size_t lru = SIZE_MAX;
+        for (size_t i = 0; i < big_ranges.size(); i++)
+            if (big_ranges[i].frame < frame_number && (lru == SIZE_MAX || big_ranges[i].frame < big_ranges[lru].frame))
+                lru = i;
+        if (lru == SIZE_MAX) break;
+        big_range_release(lru);
+    }
+    if (big_range_bytes + size > budget) return count("big_ssbo_over_budget"), nullptr;
+    WGPUBufferDescriptor bd{};
+    bd.label = sv("rx big storage range");
+    bd.size = size;
+    bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+    scope_push();
+    WGPUBuffer b = wgpuDeviceCreateBuffer(dev.device, &bd);
+    if (const std::string e = scope_pop(); !e.empty()) {
+        log_limited("big_ssbo_fail", 4, "rx: big storage copy (%llu MB) not made, copied per draw instead: %s",
+                    (unsigned long long)(size >> 20), e.c_str());
+        if (b) wgpuBufferRelease(b);
+        trim_big_storage(0);   // (what was not bound this frame: the memory is short)
+        return nullptr;
+    }
+    big_ranges.push_back(BigRange{b, guest, size, 0, frame_number});
+    big_range_bytes += size;
+    count("big_ssbo_new");
+    return &big_ranges.back();
+}
+}  // namespace
+
+uint64_t trim_big_storage(int64_t idle_frames) {
+    uint64_t freed = 0;
+    for (size_t i = big_ranges.size(); i-- > 0;)
+        if (frame_number - big_ranges[i].frame > idle_frames) {
+            freed += big_ranges[i].size;
+            big_range_release(i);
+        }
+    return freed;
+}
+
+void big_storage_stats(size_t* n, uint64_t* bytes) {
+    *n = big_ranges.size();
+    *bytes = big_range_bytes;
+}
+
 namespace {
 
 struct Pipeline {
@@ -575,27 +650,26 @@ StorageBinding draw_storage(uint64_t va, uint64_t size, bool writable) {
         if (!c.buffer && size > (8u << 20) && !no_big && !gpu_written(va, size)) {
             uint64_t avail = 0;
             const uint8_t* host = hos_gpu_ptr(va, &avail);
-            if (host && avail >= size) {
-                struct Big { WGPUBuffer buffer = nullptr; uint64_t seq = 0; int64_t frame = 0; };
-                static std::unordered_map<uint64_t, Big> bigs;
-                const uint64_t guest = hos_gpu_translate(va);
-                Big& b = bigs[guest ^ size << 44];
-                if (!b.buffer) {
-                    WGPUBufferDescriptor bd{};
-                    bd.label = sv("rx big storage range");
-                    bd.size = (size + 3) & ~3ull;
-                    bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
-                    b.buffer = wgpuDeviceCreateBuffer(dev.device, &bd);
-                    b.seq = 0;
-                }
-                if (!b.seq) {
-                    b.seq = memory_seq();
-                    queue_upload(b.buffer, 0, host, (size + 3) & ~3ull);
-                    count("big_ssbo_uploads", (int64_t)size);
-                } else if (memory_written_since(guest, size, b.seq)) {   // (the pages written since, in runs)
-                    const uint64_t seq = b.seq;
-                    b.seq = memory_seq();
-                    const uint64_t first = guest & ~4095ull, end = (guest + size + 4095) & ~4095ull;
+            const uint64_t guest = host ? hos_gpu_translate(va) : 0;
+            const uint64_t align = dev.limits.minStorageBufferOffsetAlignment;
+            BigRange* b = nullptr;   // the smallest copy that holds the range at an offset a binding may have
+            if (host && avail >= size)
+                for (BigRange& r : big_ranges)
+                    if (r.guest <= guest && guest + size <= r.guest + r.size && (guest - r.guest) % align == 0 &&
+                        (!b || r.size < b->size))
+                        b = &r;
+            if (host && avail >= size && !b) b = big_range_new(guest, (size + 3) & ~3ull);
+            if (b) {
+                // (its pages written since its last upload, over all of it: one seq for the whole copy)
+                const uint8_t* bh = host - (guest - b->guest);
+                if (!b->seq) {
+                    b->seq = memory_seq();
+                    queue_upload(b->buffer, 0, bh, b->size);
+                    count("big_ssbo_uploads", (int64_t)b->size);
+                } else if (memory_written_since(b->guest, b->size, b->seq)) {   // (in runs)
+                    const uint64_t seq = b->seq;
+                    b->seq = memory_seq();
+                    const uint64_t first = b->guest & ~4095ull, end = (b->guest + b->size + 4095) & ~4095ull;
                     for (uint64_t p = first; p < end;) {
                         if (!memory_written_since(p, 4096, seq)) {
                             p += 4096;
@@ -603,23 +677,15 @@ StorageBinding draw_storage(uint64_t va, uint64_t size, bool writable) {
                         }
                         uint64_t q = p + 4096;
                         while (q < end && memory_written_since(q, 4096, seq)) q += 4096;
-                        const uint64_t lo = std::max(p, guest), hi = std::min(q, guest + size);
-                        const uint64_t off = (lo - guest) & ~3ull, n = ((hi - guest + 3) & ~3ull) - off;
-                        queue_upload(b.buffer, off, host + off, n);
+                        const uint64_t lo = std::max(p, b->guest), hi = std::min(q, b->guest + b->size);
+                        const uint64_t off = (lo - b->guest) & ~3ull, n = ((hi - b->guest + 3) & ~3ull) - off;
+                        queue_upload(b->buffer, off, bh + off, n);
                         count("big_ssbo_uploads", (int64_t)n);
                         p = q;
                     }
                 }
-                b.frame = frame_number;
-                if (bigs.size() > 64)   // (unused for a minute: released)
-                    for (auto it = bigs.begin(); it != bigs.end();)
-                        if (frame_number - it->second.frame > 3600) {
-                            release_buffer_later(it->second.buffer);
-                            it = bigs.erase(it);
-                        } else {
-                            ++it;
-                        }
-                out.buffer = b.buffer, out.offset = 0, out.size = size, out.ok = true;
+                b->frame = frame_number;
+                out.buffer = b->buffer, out.offset = guest - b->guest, out.size = size, out.ok = true;
                 count("big_ssbo_bound");
                 return out;
             }

@@ -245,6 +245,10 @@ void retire_unused_segments() {
     if (retired) count("segments_retired", retired);
 }
 
+void retire_buffer(WGPUBuffer b) {
+    if (b) retired_segment_buffers.push_back(b);
+}
+
 bool segments_retired_pending() {
     return !retired_segment_buffers.empty();
 }

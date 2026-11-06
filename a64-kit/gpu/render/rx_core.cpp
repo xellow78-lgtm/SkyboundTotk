@@ -1326,17 +1326,19 @@ void memory_report() {
         }
     for (const auto& [g, im] : spare_images)
         if (im) spare_bytes += image_bytes(*im);
-    size_t ntex = 0, ntext = 0;
-    uint64_t tex_bytes = 0, text_bytes = 0, priv = 0, ws = 0;
+    size_t ntex = 0, ntext = 0, nbig = 0;
+    uint64_t tex_bytes = 0, text_bytes = 0, priv = 0, ws = 0, big_bytes = 0;
     decoded_texture_stats(&ntex, &tex_bytes);
     wgsl_text_stats(&ntext, &text_bytes);
+    big_storage_stats(&nbig, &big_bytes);
     hos_process_memory(&priv, &ws);
     hos_log("mem: process %llu MB private, %llu MB working set | GPU: decoded textures %llu MB (%zu), render targets "
-            "%llu MB (%zu) + %llu MB spare (%zu) + %llu MB feedback copies, guest-memory buffers %zu x 16 MB | "
-            "%zu pipelines, %zu WGSL texts %llu MB",
+            "%llu MB (%zu) + %llu MB spare (%zu) + %llu MB feedback copies, guest-memory buffers %zu x 16 MB + "
+            "big storage copies %llu MB (%zu) | %zu pipelines, %zu WGSL texts %llu MB",
             (unsigned long long)(priv >> 20), (unsigned long long)(ws >> 20), (unsigned long long)(tex_bytes >> 20),
             ntex, (unsigned long long)(rt_bytes >> 20), images.size(), (unsigned long long)(spare_bytes >> 20),
-            spare_images.size(), (unsigned long long)(copy_bytes >> 20), buffer_segments(), pipeline_count(), ntext,
+            spare_images.size(), (unsigned long long)(copy_bytes >> 20), buffer_segments(),
+            (unsigned long long)(big_bytes >> 20), nbig, pipeline_count(), ntext,
             (unsigned long long)(text_bytes >> 20));
 #ifdef _WIN32
     // Windows' commit (RAM + page file) for every program: when it runs out, allocations fail anywhere, in any
@@ -2399,13 +2401,15 @@ static void vram_pressure() {
     // (unused for 30 s: 2 s, the first try, freed textures the game drew again moments later; decoding them again
     // stuttered, and the memory did not come back to Windows anyway)
     const uint64_t freed = trim_decoded_textures_for_vram(want, 1800, &n);
+    const uint64_t big_freed = trim_big_storage(120);   // (copies of big storage ranges not bound for ~2 s)
     dlss_trim();
     static int logged;
-    if (n && logged++ < 60)
+    if ((n || big_freed) && logged++ < 60)
         hos_log("rx: VRAM %llu of %llu MB (%llu MB from the limit): %d decoded textures not used for 30 s released, "
-                "%llu MB",
+                "%llu MB; big storage copies not bound for 2 s released, %llu MB",
                 (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20),
-                (unsigned long long)((budget > used ? budget - used : 0) >> 20), n, (unsigned long long)(freed >> 20));
+                (unsigned long long)((budget > used ? budget - used : 0) >> 20), n, (unsigned long long)(freed >> 20),
+                (unsigned long long)(big_freed >> 20));
 }
 
 /// A present that came long after the one before (RX_STALL_MS, default 100): what the renderer did in between, from
@@ -4468,6 +4472,7 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
     trim_decoded_textures();
     vram_pressure();
     if (frame_number % 600 == 300) retire_unused_segments();
+    if (frame_number % 600 == 500) trim_big_storage(1200);
     if (frame_number % 600 == 450) reset_idle_stream_memory();
     if (frame_number % 600 == 150) trim_pipelines();
     if (static const bool often = env_flag("RX_VRAM_LOG"); often ? frame_number % 1200 == 900 : frame_number % 3600 == 900)

@@ -850,6 +850,12 @@ size_t buffer_segments();
 void retire_unused_segments();
 bool segments_retired_pending();
 std::vector<WGPUBuffer> take_retired_segment_buffers();
+/// A buffer that cached bind groups may name: released after they leave the cache (trim_bind_groups), as the
+/// retired segments are.
+void retire_buffer(WGPUBuffer b);
+/// (rx_draw.cpp) The copies of big read-only storage ranges not bound for `idle_frames` released; the bytes freed.
+uint64_t trim_big_storage(int64_t idle_frames);
+void big_storage_stats(size_t* n, uint64_t* bytes);
 void release_buffer_later(WGPUBuffer b);
 size_t pipeline_count();
 void wgsl_text_stats(size_t* n, uint64_t* bytes);
