@@ -164,10 +164,12 @@ struct M { inv_cur: mat4x4<f32>, vp_prev: mat4x4<f32>, size: vec4<f32>, dz: vec4
 @compute @workgroup_size(8, 8, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (f32(id.x) >= m.size.x || f32(id.y) >= m.size.y) { return; }
   let q = vec2<i32>(id.xy);
-  // (the G-buffer's object channel: Link and what he holds marked over 100 of 255; the camera's motion is not
-  // theirs, so FSR keeps less of their history there)
-  let o = textureLoad(objects, q, 0).g;
-  textureStore(reactive, q, vec4<f32>(select(0.0, m.dz.z, o > 0.4), 0.0, 0.0, 0.0));
+  // (the G-buffer's object channel: Link and what he holds marked over 100 of 255 in green; the camera's motion is
+  // not theirs, so FSR keeps less of their history there. The Depths' gloom in blue (255, its red 32): its glowing
+  // streaks move by themselves too. With DLSS the gloom was a flat red sheet that flickered, without an upscaler it
+  // was right (2026-11-07): taken for its streaks' history averaged, not confirmed yet)
+  let o = textureLoad(objects, q, 0);
+  textureStore(reactive, q, vec4<f32>(select(0.0, m.dz.z, o.g > 0.4 || o.b > 0.4), 0.0, 0.0, 0.0));
   // (the pixel's unjittered position: the jitter moved the image by size.zw pixels)
   let uv = (vec2<f32>(id.xy) + 0.5 - m.size.zw) / m.size.xy;
   let d = textureLoad(dep, q, 0);
