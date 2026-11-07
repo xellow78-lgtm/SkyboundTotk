@@ -214,6 +214,19 @@ void hos_watch_copy(uint64_t dst, uint64_t src, uint64_t n, uint64_t lr) {
             hos_watch_arm(s, slot[i].len, why);
         }
     }
+    /* (and copied out of a watched address: the data moving elsewhere, e.g. a texture the texture manager moves) */
+    for (LONG i = 0; i < nslots && i < 4; i++) {
+        const uint64_t g = slot[i].guest;
+        if (g < src || g >= src + n) continue;
+        static volatile LONG lines;
+        if (InterlockedIncrement(&lines) <= 40) {
+            HosThread *t = hos_self();
+            hos_log("watch: %s (%#llx) copied out: %#llx bytes from %#llx to %#llx, its bytes to %#llx; thread %s, lr %#llx",
+                    slot[i].why, (unsigned long long)g, (unsigned long long)n, (unsigned long long)src,
+                    (unsigned long long)dst, (unsigned long long)(dst + (g - src)), t ? hos_thread_name(t) : "?",
+                    (unsigned long long)lr);
+        }
+    }
 }
 
 static DWORD WINAPI env_main(void *p) {

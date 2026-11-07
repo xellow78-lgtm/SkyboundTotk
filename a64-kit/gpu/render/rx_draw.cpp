@@ -18,6 +18,10 @@
 #include "rx_internal.h"
 
 extern "C" float hos_view_aspect;   // (hos/totk_ultrawide.c: the game's cameras' aspect; 0 their 16:9)
+#if !RX_WEB && defined(_WIN32)
+extern "C" void hos_watch_arm(uint64_t guest, int len, const char* why);   // (hos/hos_watch.c: RX_WATCH_GLOOM)
+extern "C" void hos_watch_move(const char* why, uint64_t guest);
+#endif
 
 namespace rx {
 namespace {
@@ -3131,6 +3135,43 @@ void dump_words(const char* what, uint32_t index, const uint8_t* p, uint64_t byt
 /// program is listed logs both stages' uniform blocks (vs / fs ub[i]) and, before it runs, saves each storage buffer
 /// it binds, as the GPU holds it then, to <frame dump dir>/ssbo_<n>_<vs|fs><binding>_<address>.bin (logged)
 bool nvn_dump_draw_ub = false;
+
+/// RX_WATCH_GLOOM=1 (debugging, Windows: hos_watch.c's hardware breakpoints): the Depths gloom maps' bytes under the
+/// camera, wherever the maps are now (the game's texture manager moves textures: aglTextureDataMgr::Compaction), are
+/// watched; whoever else reads them shows in the log. The gloom pass (pixel program 18454ee069e36783) samples its
+/// height map (R16, its first texture) and its RG8 map (the second) at (X / 10000 + 0.5, Z / 8000 + 0.5), 1000x800
+/// texels, block-linear 16 GOBs high; the camera is the scene camera's inverse view translation. Each map's 2x2
+/// texels there are in one 8-byte row piece and the one 16 bytes on (the next row): both are watched, all 4 slots.
+bool nvn_gloom_watch_draw = false;
+void gloom_watch_texture(uint32_t index, const BoundTexture& t) {
+#if !RX_WEB && defined(_WIN32)
+    if (index > 1 || !t.guest || t.width != 1000 || t.height != 800 || scene_camera.frame < 0) return;
+    const float X = scene_camera.v[47], Z = scene_camera.v[55];
+    const float u = X * 1e-4f + 0.5f, v = Z * 1.25e-4f + 0.5f;
+    const int tx = std::clamp((int)std::floor(u * 1000.0f - 0.5f), 0, 998);
+    const int ty = std::clamp((int)std::floor(v * 800.0f - 0.5f), 0, 798) & ~1;   // (rows in pairs: y % 2 is +16)
+    const uint32_t xb = (uint32_t)tx * 2, wg = (1000 * 2 + 63) / 64, bh = 16;
+    const uint32_t gob = ((xb % 64) / 32) * 256 + ((ty % 8) / 2) * 64 + ((xb % 32) / 16) * 32 + (ty % 2) * 16 + (xb % 16);
+    const uint64_t off = (uint64_t)((ty / (8 * bh)) * wg + xb / 64) * (512 * bh) + ((ty % (8 * bh)) / 8) * 512 + gob;
+    const uint64_t at = (t.guest + off) & ~7ull;
+    static uint64_t last[2], last_map[2];
+    if (at == last[index]) return;
+    static const char* names[2][2] = {{"gloom height map row", "gloom height map next row"},
+                                      {"gloom RG map row", "gloom RG map next row"}};
+    static int lines;
+    if (t.guest != last_map[index] || lines++ < 400)   // (the map moving: always)
+        hos_log("rx: gloom watch: %s map at %llx, camera %.1f %.1f %.1f: texel %d,%d at %llx", index ? "RG" : "height",
+                (unsigned long long)t.guest, X, scene_camera.v[51], Z, tx, ty, (unsigned long long)at);
+    last_map[index] = t.guest;
+    for (int k = 0; k < 2; k++) {
+        if (!last[index]) hos_watch_arm(at + 16 * k, 8, names[index][k]);
+        else hos_watch_move(names[index][k], at + 16 * k);
+    }
+    last[index] = at;
+#else
+    (void)index, (void)t;
+#endif
+}
 bool dump_draw_wanted(const ProgramPair* prog) {
     static const std::vector<uint64_t> keys = [] {
         std::vector<uint64_t> v;
@@ -3385,6 +3426,7 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
                 }
             }
         }
+        if (nvn_gloom_watch_draw && stage == 1) gloom_watch_texture(t_index, t);   // (RX_WATCH_GLOOM)
         std::memcpy(slot_bytes.data() + (size_t)t_index++ * 32, t.slots, sizeof t.slots);
         watch_tex_size(at, t);
         if (frame_dump_active()) {
@@ -3620,8 +3662,10 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) return;   // (rx_fsr2.cpp)
     // RX_DUMP_DRAW (debugging): before anything of this draw is in the batch
     nvn_dump_draw_ub = frame_dump_active() && dump_draw_wanted(prog);
+    static const bool gloom_watch = env_flag("RX_WATCH_GLOOM");
+    nvn_gloom_watch_draw = gloom_watch && prog->has_fs && prog->fs.key == 0x18454ee069e36783ull;
     struct DumpDrawReset {
-        ~DumpDrawReset() { nvn_dump_draw_ub = false; }
+        ~DumpDrawReset() { nvn_dump_draw_ub = false, nvn_gloom_watch_draw = false; }
     } dump_draw_reset;
     if (nvn_dump_draw_ub) nvn_dump_draw_storage(s, prog);
 
