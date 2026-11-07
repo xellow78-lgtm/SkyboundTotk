@@ -1103,6 +1103,25 @@ uint64_t jobs_pushed = 0;              // (under job_mu)
 int presents_queued = 0;               // (under job_mu)
 std::atomic<uint64_t> jobs_replayed{0};
 
+/* The batch each replayed job's work ended in (run_submit flushes its batch), by the job count it made: a fence on
+   that count waits for that batch to have run on the GPU with its readbacks in guest memory (rx_nvn_wait), not for
+   whatever was flushed since. Older than the ring: long done. */
+constexpr uint64_t kJobSerials = 4096;
+struct JobSerial {
+    std::atomic<uint64_t> job{0}, serial{0};
+};
+JobSerial job_serials[kJobSerials];
+void note_job_serial(uint64_t job) {
+    JobSerial& e = job_serials[job % kJobSerials];
+    e.serial.store(last_batch_serial(), std::memory_order_relaxed);
+    e.job.store(job, std::memory_order_release);
+}
+uint64_t job_serial(uint64_t job) {
+    const JobSerial& e = job_serials[job % kJobSerials];
+    if (e.job.load(std::memory_order_acquire) != job) return 0;
+    return e.serial.load(std::memory_order_relaxed);   // (a newer job's, if it was just overwritten: a longer wait)
+}
+
 /* RX_NVN_FRAMES_AHEAD=<n>: presents the game may queue ahead of the replay (default 1) */
 int max_presents_ahead() {
     static const int n = getenv("RX_NVN_FRAMES_AHEAD") ? std::max(1, atoi(getenv("RX_NVN_FRAMES_AHEAD"))) : 1;
@@ -1246,6 +1265,7 @@ void replay_main() {
         {
             std::lock_guard lk(job_mu);
             if (j.present) presents_queued--;
+            note_job_serial(jobs_replayed.load() + 1);
             jobs_replayed++;
         }
         job_done_cv.notify_all();
@@ -1388,6 +1408,7 @@ void rx_nvn_submit(const uint64_t* handles, int n) {
         run_submit(handles, (size_t)n);
         std::lock_guard lk(job_mu);
         jobs_pushed++;
+        note_job_serial(jobs_replayed.load() + 1);
         jobs_replayed++;
         return;
     }
@@ -1401,10 +1422,20 @@ uint64_t rx_nvn_pushed(void) {
     return jobs_pushed;
 }
 uint64_t rx_nvn_replayed(void) { return jobs_replayed.load(); }
-/* A fence: the submits made so far. It is reached when they were replayed, as the emulated GPU's syncpoints are when
-   its command processor parsed the work: what the CPU changes after that does not reach work already recorded
-   (uniforms are copied at the draw, memory uploads go to the queue in order), and what shaders write comes back to
-   guest memory by itself. RX_NVN_GPU_FENCES=1: also the GPU ran them (the replay waits for it). */
+/* A fence: the submits made so far. It is reached when they were replayed (what the CPU changes after that does not
+   reach work already recorded: uniforms are copied at the draw, memory uploads go to the queue in order) and, natively,
+   when the GPU has run them and what their shaders wrote is back in guest memory: the batch the fence's last job ended
+   in (job_serial) is done, readbacks included (batch_done). A poll (no timeout) does not wait for it.
+
+   Reached at the replay alone (as before 2026-11-07; the emulated GPU's syncpoints are reached when its command
+   processor parsed the work), TOTK read GPU results before they came back. Its WorldInfo asks the GPU what is at
+   Link's position (main+0x1d9e644: "WorldInfo(MiasmaAltitude)", the gloom's height, and the gloom noises; a one-point
+   draw samples the gloom map and stores the answer, 64 bytes), and read the answer of an earlier question: gloom
+   damage and gloom splashes at Link's feet where no gloom is drawn, none in the gloom drawn, damage at the spawn
+   point after loading a save. (Waiting at each fence for everything flushed since, RX_NVN_GPU_FENCES=all, fixed it at
+   a third of the frame rate.)
+   RX_NVN_GPU_FENCES=0: reached at the replay; =all: everything flushed so far run, as the fix was found. (Web builds:
+   off unless set.) */
 uint64_t rx_nvn_fence(void) { return rx_nvn_pushed(); }
 int rx_nvn_wait(uint64_t fence, uint64_t timeout_ns) {
     // RX_NVN_EARLY_FENCES=1 (experiment): reached at the submit, before the replay
@@ -1428,8 +1459,22 @@ int rx_nvn_wait(uint64_t fence, uint64_t timeout_ns) {
         if (!timeout_ns) return 0;
         wait_writebacks();
     }
-    static const bool gpu_fences = getenv("RX_NVN_GPU_FENCES") != nullptr;
-    if (gpu_fences) wait_batch(last_batch_serial());
+    static const int gpu_fences = [] {   // 0 off, 1 the fence's batch, 2 everything flushed
+        const char* v = getenv("RX_NVN_GPU_FENCES");
+        if (!v) return RX_WEB ? 0 : 1;
+        return !std::strcmp(v, "0") ? 0 : !std::strcmp(v, "all") ? 2 : 1;
+    }();
+    if (gpu_fences == 2) {
+        wait_batch(last_batch_serial());
+    } else if (gpu_fences == 1) {
+        const uint64_t serial = job_serial(fence);
+        if (batch_done(serial)) return 1;
+        if (!timeout_ns) return 0;
+        const int64_t t0 = hos_now_ns();
+        wait_batch(serial);
+        count("nvn_gpu_fence_waits");
+        count("t_nvn_gpu_fence_wait", hos_now_ns() - t0);
+    }
     return 1;
 }
 void rx_nvn_finish(void) {
