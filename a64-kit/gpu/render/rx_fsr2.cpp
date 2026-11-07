@@ -541,7 +541,13 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     // (only a scale-up: the second shader also copies the scene at its own size, into targets the scene's size,
     // and FSR 2 there made it resize its resources twice a frame: 250,000 times in a 70-minute run, until the GPU
     // ran out of memory; run_quality.log 2026-11-03 20:44)
-    if (dw <= mw && dh <= mh) return false;
+    // Except DLAA (Native (DLAA) with DLSS: the scene is the output's size and DLSS runs at 1:1 for its
+    // anti-aliasing): only DLSS, only a draw of the output's size from a scene of that size, and once a frame (one
+    // size and one evaluation a frame). Without this Native (DLAA) never ran DLSS: "DLSS: ready" and no feature after
+    // it in run_launcher.log 2026-11-07 05:00.
+    const bool dlaa = dw == mw && dh == mh && dw == hos_out_w && dh == hos_out_h && dlss_ready() &&
+                      st.last_fsr_frame != frame_number;
+    if (dw <= mw && dh <= mh && !dlaa) return false;
     // (and the second shader only into the game's final 1920x1080 image: it also scales 800x448 into 1600x896 on the
     // title screen, and FSR 2 resizing between the two crashed at startup: run_quality.log 2026-11-03 22:08)
     if (fs_key == hook2 && hook2 != hook && (dw < hos_out_w || dh < hos_out_h)) return false;
@@ -836,7 +842,8 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     cp_end(cp);
     if (use_dlss) {
         // (the mode from the 3D resolution setting: Quality 1.5x, Balanced 1.7x, Performance 2x, Ultra Performance
-        // 3x; the game's own up to 1600x896: Quality)
+        // 3x; the game's own up to 1600x896: Quality; the scene at the output's size: DLAA, NGX's
+        // NVSDK_NGX_PerfQuality_Value_DLAA = 5)
         const float rs = hos_render_scale;
         DlssInputs in{};
         in.color = scene_color, in.color_v = color_v;
@@ -848,7 +855,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         in.jx = c.jitter[0], in.jy = c.jitter[1];
         in.dt_ms = dt * 1000.0f;
         in.reset = st.reset;
-        in.quality = rs <= 0 ? 2 : rs >= 0.75f ? 2 : rs >= 0.65f ? 1 : rs >= 0.5f ? 0 : 3;
+        in.quality = (rw >= dw && rh >= dh) ? 5 : rs <= 0 ? 2 : rs >= 0.75f ? 2 : rs >= 0.65f ? 1 : rs >= 0.5f ? 0 : 3;
         if (!dlss_record(e, in)) {
             static int lines;
             if (lines++ < 5) hos_log("rx: DLSS: not recorded this frame (FSR 2 takes over from the next)");

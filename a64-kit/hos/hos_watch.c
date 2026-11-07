@@ -4,7 +4,8 @@
 
    HOS_WATCH=<guest address>[:<1|2|4|8 bytes>][,...] (up to 4) arms at start, after HOS_WATCH_AFTER=<s> (default 30);
    code that finds an address at run time arms it with hos_watch_arm (e.g. totk_watch.c). A breakpoint goes on the
-   threads that exist when it is armed (new threads do not get it). Needs the PDB next to the exe for names. */
+   threads that exist when it is armed, and on the game's threads started after that (hos_watch_thread, from
+   hos_thread_start), so HOS_WATCH_AFTER=0 sees the loading too. Needs the PDB next to the exe for names. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -211,6 +212,19 @@ void hos_watch_move(const char *why, uint64_t guest) {
     last = guest;
     HANDLE h = CreateThread(NULL, 0, arm_main, NULL, 0, NULL);
     if (h) CloseHandle(h);
+}
+
+/* A game thread made suspended, before it runs (hos_thread_start): the breakpoints armed so far go on it too */
+void hos_watch_thread(void *thread) {
+    if (!want_dr7) return;
+    CONTEXT c;
+    memset(&c, 0, sizeof c);
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext((HANDLE)thread, &c)) return;
+    c.Dr0 = want_dr[0], c.Dr1 = want_dr[1], c.Dr2 = want_dr[2], c.Dr3 = want_dr[3];
+    c.Dr7 = want_dr7;
+    c.Dr6 = 0;
+    SetThreadContext((HANDLE)thread, &c);
 }
 
 void hos_watch_start(void) {

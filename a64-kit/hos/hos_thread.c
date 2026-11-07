@@ -390,9 +390,22 @@ void hos_thread_start(HosThread *t) {
     if (t->started) return;
     t->started = 1;
     /* Host stack: lifted code nests a C call per guest call, so give it plenty. */
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    /* (made suspended: HOS_WATCH's breakpoints go on it before it runs, hos_watch.c) */
+    t->handle = CreateThread(NULL, 64 << 20, thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION | CREATE_SUSPENDED,
+                             NULL);
+    if (!t->handle) hos_fatal(NULL, "CreateThread failed for %s", t->name);
+    {
+        void hos_watch_thread(void *thread);
+        hos_watch_thread(t->handle);
+    }
+    hos_thread_pin(t->handle, t->name);
+    ResumeThread(t->handle);
+#else
     t->handle = CreateThread(NULL, 64 << 20, thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!t->handle) hos_fatal(NULL, "CreateThread failed for %s", t->name);
     hos_thread_pin(t->handle, t->name);
+#endif
 #ifdef __EMSCRIPTEN__
     { void web_thread_named(HANDLE t, const char *name); web_thread_named(t->handle, t->name); }
 #endif
