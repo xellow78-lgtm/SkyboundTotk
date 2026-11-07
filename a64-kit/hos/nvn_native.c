@@ -834,16 +834,76 @@ NV(nvnQueueFenceSync) {
     nvn_sync *s = (nvn_sync *)P(1); s->fenced = 1; s->fence = rx_nvn_fence();
     if (sync_log()) hos_log("nvn: FenceSync %p -> %llu (lr %#llx)", (void *)s, (unsigned long long)s->fence, (unsigned long long)c->x[30]);
 }
+/* HOS_NVN_SYNC_STATS=1 (diagnostic): every 5 s, the game's sync waits by caller (lr) and thread: calls, those that
+   found the fence reached, those that waited and for how long (all of it, and the part after the replay: the GPU and
+   its readbacks, rx_nvn_wait), the longest, and how many submits behind the newest the fence was */
+typedef struct {
+    uint64_t lr;
+    const char *thread;
+    long calls, ready, waits, timeouts;
+    int64_t wait_ns, gpu_ns, max_ns, lag;
+} SyncSite;
+static SRWLOCK sync_stats_lock = SRWLOCK_INIT;
+static SyncSite sync_sites[24];
+static int sync_nsites;
+static int64_t sync_stats_t0;
+static int sync_stats_on(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("HOS_NVN_SYNC_STATS") && atoi(getenv("HOS_NVN_SYNC_STATS")) > 0;
+    return v;
+}
+static void sync_stats_note(Ctx *c, int ready, int waited, int reached, int64_t ns, int64_t gpu_ns, uint64_t lag) {
+    const int64_t now = hos_now_ns();
+    AcquireSRWLockExclusive(&sync_stats_lock);
+    if (!sync_stats_t0) sync_stats_t0 = now;
+    int i = 0;
+    while (i < sync_nsites && sync_sites[i].lr != c->x[30]) i++;
+    if (i == sync_nsites && sync_nsites < 24) {
+        sync_sites[i].lr = c->x[30];
+        sync_sites[i].thread = c->thread ? hos_thread_name((HosThread *)c->thread) : "?";
+        sync_nsites++;
+    }
+    if (i < sync_nsites) {
+        SyncSite *t = &sync_sites[i];
+        t->calls++, t->ready += ready, t->waits += waited, t->timeouts += waited && !reached;
+        t->wait_ns += ns, t->gpu_ns += gpu_ns, t->lag += (int64_t)lag;
+        if (ns > t->max_ns) t->max_ns = ns;
+    }
+    if (now - sync_stats_t0 >= 5000000000LL) {
+        const double s = (now - sync_stats_t0) / 1e9;
+        for (int k = 0; k < sync_nsites; k++) {
+            SyncSite *t = &sync_sites[k];
+            if (!t->calls) continue;
+            hos_log("nvn sync: lr %#llx (%s): %.0f calls/s, %ld reached at once, %ld waited (%ld timed out): %.1f ms/s "
+                    "(GPU %.1f ms/s), longest %.1f ms; fence %.1f submits behind the newest",
+                    (unsigned long long)t->lr, t->thread, t->calls / s, t->ready, t->waits, t->timeouts,
+                    t->wait_ns / 1e6 / s, t->gpu_ns / 1e6 / s, t->max_ns / 1e6, (double)t->lag / t->calls);
+            t->calls = t->ready = t->waits = t->timeouts = 0;
+            t->wait_ns = t->gpu_ns = t->max_ns = t->lag = 0;
+        }
+        sync_stats_t0 = now;
+    }
+    ReleaseSRWLockExclusive(&sync_stats_lock);
+}
 /* never fenced: times out, as on the console; fenced: released once the GPU reached the fence */
 NV(nvnSyncWait) {
     const nvn_sync *s = (const nvn_sync *)P(0);
     if (sync_log()) hos_log("nvn: SyncWait %p fence %llu timeout %llu (lr %#llx)", (void *)s, (unsigned long long)s->fence,
                             (unsigned long long)U64(1), (unsigned long long)c->x[30]);
     if (!s->fenced) { RET(NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
-    if (rx_nvn_wait(s->fence, 0)) { RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    const int stats = sync_stats_on();
+    const uint64_t lag = stats ? rx_nvn_fence() - s->fence : 0;
+    const int64_t t0 = stats ? hos_now_ns() : 0;
+    if (rx_nvn_wait(s->fence, 0)) {
+        if (stats) sync_stats_note(c, 1, 0, 1, hos_now_ns() - t0, rx_nvn_gpu_wait_ns(), lag);
+        RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED);
+        return;
+    }
     static int block = -1;   /* HOS_NVN_SYNC_BLOCK=1 (experiment): a poll waits for the GPU */
     if (block < 0) block = getenv("HOS_NVN_SYNC_BLOCK") != NULL;
-    RET(rx_nvn_wait(s->fence, block ? ~0ull >> 1 : U64(1)) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
+    const int reached = rx_nvn_wait(s->fence, block ? ~0ull >> 1 : U64(1));
+    if (stats) sync_stats_note(c, 0, block || U64(1), reached, hos_now_ns() - t0, rx_nvn_gpu_wait_ns(), lag);
+    RET(reached ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
 }
 NV(nvnEventBuilderSetDefaults) { memset(P(0), 0, sizeof(nvn_event_builder)); }
 NV(nvnEventBuilderSetStorage) { nvn_event_builder *b = (nvn_event_builder *)P(0); b->pool = (const nvn_pool *)P(1); b->off = (int64_t)U64(2); }

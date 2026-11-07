@@ -209,6 +209,8 @@ uint64_t rx_nvn_fence(void);
 uint64_t rx_nvn_pushed(void);
 uint64_t rx_nvn_replayed(void);
 int rx_nvn_wait(uint64_t fence, uint64_t timeout_ns);
+/* (HOS_NVN_SYNC_STATS) of this thread's last rx_nvn_wait: ns it waited for the GPU (after the replay) */
+int64_t rx_nvn_gpu_wait_ns(void);
 /* (the threaded web build) waits while a render target writeback not in guest memory yet will write [p, p + n): the
    game's memcpy reads the targets it copies with the CPU through this, so fences need not wait for them */
 void rx_wait_writebacks_reading(const void *p, uint64_t n);

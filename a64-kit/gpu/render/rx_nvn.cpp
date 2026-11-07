@@ -1437,7 +1437,9 @@ uint64_t rx_nvn_replayed(void) { return jobs_replayed.load(); }
    RX_NVN_GPU_FENCES=0: reached at the replay; =all: everything flushed so far run, as the fix was found. (Web builds:
    off unless set.) */
 uint64_t rx_nvn_fence(void) { return rx_nvn_pushed(); }
+static thread_local int64_t gpu_wait_ns;   // (the last wait's, for HOS_NVN_SYNC_STATS: rx_nvn_gpu_wait_ns)
 int rx_nvn_wait(uint64_t fence, uint64_t timeout_ns) {
+    gpu_wait_ns = 0;
     // RX_NVN_EARLY_FENCES=1 (experiment): reached at the submit, before the replay
     static const bool early = getenv("RX_NVN_EARLY_FENCES") != nullptr;
     if (early) return 1;
@@ -1465,18 +1467,20 @@ int rx_nvn_wait(uint64_t fence, uint64_t timeout_ns) {
         return !std::strcmp(v, "0") ? 0 : !std::strcmp(v, "all") ? 2 : 1;
     }();
     if (gpu_fences == 2) {
+        const int64_t t0 = hos_now_ns();
         wait_batch(last_batch_serial());
+        gpu_wait_ns = hos_now_ns() - t0;
     } else if (gpu_fences == 1) {
         const uint64_t serial = job_serial(fence);
         if (batch_done(serial)) return 1;
         if (!timeout_ns) return 0;
         const int64_t t0 = hos_now_ns();
         wait_batch(serial);
-        count("nvn_gpu_fence_waits");
-        count("t_nvn_gpu_fence_wait", hos_now_ns() - t0);
+        gpu_wait_ns = hos_now_ns() - t0;
     }
     return 1;
 }
+int64_t rx_nvn_gpu_wait_ns(void) { return gpu_wait_ns; }
 void rx_nvn_finish(void) {
     drain();
     rx_wait_idle();
