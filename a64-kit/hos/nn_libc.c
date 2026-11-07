@@ -15,6 +15,15 @@ void rx_wait_writebacks_reading(const void *p, uint64_t n);   /* gpu/render/rx_n
 #define WAIT_WRITEBACKS(p, n) ((void)0)
 #endif
 
+/* HOS_WATCH (debugging, hos_watch.c): a copy into a watched address says where it came from */
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+extern volatile int hos_watch_on;
+void hos_watch_copy(uint64_t dst, uint64_t src, uint64_t n, uint64_t lr);
+#define WATCH_COPY(d, s, n) do { if (hos_watch_on) hos_watch_copy((d), (s), (n), c->x[30]); } while (0)
+#else
+#define WATCH_COPY(d, s, n) ((void)0)
+#endif
+
 ENTRY_HOOK_SYM(memcpy) {
     if (guest_libc()) return 0;
     const uint64_t n = ARG(2);
@@ -22,6 +31,7 @@ ENTRY_HOOK_SYM(memcpy) {
         WAIT_WRITEBACKS(GP(ARG(1)), n);   /* (TOTK copies some rendered maps with the CPU) */
         memmove(GP(ARG(0)), GP(ARG(1)), (size_t)n);
         HOS_WRITTEN(GP(ARG(0)), (size_t)n);
+        WATCH_COPY(ARG(0), ARG(1), n);
     }
     return 1;
 }
@@ -33,6 +43,7 @@ ENTRY_HOOK_SYM(memmove) {
         WAIT_WRITEBACKS(GP(ARG(1)), n);
         memmove(GP(ARG(0)), GP(ARG(1)), (size_t)n);
         HOS_WRITTEN(GP(ARG(0)), (size_t)n);
+        WATCH_COPY(ARG(0), ARG(1), n);
     }
     return 1;
 }

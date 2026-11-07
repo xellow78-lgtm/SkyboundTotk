@@ -855,7 +855,9 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         in.jx = c.jitter[0], in.jy = c.jitter[1];
         in.dt_ms = dt * 1000.0f;
         in.reset = st.reset;
-        in.quality = (rw >= dw && rh >= dh) ? 5 : rs <= 0 ? 2 : rs >= 0.75f ? 2 : rs >= 0.65f ? 1 : rs >= 0.5f ? 0 : 3;
+        // (NGX's numbers: 0 Performance, 1 Balanced, 2 Quality, 3 Ultra Performance, 5 DLAA; Quality's 2/3 used to
+        // come out as Balanced and Balanced's 1/1.7 as Performance, and NVIDIA's default model follows the mode)
+        in.quality = (rw >= dw && rh >= dh) ? 5 : rs <= 0 ? 2 : rs >= 0.62f ? 2 : rs >= 0.55f ? 1 : rs >= 0.42f ? 0 : 3;
         if (!dlss_record(e, in)) {
             static int lines;
             if (lines++ < 5) hos_log("rx: DLSS: not recorded this frame (FSR 2 takes over from the next)");

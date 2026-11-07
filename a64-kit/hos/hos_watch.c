@@ -5,7 +5,9 @@
    HOS_WATCH=<guest address>[:<1|2|4|8 bytes>][,...] (up to 4) arms at start, after HOS_WATCH_AFTER=<s> (default 30);
    code that finds an address at run time arms it with hos_watch_arm (e.g. totk_watch.c). A breakpoint goes on the
    threads that exist when it is armed, and on the game's threads started after that (hos_watch_thread, from
-   hos_thread_start), so HOS_WATCH_AFTER=0 sees the loading too. Needs the PDB next to the exe for names. */
+   hos_thread_start), so HOS_WATCH_AFTER=0 sees the loading too. A memcpy / memmove of the game's into a watched
+   address logs where the bytes came from; HOS_WATCH_FOLLOW=1 then watches those source bytes too (free slots
+   only). Needs the PDB next to the exe for names. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,11 +156,18 @@ static DWORD WINAPI arm_main(void *p) {
     return 0;
 }
 
+volatile int hos_watch_on;   /* a breakpoint is armed: the game's memcpy / memmove report to hos_watch_copy */
+
 void hos_watch_arm(uint64_t guest, int len, const char *why) {
     static int started;
     if (len != 1 && len != 2 && len != 4 && len != 8) len = 8;
     guest &= ~(uint64_t)(len - 1);   /* (a breakpoint covers an aligned range) */
     AcquireSRWLockExclusive(&lock);
+    for (LONG i = 0; i < nslots && i < 4; i++)
+        if (slot[i].guest == guest && slot[i].len == len) {   /* (watched already) */
+            ReleaseSRWLockExclusive(&lock);
+            return;
+        }
     if (nslots >= 4) {
         ReleaseSRWLockExclusive(&lock);
         hos_log("watch: all 4 breakpoints in use; %s not watched", why);
@@ -174,10 +183,37 @@ void hos_watch_arm(uint64_t guest, int len, const char *why) {
         AddVectoredExceptionHandler(1, handler);
         CreateThread(NULL, 0, summary_main, NULL, 0, NULL);
     }
+    hos_watch_on = 1;
     hos_log("watch: %s at guest %#llx (%d bytes)", why, (unsigned long long)guest, len);
     /* (from another thread: a thread cannot set its own context while it runs) */
     HANDLE h = CreateThread(NULL, 0, arm_main, NULL, 0, NULL);
     if (h) CloseHandle(h);
+}
+
+/* The game's memcpy / memmove (nn_libc.c), after the copy: one that filled a watched address says where from (the
+   data the game copied there, e.g. a texture from the buffer it was loaded into); with HOS_WATCH_FOLLOW=1 the
+   source's matching bytes are watched from then on too (a copy the game may keep and read itself) */
+void hos_watch_copy(uint64_t dst, uint64_t src, uint64_t n, uint64_t lr) {
+    static int follow = -1;
+    if (follow < 0) follow = getenv("HOS_WATCH_FOLLOW") && *getenv("HOS_WATCH_FOLLOW") != '0';
+    for (LONG i = 0; i < nslots && i < 4; i++) {
+        const uint64_t g = slot[i].guest;
+        if (g < dst || g >= dst + n) continue;
+        const uint64_t s = src + (g - dst);
+        static volatile LONG lines;
+        if (InterlockedIncrement(&lines) <= 40) {
+            HosThread *t = hos_self();
+            hos_log("watch: %s (%#llx) filled by a copy of %#llx bytes from %#llx (to %#llx); its bytes come from %#llx; "
+                    "thread %s, lr %#llx", slot[i].why, (unsigned long long)g, (unsigned long long)n,
+                    (unsigned long long)src, (unsigned long long)dst, (unsigned long long)s,
+                    t ? hos_thread_name(t) : "?", (unsigned long long)lr);
+        }
+        if (follow && strncmp(slot[i].why, "copy source", 11)) {
+            char why[48];
+            snprintf(why, sizeof why, "copy source of %llx", (unsigned long long)g);
+            hos_watch_arm(s, slot[i].len, why);
+        }
+    }
 }
 
 static DWORD WINAPI env_main(void *p) {
