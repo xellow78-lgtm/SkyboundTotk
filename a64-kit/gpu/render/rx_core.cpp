@@ -1785,6 +1785,12 @@ std::multiset<uint64_t> readback_serials;   // the batches of the readbacks not 
 std::atomic<uint64_t> batch_serial{0};       // the last batch flushed (flush_batch, under mu)
 std::atomic<uint64_t> batch_serial_run{0};   // the last one the submit thread submitted
 std::atomic<uint64_t> gpu_done_serial{0};    // the last one the GPU finished (its queue's work-done callback)
+// Batches holding a GPU query's answer for the CPU (a vertex program's storage writes: note_cpu_query), the last 64
+// serials (under query_mu): the native NVN layer's fences wait for those (last_query_batch)
+bool query_in_batch = false;   // (under mu)
+std::mutex query_mu;
+uint64_t query_serials[64];
+uint64_t query_batches = 0;
 std::mutex index_mu;
 struct SerialIndex {
     uint64_t serial = 0, index = 0;
@@ -2262,6 +2268,11 @@ void flush_batch() {
     end_render_pass("pe_flush");
     auto b = std::make_unique<Batch>();
     b->serial = ++batch_serial;
+    if (query_in_batch) {
+        query_in_batch = false;
+        std::lock_guard lk(query_mu);
+        query_serials[query_batches++ % 64] = b->serial;
+    }
     const bool has_commands = enc != nullptr;
     if (encoding_deferred()) {
         b->deferred = has_commands;
@@ -4214,6 +4225,19 @@ extern "C" void rx_wait_writebacks_reading(const void* p, uint64_t n) {
 }
 uint64_t last_batch_serial() {
     return batch_serial.load();
+}
+
+void note_cpu_query() {
+    query_in_batch = true;
+}
+bool cpu_query_in_batch() {
+    return query_in_batch;
+}
+uint64_t last_query_batch(uint64_t serial) {
+    std::lock_guard lk(query_mu);
+    for (uint64_t i = query_batches; i > 0 && i + 64 > query_batches; i--)
+        if (const uint64_t s = query_serials[(i - 1) % 64]; s <= serial) return s;
+    return 0;
 }
 
 bool batch_done(uint64_t serial) {

@@ -248,6 +248,12 @@ void sync_dispatch_writes();
 uint64_t last_batch_serial();
 bool batch_done(uint64_t serial);
 void wait_batch(uint64_t serial);
+/// A GPU query's answer for the CPU in the open batch (a draw's vertex program writes storage: TOTK's one-point
+/// queries, WorldInfo's gloom height among them); whether the open batch holds one; the last batch up to `serial` that
+/// held one (0: none known). The native NVN layer flushes the batch after such a draw and its fences wait for it.
+void note_cpu_query();
+bool cpu_query_in_batch();
+uint64_t last_query_batch(uint64_t serial);
 void dump_frame_images(const char* dir);
 void note_texels_written(uint64_t guest);   // (rx_texture.cpp: RX_DUMP_TEX=texels)
 /// RX_DUMP_TEX=<GPU VA hex>[,...] (with a frame dump): the decoded textures at those addresses, saved like targets.

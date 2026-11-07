@@ -1005,6 +1005,7 @@ void cond_recheck_present() {
             w.base_instance = (uint32_t)d.base_instance, w.instances = (uint32_t)std::max(1, d.instances);
             s.samples_passed += (uint64_t)std::max(1u, w.count) * w.instances * 16;   // (an estimate: some passed)
             nvn_draw(s, w);
+            if (cpu_query_in_batch()) flush_batch();   // (a query's answer: its readback starts now, rx_nvn_wait)
             break;
         }
         case NOP_DRAW_IDX: {
@@ -1020,6 +1021,7 @@ void cond_recheck_present() {
             w.instances = (uint32_t)std::max(1, d.instances);
             s.samples_passed += (uint64_t)std::max(1u, w.count) * w.instances * 16;
             nvn_draw(s, w);
+            if (cpu_query_in_batch()) flush_batch();
             break;
         }
         case NOP_DISPATCH: {
@@ -1439,22 +1441,24 @@ uint64_t rx_nvn_pushed(void) {
 }
 uint64_t rx_nvn_replayed(void) { return jobs_replayed.load(); }
 /* A fence: the submits made so far. It is reached when they were replayed (what the CPU changes after that does not
-   reach work already recorded: uniforms are copied at the draw, memory uploads go to the queue in order) and, natively,
-   when the GPU has run the work up to the last present before it, a frame earlier, and what its shaders wrote is back
-   in guest memory: the batch that work ended in (job_serial) is done, readbacks included (batch_done). A poll (no
-   timeout) does not wait for the GPU.
+   reach work already recorded: uniforms are copied at the draw, memory uploads go to the queue in order) and,
+   natively, when the GPU has run the work up to the last present before it (a frame earlier) and the last GPU query
+   up to the fence, with what they wrote back in guest memory (batch_done: the batch done, readbacks included). A
+   query is a draw whose vertex program writes storage (note_cpu_query): its batch ends after it, so its answer comes
+   back without waiting for the rest of the frame. A poll (no timeout) does not wait for the GPU.
 
    Reached at the replay alone (as before 2026-11-07; the emulated GPU's syncpoints are reached when its command
-   processor parsed the work), TOTK read GPU results before they came back. Its WorldInfo asks the GPU what is at
-   Link's position (main+0x1d9e644: "WorldInfo(MiasmaAltitude)", the gloom's height, and the gloom noises; a one-point
-   draw samples the gloom map and stores the answer, 64 bytes), and read the answer of an earlier question: gloom
-   damage and gloom splashes at Link's feet where no gloom is drawn, none in the gloom drawn, damage at the spawn
-   point after loading a save. Waiting at each fence for everything flushed since fixed it at a third of the frame
-   rate, and so did waiting for the fence's own work: TOTK's main thread waits each frame (main+0x2db998, its
-   frame's two syncs) for the submit it has just made (HOS_NVN_SYNC_STATS: one submit behind the newest), ~13 ms of
-   every frame in the Depths. With a frame of slack the GPU runs a frame behind the game, as it ran before.
-   RX_NVN_GPU_FENCES=0: reached at the replay; =exact: the fence's own work; =all: everything flushed so far, as the
-   fix was found. RX_NVN_FENCE_SLACK=<frames>: the slack (default 1; 0: exact). (Web builds: off unless set.) */
+   processor parsed the work), TOTK read GPU answers before they came back. Its WorldInfo asks the GPU what is at
+   Link's position (main+0x1d9e644: "WorldInfo(MiasmaAltitude)", the gloom's height, and the gloom noises; one-point
+   draws near the start of the frame sample the gloom map and store the answer, 64 bytes), and read the answer of an
+   earlier question: gloom damage and gloom splashes at Link's feet where no gloom is drawn, none in the gloom drawn,
+   damage at the spawn point after loading a save. TOTK's main thread waits each frame (main+0x2db998, its frame's
+   two syncs) for the submit it has just made (HOS_NVN_SYNC_STATS: one submit behind the newest) and reads the
+   answers then: a fence waiting for the whole of that work fixed the gloom at a third of the frame rate (~13 ms of
+   every frame waited in the Depths); one waiting only for the frame before brought the frame rate back and the gloom
+   bug with it.
+   RX_NVN_GPU_FENCES=0: reached at the replay; =exact: the fence's own work; =all: everything flushed so far.
+   RX_NVN_FENCE_SLACK=<frames>: the slack (default 1; 0: exact). (Web builds: off unless set.) */
 uint64_t rx_nvn_fence(void) { return rx_nvn_pushed(); }
 static thread_local int64_t gpu_wait_ns;   // (the last wait's, for HOS_NVN_SYNC_STATS: rx_nvn_gpu_wait_ns)
 int rx_nvn_wait(uint64_t fence, uint64_t timeout_ns) {
@@ -1496,8 +1500,9 @@ int rx_nvn_wait(uint64_t fence, uint64_t timeout_ns) {
         wait_batch(last_batch_serial());
         gpu_wait_ns = hos_now_ns() - t0;
     } else if (gpu_fences == 1) {
+        // the work up to the last present before the fence, and the last batch with a query's answer up to the fence
         const uint64_t job = slack ? fence_slack_job(fence, slack) : fence;
-        const uint64_t serial = job ? job_serial(job) : 0;
+        const uint64_t serial = std::max(job ? job_serial(job) : 0, last_query_batch(job_serial(fence)));
         if (batch_done(serial)) return 1;
         if (!timeout_ns) return 0;
         const int64_t t0 = hos_now_ns();
