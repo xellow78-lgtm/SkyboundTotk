@@ -17,6 +17,8 @@
 
 #include "rx_internal.h"
 
+extern "C" float hos_view_aspect;   // (hos/totk_ultrawide.c: the game's cameras' aspect; 0 their 16:9)
+
 namespace rx {
 namespace {
 
@@ -4163,9 +4165,12 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     // first depth-tested draw of a frame into the G-buffer (4+ color targets, a 16:9 viewport 320+ wide: the scene,
     // at whatever size dynamic resolution or the 3D resolution setting gives it; the game then draws into targets
     // of about that size, not always 1600x896) has them in its constant buffer 1; this frame's and the last one's
-    // are kept. A frame dump logs both.
+    // are kept. A frame dump logs both. (The viewport has the cameras' shape: 16:9, or the aspect ratio setting's,
+    // e.g. 16:10 on a 2560x1600 display: with 16:9 only, nothing was captured there and FSR 2 / DLSS never ran,
+    // run_launcher.log 2026-11-07 05:19)
+    const float scene_aspect = hos_view_aspect > 0 ? hos_view_aspect : 16.0f / 9.0f;
     if (targets.size() >= 4 && s.ds.dt && s.viewport[0][2] >= 320 && s.viewport[0][3] >= 180 &&
-        std::fabs(s.viewport[0][2] / s.viewport[0][3] - 16.0f / 9.0f) < 0.1f && scene_camera.frame != frame_number &&
+        std::fabs(s.viewport[0][2] / s.viewport[0][3] - scene_aspect) < 0.1f && scene_camera.frame != frame_number &&
         at.color[0] && at.color[0]->format == WGPUTextureFormat_RGBA8Unorm &&
         std::any_of(std::begin(at.color), std::end(at.color),
                     [](const Image* ci) { return ci && ci->format == WGPUTextureFormat_RG11B10Ufloat; })) {
