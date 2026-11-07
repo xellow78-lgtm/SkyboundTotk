@@ -99,6 +99,11 @@ struct Image {
     bool pitch_linear = false;
     uint64_t storage_limit = 0;             // a native NVN target: the bytes its texture's storage has there (0: unknown)
     bool writeback_queued = false;          // a one-off draw rendered it: copied to guest memory at the submission's end
+    // a native NVN target the CPU reads (cpu_read_target, rx_draw.cpp): its pages marked for the CPU's copies to be
+    // seen; whether the CPU read it in the last minute, as of hos_rt_read_gen / the frame it was last looked at
+    bool rt_pages_marked = false, cpu_read = false, cpu_read_logged = false;
+    long cpu_read_gen = -1;
+    int64_t cpu_read_frame = -1000;
     uint32_t slice = 0, volume_depth = 0;   // a 3D texture's slice drawn (nvn_slice_key): which, of how many
     bool block_view = false;                // drawn through an uncompressed view of a compressed texture: a texel a block
     uint64_t content_hash = 0;              // a texture decoded from memory: samples of the memory it came from

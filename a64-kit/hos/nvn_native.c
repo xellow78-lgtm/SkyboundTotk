@@ -269,9 +269,33 @@ NV(nvnMemoryPoolMap) {
 }
 NV(nvnMemoryPoolGetBufferAddress) { RET(((const nvn_pool *)P(0))->gpu); }
 NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watch */
+/* The CPU is about to read what the GPU wrote in [gpu, gpu + n): render targets there are written back from then on
+   (nn_libc.c, hos_rt_cpu_read: their pixels are in guest memory only when rx writes them back) */
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+void hos_rt_cpu_read(uint64_t guest, uint64_t n, uint64_t lr, const char *how);
+#endif
+static void invalidated(Ctx *c, uint64_t gpu, uint64_t n) {
+    rx_nvn_invalidate(gpu, n);
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    if (n > (8u << 20)) {   /* (a whole pool, say: not taken as reading every target in it, each written back) */
+        static volatile long told;
+        if (__atomic_add_fetch(&told, 1, __ATOMIC_RELAXED) <= 8)
+            hos_log("nvn: InvalidateMappedRange %llx+%llx from %llx: large, its render targets not written back for it",
+                    (unsigned long long)gpu, (unsigned long long)n, (unsigned long long)c->x[30]);
+        return;
+    }
+    for (uint64_t va = gpu, end = gpu + n; va < end;) {   /* (a virtual pool's pages: anywhere in guest memory) */
+        const uint64_t next = (va | (VPAGE - 1)) + 1, g = nvn_gpu_guest(va);
+        if (g) hos_rt_cpu_read(g, (next < end ? next : end) - va, c->x[30], "InvalidateMappedRange");
+        va = next;
+    }
+#else
+    (void)c;
+#endif
+}
 NV(nvnMemoryPoolInvalidateMappedRange) {   /* the CPU is about to read what the GPU wrote */
     const nvn_pool *o = (const nvn_pool *)P(0);
-    if ((int64_t)U64(1) >= 0) rx_nvn_invalidate(o->gpu + U64(1), U64(2));
+    if ((int64_t)U64(1) >= 0) invalidated(c, o->gpu + U64(1), U64(2));
 }
 NV(nvnMemoryPoolSetDebugLabel) {}
 /* NVNmappingRequest (0x28 bytes): physical pool (guest pointer), physical offset, virtual offset, size, storage class */
@@ -342,7 +366,7 @@ NV(nvnBufferGetSize) { RET(((const nvn_buffer *)P(0))->size); }
 NV(nvnBufferFlushMappedRange) {}
 NV(nvnBufferInvalidateMappedRange) {
     const nvn_buffer *o = (const nvn_buffer *)P(0);
-    if (o->pool) rx_nvn_invalidate(o->pool->gpu + (uint64_t)o->off + U64(1), U64(2));
+    if (o->pool) invalidated(c, o->pool->gpu + (uint64_t)o->off + U64(1), U64(2));
 }
 NV(nvnBufferSetDebugLabel) {}
 
