@@ -11,6 +11,8 @@
 #include <mutex>
 #include <unordered_set>
 #include <unordered_map>
+#include <functional>
+#include <cstdio>
 
 #include "rx_internal.h"
 #include "rx_nvn.h"
@@ -35,6 +37,9 @@ void rx_web_idle(volatile uint32_t* wake, uint32_t seen);
 #endif
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void* p, size_t n);
+#endif
+#if !RX_WEB && defined(_WIN32)
+extern volatile uint8_t hos_rt_pages[];   // (hos/nn_libc.c: native NVN render targets' 4 KB guest pages)
 #endif
 }
 
@@ -1089,6 +1094,7 @@ struct NvnJob {
     bool present = false;
     uint64_t present_guest = 0;
     uint32_t present_w = 0, present_h = 0;
+    std::function<void()> fn;          // (renderer work for a game thread, in order with the submits: under nvn_mu)
 };
 std::mutex job_mu;
 std::condition_variable job_cv, job_done_cv;
@@ -1229,9 +1235,14 @@ void replay_main() {
             j = std::move(jobs.front());
             jobs.pop_front();
         }
-        reflex_replay_job(j.present);   // (NVIDIA Reflex's render submit markers, rx_reflex.cpp)
-        if (j.present) run_present(j.present_guest, j.present_w, j.present_h);
-        else run_submit(j.handles.data(), j.handles.size(), j.scan);
+        if (j.fn) {
+            std::lock_guard lk(nvn_mu);
+            j.fn();
+        } else {
+            reflex_replay_job(j.present);   // (NVIDIA Reflex's render submit markers, rx_reflex.cpp)
+            if (j.present) run_present(j.present_guest, j.present_w, j.present_h);
+            else run_submit(j.handles.data(), j.handles.size(), j.scan);
+        }
         {
             std::lock_guard lk(job_mu);
             if (j.present) presents_queued--;
@@ -1309,6 +1320,62 @@ void drain() {
         job_done_cv.wait(lk, [] { return jobs_replayed.load() >= jobs_pushed; });
     }
     wait_writebacks();
+}
+
+/* RX_CPU_READ (rx_nvn_invalidate): each render target in [gpu, gpu + size) drawn since the CPU last read it, against
+   its guest memory (the replay thread, under nvn_mu, after the submits before the read). mode 1: compared and logged,
+   and the first 48 that differ saved to RX_DUMP_DIR as cpuread_<n>_<address>_..._rt.bin (the target, laid out as its
+   memory) and _mem.bin (what the CPU reads); mode 2: the target also written into its memory, as the console's GPU
+   would have (the CPU then reads what was drawn) */
+void cpu_read_check(uint64_t gpu, uint64_t size, int mode) {
+    static int logged, dumped, unread;
+    std::vector<Image*> hits;
+    for (const auto& [g, up] : all_images()) {
+        Image* im = up.get();
+        if (!im || !im->rendered || !im->rt_dirty || !im->gpu_va) continue;
+        const uint64_t bytes = im->storage_limit ? im->storage_limit
+                                                 : (uint64_t)im->width * im->height *
+                                                       VideoCore::Surface::BytesPerBlock(im->pixel_format);
+        if (im->gpu_va < gpu + size && gpu < im->gpu_va + bytes) hits.push_back(im);
+    }
+    for (Image* im : hits) {
+        std::vector<uint8_t> out;
+        uint8_t* guest = nullptr;
+        size_t n = 0;
+        const bool ok = target_guest_bytes(im, out, guest, n);
+        rt_pages_clean(im);
+        if (!ok) {
+            if (unread++ < 16)
+                hos_log("rx: CPU read of render target %08llx %ux%u format %d: cannot compare (not read back)",
+                        (unsigned long long)im->guest, im->width, im->height, (int)im->pixel_format);
+            continue;
+        }
+        size_t diff = 0;
+        for (size_t i = 0; i < n; i++) diff += out[i] != guest[i];
+        count(diff ? "cpu_read_stale" : "cpu_read_same");
+        if (logged++ < 600)
+            hos_log("rx: CPU read of render target %08llx %ux%u format %d (InvalidateMappedRange %llx+%llx, frame %lld): "
+                    "%zu of %zu bytes differ from the target%s",
+                    (unsigned long long)im->guest, im->width, im->height, (int)im->pixel_format,
+                    (unsigned long long)gpu, (unsigned long long)size, (long long)frame_number, diff, n,
+                    diff && mode == 2 ? ": the target written into memory" : "");
+        const char* dir = getenv("RX_DUMP_DIR");
+        if (diff && dir && *dir && dumped < 48) {
+            dumped++;
+            for (int k = 0; k < 2; k++) {
+                char path[512];
+                std::snprintf(path, sizeof path, "%s\\cpuread_%02d_%08llx_%ux%u_f%d_bh%u%s_f%lld_%s.bin", dir, dumped,
+                              (unsigned long long)im->guest, im->width, im->height, (int)im->pixel_format,
+                              im->bl_height, im->pitch_linear ? "_pitch" : "", (long long)frame_number,
+                              k ? "mem" : "rt");
+                if (FILE* f = std::fopen(path, "wb")) {
+                    std::fwrite(k ? guest : out.data(), 1, n, f);
+                    std::fclose(f);
+                }
+            }
+        }
+        if (diff && mode == 2) std::memcpy(guest, out.data(), n);
+    }
 }
 }  // namespace
 }  // namespace rx
@@ -1454,9 +1521,43 @@ void rx_nvn_write_texels(const nvn_tex* t, unsigned level, unsigned layer0, cons
     std::lock_guard lk(nvn_mu);
     texel_copy(t, level, layer0, r, const_cast<uint8_t*>(src), row, img, true);
 }
-/* the CPU is about to read memory a shader may have written on the GPU (InvalidateMappedRange): nothing to do here.
-   TOTK invalidates ranges every frame; a GPU sync at each (as rx_sync_gpu_writes makes) halved the frame rate, and the
-   emulated path never synced there either: shader writes come back to guest memory by themselves (readbacks). */
-void rx_nvn_invalidate(uint64_t gpu, uint64_t size) { (void)gpu, (void)size; }
+/* the CPU is about to read memory a shader may have written on the GPU (InvalidateMappedRange). No GPU sync in
+   general: TOTK invalidates ranges every frame; a GPU sync at each (as rx_sync_gpu_writes makes) halved the frame rate,
+   and the emulated path never synced there either: shader writes come back to guest memory by themselves (readbacks).
+   Render targets do not (only after a one-off draw). RX_CPU_READ=check (diagnostic): a range up to 8 MB holding a
+   render target drawn since the CPU last read it (hos_rt_pages, mark_rt_pages) waits for the replay, which compares
+   the target with its memory (cpu_read_check); RX_CPU_READ=sync: the target is also written into its memory. TOTK's
+   game logic reads its terrain tiles' 260x260 RG8 maps so. */
+void rx_nvn_invalidate(uint64_t gpu, uint64_t size) {
+#if !RX_WEB && defined(_WIN32)
+    static const int mode = [] {
+        const char* v = getenv("RX_CPU_READ");
+        return !v ? 0 : !std::strcmp(v, "sync") ? 2 : !std::strcmp(v, "check") ? 1 : 0;
+    }();
+    if (!mode || !size || size > (8u << 20) || !rx_active()) return;
+    constexpr uint64_t space = 1ull << 33;
+    bool drawn = false;
+    for (uint64_t va = gpu, end = gpu + size; va < end && !drawn;) {
+        const uint64_t next = (va | 0xFFFF) + 1, g = nvn_gpu_guest(va);
+        if (g && g < space) {
+            const uint64_t last = std::min(g + (std::min(next, end) - va), space) - 1;
+            for (uint64_t p = g >> 12; p <= last >> 12 && !drawn; p++) drawn = (hos_rt_pages[p] & 2) != 0;
+        }
+        va = next;
+    }
+    if (!drawn) return;
+    if (replay_sync()) {
+        std::lock_guard lk(nvn_mu);
+        cpu_read_check(gpu, size, mode);
+        return;
+    }
+    NvnJob j;
+    j.fn = [gpu, size] { cpu_read_check(gpu, size, mode); };
+    push_job(std::move(j));
+    drain();
+#else
+    (void)gpu, (void)size;
+#endif
+}
 
 }  // extern "C"

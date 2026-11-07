@@ -21,10 +21,8 @@ extern "C" float hos_view_aspect;   // (hos/totk_ultrawide.c: the game's cameras
 #if !RX_WEB && defined(_WIN32)
 extern "C" void hos_watch_arm(uint64_t guest, int len, const char* why);   // (hos/hos_watch.c: RX_WATCH_GLOOM)
 extern "C" void hos_watch_move(const char* why, uint64_t guest);
-// (hos/nn_libc.c: render target memory the CPU reads, by 4 KB guest page: cpu_read_target)
+// (hos/nn_libc.c: native NVN render targets' 4 KB guest pages: mark_rt_pages)
 extern "C" volatile uint8_t hos_rt_pages[];
-extern "C" volatile uint32_t hos_rt_read_s[];
-extern "C" volatile long hos_rt_read_gen;
 #endif
 
 namespace rx {
@@ -3605,61 +3603,42 @@ bool nvn_one_off(const Attachments& at) {
     return !recent;
 }
 
-/// Whether the CPU read this native NVN target's memory in the last minute (a memcpy out of it or an
-/// InvalidateMappedRange over it: hos/nn_libc.c, hos_rt_cpu_read). Then its draws are as a one-off target's: each
-/// submission that draws it writes it back to guest memory, and they wait for their pipelines. A target's pixels are in
-/// guest memory only when written back, and that was after one-off draws only (a target no draw used in the last 64
-/// frames): TOTK's terrain bakes maps into a target and copies them out with the CPU, and a burst of bakes into the
-/// same target (streaming in after a load) left the first bake's pixels in memory for the rest. The first call for an
-/// image marks its 4 KB pages (hos_rt_pages), so the CPU's copies out of them are seen. RX_CPU_READ_WRITEBACK=0: off
-bool cpu_read_target(Image* im, bool depth) {
-#if RX_WEB || !defined(_WIN32)
-    (void)im, (void)depth;
-    return false;
-#else
-    static const bool off = getenv("RX_CPU_READ_WRITEBACK") && atoi(getenv("RX_CPU_READ_WRITEBACK")) == 0;
-    if (off || !im || !im->gpu_va || (im->guest >> 32)) return false;
+}  // namespace
+
+#if !RX_WEB && defined(_WIN32)
+namespace {
+/// fn(page) for each 4 KB guest page of a native NVN target's memory, 64 KB of GPU addresses at a time (a virtual
+/// pool's pages may be anywhere in guest memory)
+template <class F>
+void rt_guest_pages(const Image* im, F&& fn) {
     constexpr uint64_t space = 1ull << 33, vpage = 0x10000;   // (nn_libc.c's pages; NVN's virtual mapping granularity)
     const uint64_t bytes = im->storage_limit ? im->storage_limit
                                              : (uint64_t)im->width * im->height *
                                                    VideoCore::Surface::BytesPerBlock(im->pixel_format);
-    // the guest pages of [gpu_va, gpu_va + bytes), 64 KB of GPU addresses at a time (a virtual pool's pages may be
-    // anywhere in guest memory)
-    auto pages = [&](auto&& fn) {
-        for (uint64_t va = im->gpu_va, end = im->gpu_va + bytes; va < end;) {
-            const uint64_t next = (va | (vpage - 1)) + 1, g = nvn_gpu_guest(va);
-            if (g && g < space) {
-                const uint64_t last = std::min(g + ((next < end ? next : end) - va), space) - 1;
-                for (uint64_t p = g >> 12; p <= last >> 12; p++) fn(p);
-            }
-            va = next;
+    for (uint64_t va = im->gpu_va, end = im->gpu_va + bytes; va < end;) {
+        const uint64_t next = (va | (vpage - 1)) + 1, g = nvn_gpu_guest(va);
+        if (g && g < space) {
+            const uint64_t last = std::min(g + ((next < end ? next : end) - va), space) - 1;
+            for (uint64_t p = g >> 12; p <= last >> 12; p++) fn(p);
         }
-    };
-    if (!im->rt_pages_marked) {
-        im->rt_pages_marked = true;
-        pages([](uint64_t p) { if (!hos_rt_pages[p]) hos_rt_pages[p] = 1; });
+        va = next;
     }
-    // (looked at again when the CPU read a target's page first in a minute, and every 2 s, as reads age out)
-    const long gen = hos_rt_read_gen;
-    if (im->cpu_read_gen == gen && frame_number - im->cpu_read_frame < 120) return im->cpu_read && !depth;
-    im->cpu_read_gen = gen, im->cpu_read_frame = frame_number;
-    const uint32_t now = (uint32_t)(hos_now_ns() / 1000000000) + 1;
-    bool read = false;
-    pages([&](uint64_t p) { read |= hos_rt_read_s[p] && hos_rt_read_s[p] + 60 >= now; });
-    if (read && !im->cpu_read_logged) {
-        im->cpu_read_logged = true;
-        log_limited("cpu_read_rt", 64, "rx: the CPU reads %s %08llx (gpu %llx) %ux%u format %d: %s",
-                    depth ? "depth target" : "render target", (unsigned long long)im->guest,
-                    (unsigned long long)im->gpu_va, im->width, im->height, (int)im->pixel_format,
-                    depth ? "not written back (depth)" : "written back after each submission that draws it now");
-    }
-    if (read != im->cpu_read) count(read ? "cpu_read_rt_on" : "cpu_read_rt_off");
-    im->cpu_read = read;
-    return read && !depth;
-#endif
 }
-
 }  // namespace
+void mark_rt_pages(Image* im) {
+    if (!im || im->rt_dirty || !im->gpu_va || (im->guest >> 32)) return;
+    im->rt_dirty = true;
+    rt_guest_pages(im, [](uint64_t p) { hos_rt_pages[p] |= 3; });
+}
+void rt_pages_clean(Image* im) {
+    if (!im || !im->rt_dirty) return;
+    im->rt_dirty = false;
+    rt_guest_pages(im, [](uint64_t p) { hos_rt_pages[p] &= (uint8_t)~2u; });
+}
+#else
+void mark_rt_pages(Image*) {}
+void rt_pages_clean(Image*) {}
+#endif
 
 void nvn_draw(NvnState& s, const NvnDraw& d) {
     // RX_NVN_NO_DRAWS=1 (measurement only: the screen is wrong): no draw is prepared, so the frame rate is what the
@@ -3702,13 +3681,9 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
             log_limited("scene_size", 400, "rx: scene %ux%u from frame %lld", lw, lh, (long long)frame_number);
         }
     }
-    // (targets the CPU reads: written back after each submission that draws them, cpu_read_target)
-    bool cpu_read = false;
-    for (Image* c : at.color)
-        if (c) cpu_read |= cpu_read_target(c, false);
-    if (at.depth) cpu_read_target(at.depth, true);
-    draw_must_run = nvn_one_off(at) || cpu_read;
-    if (cpu_read) count("cpu_read_draws");
+    // (its targets' pages marked drawn: the CPU's reads of them are checked, rx_nvn_invalidate)
+    for (Image* c : at.color) mark_rt_pages(c);
+    draw_must_run = nvn_one_off(at);
     struct MustRunReset {
         ~MustRunReset() { draw_must_run = false; }
     } must_run_reset;

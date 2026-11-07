@@ -24,13 +24,12 @@ void hos_watch_copy(uint64_t dst, uint64_t src, uint64_t n, uint64_t lr);
 #define WATCH_COPY(d, s, n) ((void)0)
 #endif
 
-/* Render target memory the CPU reads. A render target's pixels reach guest memory only when rx writes it back, which
-   it did only after a one-off draw (a target no draw used in the last 64 frames): TOTK's terrain bakes maps into a
-   target and copies them out with the CPU, and a burst of bakes into the same target (streaming after a load) left
-   the first bake's pixels in memory for the rest. rx marks the 4 KB pages its NVN targets cover (hos_rt_pages); a
-   memcpy / memmove out of one, or an InvalidateMappedRange over one (nvn_native.c), notes when (hos_rt_read_s:
-   seconds + 1) and, the first time in a minute, bumps hos_rt_read_gen: rx then writes that target back after each
-   submission that draws it (rx_draw.cpp, cpu_read_target). */
+/* Render target memory the CPU reads. A render target's pixels reach guest memory only when rx writes it back (after
+   a one-off draw: a target no draw used in the last 64 frames). rx marks the 4 KB pages its NVN targets cover
+   (hos_rt_pages: bit 0 a target's, bit 1 drawn since the CPU last read it; rx_draw.cpp, mark_rt_pages). A memcpy /
+   memmove out of one, or an InvalidateMappedRange over one (nvn_native.c), is logged the first time in a minute a
+   page is read (hos_rt_read_s: seconds + 1), with who read it; RX_CPU_READ compares what was drawn with what the CPU
+   reads (rx_nvn.cpp, rx_nvn_invalidate). */
 #if defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #define HOS_RT_SPACE (1ull << 33)   /* (8 GB of guest space, in 4 KB pages) */
 volatile uint8_t hos_rt_pages[HOS_RT_SPACE >> 12];

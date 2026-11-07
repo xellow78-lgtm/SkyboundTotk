@@ -99,11 +99,9 @@ struct Image {
     bool pitch_linear = false;
     uint64_t storage_limit = 0;             // a native NVN target: the bytes its texture's storage has there (0: unknown)
     bool writeback_queued = false;          // a one-off draw rendered it: copied to guest memory at the submission's end
-    // a native NVN target the CPU reads (cpu_read_target, rx_draw.cpp): its pages marked for the CPU's copies to be
-    // seen; whether the CPU read it in the last minute, as of hos_rt_read_gen / the frame it was last looked at
-    bool rt_pages_marked = false, cpu_read = false, cpu_read_logged = false;
-    long cpu_read_gen = -1;
-    int64_t cpu_read_frame = -1000;
+    // a native NVN target drawn since the CPU last read its memory (InvalidateMappedRange: rx_nvn_invalidate), its
+    // 4 KB guest pages marked drawn in hos_rt_pages (mark_rt_pages, rx_draw.cpp)
+    bool rt_dirty = false;
     uint32_t slice = 0, volume_depth = 0;   // a 3D texture's slice drawn (nvn_slice_key): which, of how many
     bool block_view = false;                // drawn through an uncompressed view of a compressed texture: a texel a block
     uint64_t content_hash = 0;              // a texture decoded from memory: samples of the memory it came from
@@ -373,6 +371,13 @@ void dump_start_now();
 /// as the console's memory would hold them (TOTK's terrain copies the maps it renders with the CPU)
 void queue_target_writeback(Image* im);
 void writeback_targets();
+/// A native NVN target's 4 KB guest pages in hos/nn_libc.c's hos_rt_pages: bit 0 a target's, bit 1 drawn since the
+/// CPU last read it (mark_rt_pages at each draw; rt_pages_clean once rx_nvn_invalidate's check looked at it)
+void mark_rt_pages(Image* im);
+void rt_pages_clean(Image* im);
+/// A render target's pixels as its guest memory would hold them (its layout: block or pitch linear) into `out`, which
+/// starts as a copy of that memory; `guest` / `size`: that memory. False when it cannot be read back (render thread)
+bool target_guest_bytes(Image* im, std::vector<uint8_t>& out, uint8_t*& guest, size_t& size);
 /// RX_GUEST_WATCH=<lo>-<hi> guest hex (debugging): whether GPU memory [va, va + size) touches that guest range
 bool guest_watch_hit(uint64_t va, uint64_t size);
 

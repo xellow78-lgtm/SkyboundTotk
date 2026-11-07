@@ -3920,8 +3920,11 @@ static uint8_t norm16_stand_in(PixelFormat pf, WGPUTextureFormat texture) {
 }
 
 /// The read-back rows q (row bytes apart) into guest memory, in the target's layout (pitch or block linear).
-/// counted: false off the renderer's thread (count() is that thread's)
-void apply_target_writeback(const TargetWriteback& t, const uint8_t* q, bool counted) {
+/// counted: false off the renderer's thread (count() is that thread's). dest: into that copy of the memory instead
+/// (dest_avail bytes; target_guest_bytes)
+void apply_target_writeback(const TargetWriteback& t, const uint8_t* q, bool counted, uint8_t* dest = nullptr,
+                            uint64_t dest_avail = 0) {
+    if (dest) counted = false;   // (a comparison, not a writeback)
     const uint32_t w = t.w, h = t.h, bpp = t.bpp, row = t.row;
     std::vector<uint8_t> conv;
     if (t.norm16) {   // (float16 back to the guest's 16-bit norm values)
@@ -3941,8 +3944,8 @@ void apply_target_writeback(const TargetWriteback& t, const uint8_t* q, bool cou
         q = conv.data();
         if (counted) count("rt_writeback_norm16");
     }
-    uint64_t avail = 0;
-    uint8_t* out = const_cast<uint8_t*>(hos_gpu_ptr(t.gpu_va, &avail));
+    uint64_t avail = dest_avail;
+    uint8_t* out = dest ? dest : const_cast<uint8_t*>(hos_gpu_ptr(t.gpu_va, &avail));
     if (t.pitch_linear) {
         const uint32_t pitch = std::max(t.reg_width, w * bpp);
         const uint64_t need = (uint64_t)pitch * (h - 1) + (uint64_t)w * bpp;
@@ -4119,6 +4122,75 @@ void writeback_targets() {
     }
     if (RX_WEB_MT) flush_batch();   // (the copies go now)
 }
+
+bool target_guest_bytes(Image* im, std::vector<uint8_t>& out, uint8_t*& guest, size_t& size) {
+    if (RX_WEB_MT || !im || !im->tex || (im->guest >> 32)) return false;
+    const PixelFormat pf = im->pixel_format;
+    const bool same_bytes = wgpu_format(pf) == im->format || srgb_pair(wgpu_format(pf)) == im->format;
+    const uint8_t norm16 = same_bytes ? 0 : norm16_stand_in(pf, im->format);
+    if (im->layers != 1 || im->dimension != WGPUTextureDimension_2D || (!same_bytes && !norm16) ||
+        VideoCore::Surface::GetFormatType(pf) != VideoCore::Surface::SurfaceType::ColorTexture ||
+        VideoCore::Surface::IsPixelFormatASTC(pf) || VideoCore::Surface::DefaultBlockWidth(pf) != 1)
+        return false;
+    TargetWriteback t;
+    t.guest = im->guest, t.gpu_va = im->gpu_va, t.storage_limit = im->storage_limit;
+    t.bpp = VideoCore::Surface::BytesPerBlock(pf);
+    t.w = im->width, t.h = im->height;
+    t.row = (t.w * t.bpp + 255) & ~255u;
+    t.reg_width = im->reg_width, t.bl_height = im->bl_height, t.bl_depth = im->bl_depth;
+    t.pitch_linear = im->pitch_linear;
+    t.pf = (int)pf;
+    t.norm16 = norm16;
+    // (the memory, as apply_target_writeback lays the target out in it)
+    uint64_t avail = 0;
+    guest = const_cast<uint8_t*>(hos_gpu_ptr(t.gpu_va, &avail));
+    size = t.pitch_linear ? (size_t)std::max(t.reg_width, t.w * t.bpp) * t.h
+                          : Tegra::Texture::CalculateSize(true, t.bpp, std::max(t.reg_width, t.w), t.h, 1, t.bl_height,
+                                                          t.bl_depth);
+    if (!guest || avail < size || (t.storage_limit && size > t.storage_limit)) return false;
+    flush_batch();
+    wait_submitted();
+    WGPUBufferDescriptor bd{};
+    bd.label = sv("rx target comparison");
+    bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+    bd.size = (uint64_t)t.row * t.h;
+    WGPUBuffer staging = wgpuDeviceCreateBuffer(dev.device, &bd);
+    WGPUTexelCopyTextureInfo src{};
+    src.texture = im->tex;
+    src.aspect = WGPUTextureAspect_All;
+    WGPUTexelCopyBufferInfo dst{};
+    dst.buffer = staging;
+    dst.layout.bytesPerRow = t.row;
+    dst.layout.rowsPerImage = t.h;
+    const WGPUExtent3D extent{t.w, t.h, 1};
+    WGPUCommandEncoder e = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
+    wgpuCommandEncoderCopyTextureToBuffer(e, &src, &dst, &extent);
+    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(e, nullptr);
+    wgpuQueueSubmit(dev.queue, 1, &cb);
+    wgpuCommandBufferRelease(cb);
+    wgpuCommandEncoderRelease(e);
+    struct Done { bool complete = false; WGPUMapAsyncStatus status = WGPUMapAsyncStatus_Error; } done;
+    WGPUBufferMapCallbackInfo mc{};
+    mc.mode = WGPUCallbackMode_AllowSpontaneous;
+    mc.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+        auto* dn = static_cast<Done*>(u1);
+        dn->status = status;
+        dn->complete = true;
+    };
+    mc.userdata1 = &done;
+    wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, bd.size, mc);
+    while (!done.complete) wgpuDevicePoll(dev.device, true, nullptr);
+    const bool ok = done.status == WGPUMapAsyncStatus_Success;
+    if (ok) {
+        out.assign(guest, guest + size);
+        apply_target_writeback(t, static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(staging, 0, bd.size)), false,
+                               out.data(), size);
+        wgpuBufferUnmap(staging);
+    }
+    wgpuBufferRelease(staging);
+    return ok;
+}
+
 int rx_target_writebacks_pending() { return target_writebacks_pending.load(); }
 
 extern "C" void rx_wait_writebacks_reading(const void* p, uint64_t n) {
