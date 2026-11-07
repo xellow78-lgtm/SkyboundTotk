@@ -3800,6 +3800,11 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     nvn_dump_draw_ub = frame_dump_active() && dump_draw_wanted(prog);
     static const bool gloom_watch = env_flag("RX_WATCH_GLOOM") || env_flag("RX_GUARD_GLOOM");
     nvn_gloom_watch_draw = gloom_watch && prog->has_fs && prog->fs.key == 0x18454ee069e36783ull;
+#if !RX_WEB && defined(_WIN32)
+    // (HOS_GLOOM_TRACE, hos/totk_gloom.c: its log lines say where the camera was)
+    if (static const bool gloom_trace = env_flag("HOS_GLOOM_TRACE"); gloom_trace && !hos_guard_context)
+        hos_guard_context = gloom_camera_note;
+#endif
     struct DumpDrawReset {
         ~DumpDrawReset() { nvn_dump_draw_ub = false, nvn_gloom_watch_draw = false; }
     } dump_draw_reset;
