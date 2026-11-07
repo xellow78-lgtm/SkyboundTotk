@@ -26,6 +26,7 @@ extern "C" volatile uint8_t hos_rt_pages[];
 // (hos/hos_watch.c: guard pages, RX_GUARD_GLOOM)
 extern "C" void hos_guard_arm(uint64_t guest, uint64_t len, const char* why);
 extern "C" void (*hos_guard_context)(char* out, size_t cap);
+extern "C" volatile int hos_guard_control_pending;
 extern "C" uint8_t* hos_guest_base(void);
 extern "C" void hos_scan_pieces(const uint8_t* const* pieces, const char* const* names, int n, uint32_t len,
                                 uint64_t skip, uint64_t skip_len, int delay_s, const char* guard_why);
@@ -3158,41 +3159,80 @@ void gloom_camera_note(char* out, size_t cap) {
                   scene_camera.v[55], (long long)frame_number);
 }
 
-/// RX_GUARD_GLOOM: the gloom maps' whole memory guarded (every access, by any thread, logged with who made it and
-/// where the camera was: hos_guard_arm), and copies of the height map looked for elsewhere (gloom_copy_scan). Both
-/// maps are 1000x800, 2 bytes a texel, block linear with blocks 16 GOBs tall.
+/// RX_GUARD_GLOOM: the gloom maps' whole memory guarded, all 10 levels (every access, by any thread, logged with who
+/// made it and where the camera was: hos_guard_arm), and copies of them looked for elsewhere in guest memory
+/// (hos_scan_pieces). Both maps are 1000x800, 2 bytes a texel, block linear, the first level's blocks 16 GOBs tall.
+struct GloomLevel {
+    uint64_t start = 0;
+    uint32_t w = 0, h = 0, wg = 0, bh = 0;
+};
+std::vector<GloomLevel> gloom_levels(uint64_t* total) {
+    std::vector<GloomLevel> v;
+    uint64_t at = 0;
+    for (uint32_t l = 0; l < 10; l++) {
+        GloomLevel g;
+        g.w = std::max(1u, 1000u >> l), g.h = std::max(1u, 800u >> l);
+        g.bh = 16;
+        while (g.bh > 1 && g.h <= (g.bh / 2) * 8) g.bh /= 2;   // (a level's blocks no taller than it needs)
+        g.wg = (g.w * 2 + 63) / 64;
+        g.start = at;
+        at += (uint64_t)g.wg * ((g.h + 8 * g.bh - 1) / (8 * g.bh)) * g.bh * 512;
+        v.push_back(g);
+    }
+    *total = at;
+    return v;
+}
 void gloom_guard_texture(uint32_t index, const BoundTexture& t) {
     static uint64_t guarded[2];
+    static std::vector<uint8_t> snapshot[2];
     if (t.guest == guarded[index]) return;
-    constexpr uint32_t wg = (1000 * 2 + 63) / 64, bh = 16;
-    constexpr uint64_t len = (uint64_t)wg * 512 * bh * ((800 + 8 * bh - 1) / (8 * bh));
+    uint64_t len = 0;
+    const std::vector<GloomLevel> lv = gloom_levels(&len);
+    if (!hos_guard_context) hos_guard_control_pending = 1;   // (the control: hos_watch.c)
     hos_guard_context = gloom_camera_note;
+    // (what is looked for is taken before the map is guarded: reading it then would be a hit)
+    const uint8_t* m = hos_guest_base() + t.guest;
+    snapshot[index].assign(m, m + len);
     static bool scanning;
-    if (index == 0 && !scanning) {
-        // (the pieces looked for, taken before the map is guarded: reading it then would be a hit)
+    if (!scanning && !snapshot[0].empty() && !snapshot[1].empty()) {
         scanning = true;
         std::vector<std::vector<uint8_t>> pieces;
         std::vector<std::string> names;
-        const uint8_t* m = hos_guest_base() + t.guest;
-        for (int i = 1; i <= 8; i++) {   // (GOBs spread over the map, as GPU memory holds them)
-            const uint64_t o = (len * i / 9) & ~511ull;
-            pieces.emplace_back(m + o, m + o + 512);
-            names.push_back("GOB at offset " + std::to_string(o));
-        }
-        for (uint32_t y : {100u, 300u, 500u, 700u}) {   // (the first 256 texels of a row, deswizzled)
-            std::vector<uint8_t> row(512);
-            for (uint32_t xb = 0; xb < 512; xb++) {
-                const uint32_t gob =
-                    ((xb % 64) / 32) * 256 + ((y % 8) / 2) * 64 + ((xb % 32) / 16) * 32 + (y % 2) * 16 + (xb % 16);
-                row[xb] = m[(uint64_t)((y / (8 * bh)) * wg + xb / 64) * (512 * bh) + ((y % (8 * bh)) / 8) * 512 + gob];
+        constexpr uint32_t n = 256;
+        for (int k = 0; k < 2; k++) {
+            const uint8_t* s = snapshot[k].data();
+            const char* map = k ? "RG map" : "height map";
+            for (uint32_t l = 0; l < 5; l++) {   // (as GPU memory holds them: GOBs at a level's start and inside it)
+                const uint64_t next = l + 1 < lv.size() ? lv[l + 1].start : len;
+                for (int i = 0; i < 3; i++) {
+                    const uint64_t o = (lv[l].start + (next - lv[l].start) * i / 3) & ~511ull;
+                    if (o + n > len) continue;
+                    pieces.emplace_back(s + o, s + o + n);
+                    names.push_back(std::string(map) + " level " + std::to_string(l) + " GOB at offset " +
+                                    std::to_string(o));
+                }
             }
-            pieces.push_back(std::move(row));
-            names.push_back("linear row " + std::to_string(y));
+            for (uint32_t l = 0; l < 3; l++) {   // (rows deswizzled: the first 128 texels)
+                const GloomLevel& g = lv[l];
+                for (int i = 1; i <= 3; i++) {
+                    const uint32_t y = g.h * i / 4;
+                    std::vector<uint8_t> row(n);
+                    for (uint32_t xb = 0; xb < n; xb++) {
+                        const uint32_t gob = ((xb % 64) / 32) * 256 + ((y % 8) / 2) * 64 + ((xb % 32) / 16) * 32 +
+                                             (y % 2) * 16 + (xb % 16);
+                        row[xb] = s[g.start + (uint64_t)((y / (8 * g.bh)) * g.wg + xb / 64) * (512 * g.bh) +
+                                    ((y % (8 * g.bh)) / 8) * 512 + gob];
+                    }
+                    pieces.push_back(std::move(row));
+                    names.push_back(std::string(map) + " level " + std::to_string(l) + " row " + std::to_string(y));
+                }
+            }
         }
         std::vector<const uint8_t*> ptrs;
         std::vector<const char*> name_ptrs;
         for (size_t i = 0; i < pieces.size(); i++) ptrs.push_back(pieces[i].data()), name_ptrs.push_back(names[i].c_str());
-        hos_scan_pieces(ptrs.data(), name_ptrs.data(), (int)pieces.size(), 512, t.guest, len, 20, "gloom map copy");
+        // (the maps themselves are left out by their guard: a guarded region is not read)
+        hos_scan_pieces(ptrs.data(), name_ptrs.data(), (int)pieces.size(), n, 0, 0, 20, "gloom map copy");
     }
     hos_guard_arm(t.guest, len, index ? "gloom RG map" : "gloom height map");
     guarded[index] = t.guest;

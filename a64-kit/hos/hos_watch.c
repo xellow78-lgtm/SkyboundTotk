@@ -99,8 +99,9 @@ static const char *symbolize(DWORD64 pc, char *out, size_t cap) {
 /* Guard pages (hos_guard_arm): every access to a whole range, by any thread, through PAGE_GUARD. A hit is recorded
    (by host code address, as breakpoints are: sites[].slot 4 + the range), the thread single-steps the access, and
    the page is guarded again on the step. The first 400 hits are logged with the offset in the range, read or write,
-   the thread and hos_guard_context's note (the renderer's camera). A range stops being guarded after 20000 hits. */
-typedef struct { uint64_t guest, len; DWORD protect; char why[48]; volatile LONG hits; } Guard;
+   the thread and hos_guard_context's note (the renderer's camera), up to 150 a range. A range stops being guarded
+   after 20000 hits. A range armed once (hos_guard_arm_once) is not guarded again: each of its pages tells once. */
+typedef struct { uint64_t guest, len; DWORD protect; int once; char why[48]; volatile LONG hits, lines; } Guard;
 static Guard guards[4];
 static volatile LONG nguards;
 static __declspec(thread) uintptr_t rearm_page;
@@ -148,7 +149,7 @@ static LONG CALLBACK handler(EXCEPTION_POINTERS *e) {
         if (site) InterlockedIncrement(&site->hits);
         static volatile LONG lines;
         static SRWLOCK sym_lock = SRWLOCK_INIT;   /* (dbghelp is not thread safe) */
-        if (log_it && InterlockedIncrement(&lines) <= 400) {
+        if (log_it && InterlockedIncrement(&lines) <= 600 && InterlockedIncrement(&guards[g].lines) <= 150) {
             AcquireSRWLockExclusive(&sym_lock);
             char name[300], note[160] = "";
             if (hos_guard_context) hos_guard_context(note, sizeof note);
@@ -162,7 +163,8 @@ static LONG CALLBACK handler(EXCEPTION_POINTERS *e) {
             }
             ReleaseSRWLockExclusive(&sym_lock);
         }
-        if (n < 20000) {   /* (guarded again after this one instruction) */
+        if (guards[g].once) {
+        } else if (n < 20000) {   /* (guarded again after this one instruction) */
             rearm_page = a & ~(uintptr_t)0xFFF;
             rearm_guard = g;
             c->EFlags |= 0x100;
@@ -278,7 +280,7 @@ void hos_watch_arm(uint64_t guest, int len, const char *why) {
 
 /* Every access to [guest, guest + len) from now on, by any thread (guard pages: the handler above). Up to 4 ranges;
    the same range again is ignored. */
-void hos_guard_arm(uint64_t guest, uint64_t len, const char *why) {
+static void guard_arm(uint64_t guest, uint64_t len, const char *why, int once) {
     static int started;
     const uint64_t lo = guest & ~0xFFFull, hi = (guest + len + 0xFFF) & ~0xFFFull;
     MEMORY_BASIC_INFORMATION mi;
@@ -298,7 +300,7 @@ void hos_guard_arm(uint64_t guest, uint64_t len, const char *why) {
         return;
     }
     Guard *g = &guards[nguards];
-    g->guest = lo, g->len = hi - lo, g->protect = mi.Protect & 0xFF, g->hits = 0;
+    g->guest = lo, g->len = hi - lo, g->protect = mi.Protect & 0xFF, g->hits = 0, g->lines = 0, g->once = once;
     snprintf(g->why, sizeof g->why, "%s", why);
     InterlockedIncrement(&nguards);
     ReleaseSRWLockExclusive(&lock);
@@ -309,9 +311,15 @@ void hos_guard_arm(uint64_t guest, uint64_t len, const char *why) {
     }
     DWORD old;
     const BOOL ok = VirtualProtect(hos_guest_base() + lo, (SIZE_T)(hi - lo), g->protect | PAGE_GUARD, &old);
-    hos_log("guard: %s at guest %#llx..%#llx%s", why, (unsigned long long)lo, (unsigned long long)hi,
-            ok ? "" : " (VirtualProtect failed: not guarded)");
+    hos_log("guard: %s at guest %#llx..%#llx%s%s", why, (unsigned long long)lo, (unsigned long long)hi,
+            once ? " (each page once)" : "", ok ? "" : " (VirtualProtect failed: not guarded)");
 }
+void hos_guard_arm(uint64_t guest, uint64_t len, const char *why) { guard_arm(guest, len, why, 0); }
+void hos_guard_arm_once(uint64_t guest, uint64_t len, const char *why) { guard_arm(guest, len, why, 1); }
+/* RX_GUARD_GLOOM's control (set by the renderer when it guards the gloom maps): the next InvalidateMappedRange over
+   render target memory (the game about to read what the GPU drew there: the terrain's tiles) is guarded once, from
+   the game's own thread right before its reads (nvn_native.c), so the log shows the guard catching the game's code */
+volatile int hos_guard_control_pending;
 
 /* Where else in guest memory n pieces of `len` bytes are (copies of some data the game may keep for itself), after
    delay_s seconds, on a thread of its own: each piece is found by an 8-byte anchor at a 16-byte aligned offset in it

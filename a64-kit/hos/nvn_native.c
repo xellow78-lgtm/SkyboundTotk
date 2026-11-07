@@ -273,6 +273,9 @@ NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watc
    (nn_libc.c, hos_rt_cpu_read: their pixels are in guest memory only when rx writes them back) */
 #if defined(_WIN32) && !defined(__EMSCRIPTEN__)
 void hos_rt_cpu_read(uint64_t guest, uint64_t n, uint64_t lr, const char *how);
+void hos_guard_arm_once(uint64_t guest, uint64_t len, const char *why);
+extern volatile int hos_guard_control_pending;   /* (hos_watch.c: RX_GUARD_GLOOM's control) */
+extern volatile uint8_t hos_rt_pages[];
 #endif
 static void invalidated(Ctx *c, uint64_t gpu, uint64_t n) {
     rx_nvn_invalidate(gpu, n);
@@ -287,6 +290,10 @@ static void invalidated(Ctx *c, uint64_t gpu, uint64_t n) {
     for (uint64_t va = gpu, end = gpu + n; va < end;) {   /* (a virtual pool's pages: anywhere in guest memory) */
         const uint64_t next = (va | (VPAGE - 1)) + 1, g = nvn_gpu_guest(va);
         if (g) hos_rt_cpu_read(g, (next < end ? next : end) - va, c->x[30], "InvalidateMappedRange");
+        if (g && hos_guard_control_pending && g < (1ull << 33) && (hos_rt_pages[g >> 12] & 1)) {
+            hos_guard_control_pending = 0;
+            hos_guard_arm_once(g, (next < end ? next : end) - va, "render target the game reads (control)");
+        }
         va = next;
     }
 #else
