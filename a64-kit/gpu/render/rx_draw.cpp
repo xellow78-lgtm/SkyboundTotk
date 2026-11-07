@@ -23,6 +23,12 @@ extern "C" void hos_watch_arm(uint64_t guest, int len, const char* why);   // (h
 extern "C" void hos_watch_move(const char* why, uint64_t guest);
 // (hos/nn_libc.c: native NVN render targets' 4 KB guest pages: mark_rt_pages)
 extern "C" volatile uint8_t hos_rt_pages[];
+// (hos/hos_watch.c: guard pages, RX_GUARD_GLOOM)
+extern "C" void hos_guard_arm(uint64_t guest, uint64_t len, const char* why);
+extern "C" void (*hos_guard_context)(char* out, size_t cap);
+extern "C" uint8_t* hos_guest_base(void);
+extern "C" void hos_scan_pieces(const uint8_t* const* pieces, const char* const* names, int n, uint32_t len,
+                                uint64_t skip, uint64_t skip_len, int delay_s, const char* guard_why);
 #endif
 
 namespace rx {
@@ -3145,9 +3151,60 @@ bool nvn_dump_draw_ub = false;
 /// texels, block-linear 16 GOBs high; the camera is the scene camera's inverse view translation. Each map's 2x2
 /// texels there are in one 8-byte row piece and the one 16 bytes on (the next row): both are watched, all 4 slots.
 bool nvn_gloom_watch_draw = false;
+#if !RX_WEB && defined(_WIN32)
+/// (RX_GUARD_GLOOM: the renderer's camera, on each guard hit's log line)
+void gloom_camera_note(char* out, size_t cap) {
+    std::snprintf(out, cap, "camera %.1f %.1f %.1f (frame %lld)", scene_camera.v[47], scene_camera.v[51],
+                  scene_camera.v[55], (long long)frame_number);
+}
+
+/// RX_GUARD_GLOOM: the gloom maps' whole memory guarded (every access, by any thread, logged with who made it and
+/// where the camera was: hos_guard_arm), and copies of the height map looked for elsewhere (gloom_copy_scan). Both
+/// maps are 1000x800, 2 bytes a texel, block linear with blocks 16 GOBs tall.
+void gloom_guard_texture(uint32_t index, const BoundTexture& t) {
+    static uint64_t guarded[2];
+    if (t.guest == guarded[index]) return;
+    constexpr uint32_t wg = (1000 * 2 + 63) / 64, bh = 16;
+    constexpr uint64_t len = (uint64_t)wg * 512 * bh * ((800 + 8 * bh - 1) / (8 * bh));
+    hos_guard_context = gloom_camera_note;
+    static bool scanning;
+    if (index == 0 && !scanning) {
+        // (the pieces looked for, taken before the map is guarded: reading it then would be a hit)
+        scanning = true;
+        std::vector<std::vector<uint8_t>> pieces;
+        std::vector<std::string> names;
+        const uint8_t* m = hos_guest_base() + t.guest;
+        for (int i = 1; i <= 8; i++) {   // (GOBs spread over the map, as GPU memory holds them)
+            const uint64_t o = (len * i / 9) & ~511ull;
+            pieces.emplace_back(m + o, m + o + 512);
+            names.push_back("GOB at offset " + std::to_string(o));
+        }
+        for (uint32_t y : {100u, 300u, 500u, 700u}) {   // (the first 256 texels of a row, deswizzled)
+            std::vector<uint8_t> row(512);
+            for (uint32_t xb = 0; xb < 512; xb++) {
+                const uint32_t gob =
+                    ((xb % 64) / 32) * 256 + ((y % 8) / 2) * 64 + ((xb % 32) / 16) * 32 + (y % 2) * 16 + (xb % 16);
+                row[xb] = m[(uint64_t)((y / (8 * bh)) * wg + xb / 64) * (512 * bh) + ((y % (8 * bh)) / 8) * 512 + gob];
+            }
+            pieces.push_back(std::move(row));
+            names.push_back("linear row " + std::to_string(y));
+        }
+        std::vector<const uint8_t*> ptrs;
+        std::vector<const char*> name_ptrs;
+        for (size_t i = 0; i < pieces.size(); i++) ptrs.push_back(pieces[i].data()), name_ptrs.push_back(names[i].c_str());
+        hos_scan_pieces(ptrs.data(), name_ptrs.data(), (int)pieces.size(), 512, t.guest, len, 20, "gloom map copy");
+    }
+    hos_guard_arm(t.guest, len, index ? "gloom RG map" : "gloom height map");
+    guarded[index] = t.guest;
+}
+#endif
 void gloom_watch_texture(uint32_t index, const BoundTexture& t) {
 #if !RX_WEB && defined(_WIN32)
     if (index > 1 || !t.guest || t.width != 1000 || t.height != 800 || scene_camera.frame < 0) return;
+    if (static const bool guard = env_flag("RX_GUARD_GLOOM"); guard) {
+        gloom_guard_texture(index, t);
+        if (!env_flag("RX_WATCH_GLOOM")) return;
+    }
     const float X = scene_camera.v[47], Z = scene_camera.v[55];
     const float u = X * 1e-4f + 0.5f, v = Z * 1.25e-4f + 0.5f;
     const int tx = std::clamp((int)std::floor(u * 1000.0f - 0.5f), 0, 998);
@@ -3701,7 +3758,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) return;   // (rx_fsr2.cpp)
     // RX_DUMP_DRAW (debugging): before anything of this draw is in the batch
     nvn_dump_draw_ub = frame_dump_active() && dump_draw_wanted(prog);
-    static const bool gloom_watch = env_flag("RX_WATCH_GLOOM");
+    static const bool gloom_watch = env_flag("RX_WATCH_GLOOM") || env_flag("RX_GUARD_GLOOM");
     nvn_gloom_watch_draw = gloom_watch && prog->has_fs && prog->fs.key == 0x18454ee069e36783ull;
     struct DumpDrawReset {
         ~DumpDrawReset() { nvn_dump_draw_ub = false, nvn_gloom_watch_draw = false; }

@@ -7,7 +7,11 @@
    threads that exist when it is armed, and on the game's threads started after that (hos_watch_thread, from
    hos_thread_start), so HOS_WATCH_AFTER=0 sees the loading too. A memcpy / memmove of the game's into a watched
    address logs where the bytes came from; HOS_WATCH_FOLLOW=1 then watches those source bytes too (free slots
-   only). Needs the PDB next to the exe for names. */
+   only). Needs the PDB next to the exe for names.
+
+   hos_guard_arm(guest, len, why): every access to a whole range (up to 4), by any thread, through guard pages, each
+   logged with who made it, and the offset in the range (RX_GUARD_GLOOM: the Depths gloom maps). hos_scan_pieces:
+   where else in guest memory some bytes are (copies of data the game may keep), the first place found guarded. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +22,7 @@
 
 int hos_thread_handles(HANDLE *out, const char **names, int max);   /* hos_thread.c */
 uint8_t *hos_guest_base(void);                                      /* hos_main.c */
+uint64_t hos_guest_size(void);
 void hos_backtrace(void);                                           /* hos_prof.c */
 
 static struct { uint64_t guest; int len; char why[48]; } slot[4];
@@ -91,9 +96,90 @@ static const char *symbolize(DWORD64 pc, char *out, size_t cap) {
     return out;
 }
 
+/* Guard pages (hos_guard_arm): every access to a whole range, by any thread, through PAGE_GUARD. A hit is recorded
+   (by host code address, as breakpoints are: sites[].slot 4 + the range), the thread single-steps the access, and
+   the page is guarded again on the step. The first 400 hits are logged with the offset in the range, read or write,
+   the thread and hos_guard_context's note (the renderer's camera). A range stops being guarded after 20000 hits. */
+typedef struct { uint64_t guest, len; DWORD protect; char why[48]; volatile LONG hits; } Guard;
+static Guard guards[4];
+static volatile LONG nguards;
+static __declspec(thread) uintptr_t rearm_page;
+static __declspec(thread) int rearm_guard;
+void (*hos_guard_context)(char *out, size_t cap);
+static int guard_of(uintptr_t a, uint64_t *off) {
+    for (LONG i = 0; i < nguards && i < 4; i++) {
+        const uintptr_t h = (uintptr_t)(hos_guest_base() + guards[i].guest);
+        if (a >= h && a < h + guards[i].len) {
+            *off = a - h;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 static LONG CALLBACK handler(EXCEPTION_POINTERS *e) {
-    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code == STATUS_GUARD_PAGE_VIOLATION) {
+        const uintptr_t a = (uintptr_t)e->ExceptionRecord->ExceptionInformation[1];
+        uint64_t off = 0;
+        const int g = guard_of(a, &off);
+        if (g < 0) return EXCEPTION_CONTINUE_SEARCH;
+        CONTEXT *c = e->ContextRecord;
+        const DWORD64 rip = c->Rip;
+        HosThread *t = hos_self();
+        /* (the game's threads' hits count toward the limit; host threads', the renderer reading what it decodes,
+           are logged 16 times in all and never stop the guard) */
+        static volatile LONG host_lines;
+        const LONG n = t ? InterlockedIncrement(&guards[g].hits) : 0;
+        const int log_it = t ? 1 : InterlockedIncrement(&host_lines) <= 16;
+        InterlockedIncrement(&total_hits);
+        InterlockedIncrement(&new_hits);
+        Site *site = NULL;
+        AcquireSRWLockExclusive(&lock);
+        for (LONG i = 0; i < nsites && !site; i++)
+            if (sites[i].rip == rip && sites[i].slot == 4 + g) site = &sites[i];
+        if (!site && nsites < 256) {
+            site = &sites[nsites];
+            site->rip = rip;
+            site->slot = 4 + g;
+            InterlockedIncrement(&nsites);
+        }
+        ReleaseSRWLockExclusive(&lock);
+        if (site) InterlockedIncrement(&site->hits);
+        static volatile LONG lines;
+        static SRWLOCK sym_lock = SRWLOCK_INIT;   /* (dbghelp is not thread safe) */
+        if (log_it && InterlockedIncrement(&lines) <= 400) {
+            AcquireSRWLockExclusive(&sym_lock);
+            char name[300], note[160] = "";
+            if (hos_guard_context) hos_guard_context(note, sizeof note);
+            const ULONG_PTR rw = e->ExceptionRecord->ExceptionInformation[0];
+            hos_log("guard: %s +%#llx %s by %s on thread %s%s%s", guards[g].why, (unsigned long long)off,
+                    rw == 1 ? "written" : rw == 8 ? "executed" : "read", symbolize(rip, name, sizeof name),
+                    t ? hos_thread_name(t) : "(host)", *note ? ", " : "", note);
+            if (site && site->reported++ < 1) {
+                hos_log_flush();
+                hos_backtrace();
+            }
+            ReleaseSRWLockExclusive(&sym_lock);
+        }
+        if (n < 20000) {   /* (guarded again after this one instruction) */
+            rearm_page = a & ~(uintptr_t)0xFFF;
+            rearm_guard = g;
+            c->EFlags |= 0x100;
+        } else if (n == 20000) {
+            hos_log("guard: %s: 20000 hits, no longer guarded", guards[g].why);
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT *c = e->ContextRecord;
+    if (rearm_page) {   /* (the step after a guard hit) */
+        DWORD old;
+        VirtualProtect((void *)rearm_page, 0x1000, guards[rearm_guard].protect | PAGE_GUARD, &old);
+        rearm_page = 0;
+        c->EFlags &= ~(DWORD)0x100;
+        if (!(c->Dr6 & 0xF)) return EXCEPTION_CONTINUE_EXECUTION;
+    }
     const DWORD64 hit = c->Dr6 & 0xF;
     if (!hit) return EXCEPTION_CONTINUE_SEARCH;
     c->Dr6 = 0;
@@ -187,6 +273,130 @@ void hos_watch_arm(uint64_t guest, int len, const char *why) {
     hos_log("watch: %s at guest %#llx (%d bytes)", why, (unsigned long long)guest, len);
     /* (from another thread: a thread cannot set its own context while it runs) */
     HANDLE h = CreateThread(NULL, 0, arm_main, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+
+/* Every access to [guest, guest + len) from now on, by any thread (guard pages: the handler above). Up to 4 ranges;
+   the same range again is ignored. */
+void hos_guard_arm(uint64_t guest, uint64_t len, const char *why) {
+    static int started;
+    const uint64_t lo = guest & ~0xFFFull, hi = (guest + len + 0xFFF) & ~0xFFFull;
+    MEMORY_BASIC_INFORMATION mi;
+    if (!VirtualQuery(hos_guest_base() + lo, &mi, sizeof mi) || mi.State != MEM_COMMIT) {
+        hos_log("guard: %s at guest %#llx: not committed memory, not guarded", why, (unsigned long long)guest);
+        return;
+    }
+    AcquireSRWLockExclusive(&lock);
+    for (LONG i = 0; i < nguards && i < 4; i++)
+        if (guards[i].guest == lo && guards[i].len == hi - lo) {
+            ReleaseSRWLockExclusive(&lock);
+            return;
+        }
+    if (nguards >= 4) {
+        ReleaseSRWLockExclusive(&lock);
+        hos_log("guard: all 4 ranges in use; %s not guarded", why);
+        return;
+    }
+    Guard *g = &guards[nguards];
+    g->guest = lo, g->len = hi - lo, g->protect = mi.Protect & 0xFF, g->hits = 0;
+    snprintf(g->why, sizeof g->why, "%s", why);
+    InterlockedIncrement(&nguards);
+    ReleaseSRWLockExclusive(&lock);
+    if (!started) {
+        started = 1;
+        AddVectoredExceptionHandler(1, handler);
+        CreateThread(NULL, 0, summary_main, NULL, 0, NULL);
+    }
+    DWORD old;
+    const BOOL ok = VirtualProtect(hos_guest_base() + lo, (SIZE_T)(hi - lo), g->protect | PAGE_GUARD, &old);
+    hos_log("guard: %s at guest %#llx..%#llx%s", why, (unsigned long long)lo, (unsigned long long)hi,
+            ok ? "" : " (VirtualProtect failed: not guarded)");
+}
+
+/* Where else in guest memory n pieces of `len` bytes are (copies of some data the game may keep for itself), after
+   delay_s seconds, on a thread of its own: each piece is found by an 8-byte anchor at a 16-byte aligned offset in it
+   (the first one whose bytes are not all alike), every 16-byte aligned place of committed, readable memory compared
+   (read with ReadProcessMemory 4 MB at a time, so memory freed meanwhile is no fault), [skip, skip + skip_len) left out.
+   Each place found is logged; the first one is guarded (2 MB from its 64 KB, hos_guard_arm) as guard_why. */
+typedef struct { uint8_t *bytes; uint32_t len, anchor; uint64_t anchor_value; char name[64]; } Piece;
+typedef struct { Piece *p; int n; uint64_t skip, skip_len; int delay_s; char why[48]; } Scan;
+static DWORD WINAPI scan_main(void *arg) {
+    Scan *s = (Scan *)arg;
+    Sleep((DWORD)s->delay_s * 1000);
+    const int64_t t0 = hos_now_ns();
+    uint8_t *base = hos_guest_base();
+    uint64_t space = hos_guest_size();
+    if (space > (1ull << 33)) space = 1ull << 33;
+    enum { CHUNK = 4 << 20, OVERLAP = 4096 };
+    uint8_t *buf = (uint8_t *)malloc(CHUNK + OVERLAP);
+    int found = 0;
+    uint64_t guarded = 0, scanned = 0;
+    for (uint64_t at = 0x10000; buf && at < space;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(base + at, &mi, sizeof mi)) break;
+        const uint64_t lo = (uint64_t)((uint8_t *)mi.BaseAddress - base), hi = lo + mi.RegionSize;
+        at = hi;
+        const DWORD p = mi.Protect;
+        if (mi.State != MEM_COMMIT || (p & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            !(p & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+            continue;
+        for (uint64_t c = lo; c < hi; c += CHUNK) {
+            const uint64_t want = hi - c < CHUNK + OVERLAP ? hi - c : CHUNK + OVERLAP;
+            if (c < s->skip + s->skip_len && s->skip < c + want) continue;
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), base + c, buf, (SIZE_T)want, &got) || got < 16) continue;
+            scanned += got;
+            for (uint64_t o = 0; o + 8 <= got && o < CHUNK; o += 16) {
+                uint64_t v;
+                memcpy(&v, buf + o, 8);
+                for (int k = 0; k < s->n; k++) {
+                    const Piece *pc = &s->p[k];
+                    if (v != pc->anchor_value || o < pc->anchor) continue;
+                    const uint64_t start = o - pc->anchor;
+                    if (start + pc->len > got || memcmp(buf + start, pc->bytes, pc->len)) continue;
+                    const uint64_t g = c + start;
+                    if (found++ < 64)
+                        hos_log("scan: %s found at guest %#llx (region %#llx..%#llx, protect %#lx)", pc->name,
+                                (unsigned long long)g, (unsigned long long)lo, (unsigned long long)hi, (unsigned long)p);
+                    if (!guarded) {
+                        guarded = g & ~0xFFFFull;
+                        hos_guard_arm(guarded, 2u << 20, s->why);
+                    }
+                }
+            }
+        }
+    }
+    hos_log("scan: %d places hold the %d pieces looked for; %llu MB scanned in %.1f s", found, s->n,
+            (unsigned long long)(scanned >> 20), (double)(hos_now_ns() - t0) / 1e9);
+    free(buf);
+    for (int k = 0; k < s->n; k++) free(s->p[k].bytes);
+    free(s->p);
+    free(s);
+    return 0;
+}
+void hos_scan_pieces(const uint8_t *const *pieces, const char *const *names, int n, uint32_t len, uint64_t skip,
+                     uint64_t skip_len, int delay_s, const char *guard_why) {
+    Scan *s = (Scan *)calloc(1, sizeof *s);
+    s->p = (Piece *)calloc((size_t)(n > 0 ? n : 1), sizeof *s->p);
+    for (int i = 0; i < n; i++) {
+        Piece *pc = &s->p[s->n];
+        int ok = 0;
+        for (uint32_t a = 0; a + 8 <= len && !ok; a += 16) {
+            int varied = 0;
+            for (int j = 1; j < 8 && !varied; j++) varied = pieces[i][a + j] != pieces[i][a];
+            if (varied) pc->anchor = a, memcpy(&pc->anchor_value, pieces[i] + a, 8), ok = 1;
+        }
+        if (!ok) continue;   /* (all alike: it would be found everywhere) */
+        pc->bytes = (uint8_t *)malloc(len);
+        memcpy(pc->bytes, pieces[i], len);
+        pc->len = len;
+        snprintf(pc->name, sizeof pc->name, "%s", names[i]);
+        s->n++;
+    }
+    s->skip = skip, s->skip_len = skip_len, s->delay_s = delay_s;
+    snprintf(s->why, sizeof s->why, "%s", guard_why);
+    hos_log("scan: looking for %d pieces of %u bytes in %d s", s->n, len, delay_s);
+    HANDLE h = CreateThread(NULL, 0, scan_main, s, 0, NULL);
     if (h) CloseHandle(h);
 }
 
