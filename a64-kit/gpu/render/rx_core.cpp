@@ -1127,6 +1127,10 @@ std::array<uint8_t, 0x1000> method_table() {
 } // namespace
 /// (rx_fsr2.cpp: the clears still waiting, done now, before it draws into a target itself)
 void flush_clears_now() { flush_pending_clears(); }
+/// (rx_ssr.cpp: a target drawn outside the game's passes gets a new version, as a pass would give it)
+void bump_image_version(Image* im) {
+    if (im) im->version = ++image_versions;
+}
 
 WGPUShaderModule program_module(const WGPUShaderModuleDescriptor* d) {
 #if !RX_WEB

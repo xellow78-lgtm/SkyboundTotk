@@ -4515,6 +4515,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         watch_outcome.skipped = "replaced by the upscaler";
         return;
     }
+    ssr_on_draw(at, prog->vs.key, prog->has_fs ? prog->fs.key : 0);   // (rx_ssr.cpp: water reflections)
     // RX_DUMP_DRAW (debugging): before anything of this draw is in the batch
     nvn_dump_draw_ub = frame_dump_active() && dump_draw_wanted(prog);
     static const bool gloom_watch = env_flag("RX_WATCH_GLOOM") || env_flag("RX_GUARD_GLOOM");
@@ -5155,6 +5156,11 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
                 wgpuTextureAddRef(m->tex);   // (FSR 2's reactive mask: the G-buffer's object channel)
                 if (scene_mask) wgpuTextureRelease(scene_mask);
                 scene_mask = m->tex;
+            }
+            if (Image* nm = at.color[3]; nm && nm->tex && nm->format == WGPUTextureFormat_RGBA8Unorm && nm->tex != scene_normal) {
+                wgpuTextureAddRef(nm->tex);   // (the water reflections' ripples: the G-buffer's normals, rx_ssr.cpp)
+                if (scene_normal) wgpuTextureRelease(scene_normal);
+                scene_normal = nm->tex;
             }
             if (at.depth && at.depth->tex && at.depth->tex != scene_depth) {
                 wgpuTextureAddRef(at.depth->tex);

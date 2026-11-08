@@ -152,11 +152,11 @@ void hos_bind_defaults(Bindings *b) {
     b->dlss_preset = 0;
     b->shadow_res = 0;
     b->shadow_dist = 0;
-    b->reflection_quality = 0;
+    b->water_reflections = 0;
 }
 
 volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting, hos_fps_limit = 60, hos_fps_counter, hos_frame_timing,
-             hos_dlss_preset;
+             hos_dlss_preset, hos_water_reflections;
 static void apply_graphics(const Bindings *b) {
     hos_aniso_level = b->aniso;
     hos_reflex_mode = b->reflex;
@@ -165,6 +165,7 @@ static void apply_graphics(const Bindings *b) {
     hos_fps_counter = b->fps_counter;
     hos_frame_timing = b->frame_timing;
     hos_dlss_preset = b->dlss_preset;
+    hos_water_reflections = b->water_reflections;
 }
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -221,7 +222,8 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "dlss_preset")) { b->dlss_preset = atoi(v); continue; }
         if (!_stricmp(k, "shadow_resolution")) { b->shadow_res = atoi(v); continue; }
         if (!_stricmp(k, "shadow_distance")) { b->shadow_dist = atoi(v); continue; }
-        if (!_stricmp(k, "reflection_quality")) { b->reflection_quality = atoi(v); continue; }
+        if (!_stricmp(k, "water_reflections")) { b->water_reflections = atoi(v); continue; }
+        if (!_stricmp(k, "reflection_quality")) continue;   /* (an earlier setting: it changed nothing in the field) */
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -254,7 +256,7 @@ static void load(Bindings *b) {
     if (b->dlss_preset < 0 || b->dlss_preset > 4) b->dlss_preset = 0;
     if (b->shadow_res < 0 || b->shadow_res > 3) b->shadow_res = 0;
     if (b->shadow_dist < 0 || b->shadow_dist > 3) b->shadow_dist = 0;
-    if (b->reflection_quality < 0 || b->reflection_quality > 2) b->reflection_quality = 0;
+    if (b->water_reflections < 0 || b->water_reflections > 2) b->water_reflections = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -293,10 +295,10 @@ static void save(const Bindings *b) {
                "# 2 1536, 3 2048 (sharper, steadier shadows; more video memory)\nshadow_resolution = %d\n"
                "# how far the sharp shadows reach, at the next start: 0 the game's own (20 / 40 / 80 / 160 m), 1 x1.5,\n"
                "# 2 x2, 3 x3 (each cascade spread over more ground: raise shadow_resolution with it)\nshadow_distance = %d\n"
-               "# the reflection buffer (water, shiny surfaces), at the next start: 0 the game's own, 1 x1.5, 2 x2 on each\n"
-               "# side (at most the 3D scene's size)\nreflection_quality = %d\n\n",
+               "# reflections of the world on the water (screen space: only what is on screen): 0 off, 1 natural (with the\n"
+               "# ripples), 2 clear\nwater_reflections = %d\n\n",
                b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit, b->fps_counter, b->aspect,
-               b->frame_timing, b->dlss_preset, b->shadow_res, b->shadow_dist, b->reflection_quality);
+               b->frame_timing, b->dlss_preset, b->shadow_res, b->shadow_dist, b->water_reflections);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)

@@ -46,8 +46,8 @@ typedef struct {
                                               (up to 960, smaller near the ground), 1 1024, 2 1536, 3 2048 */
     int shadow_dist;                       /* how far the sharp shadow cascades reach (totk_shadows.c, at the start):
                                               0 the game's own (20 / 40 / 80 / 160 m), 1 x1.5, 2 x2, 3 x3 */
-    int reflection_quality;                /* the reflection buffer (totk_reflections.c, at the start): 0 the game's
-                                              own, 1 x1.5, 2 x2 on each side (at most the scene's size) */
+    int water_reflections;                 /* screen-space reflections on the water (rx_ssr.cpp, live): 0 off,
+                                              1 natural (with the ripples), 2 clear */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */
@@ -58,6 +58,7 @@ extern volatile int hos_fps_limit;              /* Bindings.fps_limit */
 extern volatile int hos_fps_counter;            /* Bindings.fps_counter */
 extern volatile int hos_frame_timing;           /* Bindings.frame_timing */
 extern volatile int hos_dlss_preset;            /* Bindings.dlss_preset */
+extern volatile int hos_water_reflections;      /* Bindings.water_reflections */
 
 /* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
 int hos_render_mode_count(void);

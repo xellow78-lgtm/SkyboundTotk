@@ -67,7 +67,7 @@ struct Row {
 const char* const kAnisoNames[5] = {"Game's own", "2x", "4x", "8x", "16x"};
 const char* const kShadowResNames[4] = {"Game's own", "1024", "1536", "2048"};   // (input.ini shadow_resolution)
 const char* const kShadowDistNames[4] = {"Game's own", "x1.5", "x2", "x3"};     // (input.ini shadow_distance)
-const char* const kReflectionNames[3] = {"Game's own", "x1.5", "x2"};           // (input.ini reflection_quality)
+const char* const kWaterNames[3] = {"Off", "Natural", "Clear"};                  // (input.ini water_reflections)
 const char* const kReflexNames[3] = {"Off", "On", "On + Boost"};
 const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 200, 0};   // (200 at most: nn_vi.c FPS_MAX)
 const char* const kFpsNames[8] = {"30", "60", "90", "120", "144", "165", "200", "Display's rate"};
@@ -141,9 +141,9 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
         add(kOption, kShadowDist, "Shadow distance", kShadowDistNames[std::clamp(b.shadow_dist, 0, 3)],
             b.shadow_dist ? "At the next start. Sharp shadows further out; raise Shadow resolution with it."
                           : "At the next start. Sharp shadows to 20 m, softer in steps to 160 m.");
-        add(kOption, kReflections, "Reflection quality", kReflectionNames[std::clamp(b.reflection_quality, 0, 2)],
-            b.reflection_quality ? "At the next start. Sharper reflections on water and shiny floors; costs GPU time."
-                                 : "At the next start. The size of the reflections on water and shiny floors.");
+        add(kOption, kReflections, "Water reflections", kWaterNames[std::clamp(b.water_reflections, 0, 2)],
+            b.water_reflections ? "The world mirrored on the water: only what is on screen. Clear: fewer ripples."
+                                : "Mirrors what is on screen in the water (screen-space reflections).");
         Row& rf = add(kOption, kReflex, "NVIDIA Reflex", kReflexNames[std::clamp(b.reflex, 0, 2)],
                       reflex_available() ? "Less input lag. Boost also keeps the GPU's clocks up."
                                          : "Needs an NVIDIA GPU on Vulkan.");
@@ -283,7 +283,7 @@ void change(State& s, const Row& r, int dir) {
     case kAniso: b.aniso = (b.aniso + dir + 5) % 5; break;
     case kShadowRes: b.shadow_res = (b.shadow_res + dir + 4) % 4; break;
     case kShadowDist: b.shadow_dist = (b.shadow_dist + dir + 4) % 4; break;
-    case kReflections: b.reflection_quality = (b.reflection_quality + dir + 3) % 3; break;
+    case kReflections: b.water_reflections = (b.water_reflections + dir + 3) % 3; break;
     case kReflex: b.reflex = (b.reflex + dir + 3) % 3; break;
     case kFps: b.fps_limit = kFpsValues[(fps_index(b.fps_limit) + dir + 8) % 8]; break;
     case kOutRes: b.output_res = (b.output_res + dir + 4) % 4; break;
@@ -330,7 +330,7 @@ void reset_controls(State& s) {
     d.render_mode = b.render_mode, d.aniso = b.aniso, d.reflex = b.reflex;   // (the graphics settings: kept)
     d.button_icons = b.button_icons, d.output_res = b.output_res, d.fps_limit = b.fps_limit;
     d.fps_counter = b.fps_counter, d.aspect = b.aspect, d.frame_timing = b.frame_timing, d.dlss_preset = b.dlss_preset;
-    d.shadow_res = b.shadow_res, d.shadow_dist = b.shadow_dist, d.reflection_quality = b.reflection_quality;
+    d.shadow_res = b.shadow_res, d.shadow_dist = b.shadow_dist, d.water_reflections = b.water_reflections;
     hos_bind_set(&d);
     set_status(s, "Controls and mouse settings are back to the defaults.");
 }

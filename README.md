@@ -90,8 +90,11 @@ No game files are included. You need your own dump of the game (see [Game files]
   2048 instead of the game's own (up to 960, and smaller near the ground, which makes leaf shadows blocky and jumpy),
   and the sharp shadow cascades reaching x1.5, x2 or x3 as far as the game's 20 / 40 / 80 / 160 m. Adapted from
   totk-pc-recomp (MIT).
-- **Reflection quality** (new, 1.4.3, at the next start): the game's reflection buffer (water, shiny floors) x1.5
-  or x2 on each side, at most the 3D scene's size.
+- **Water reflections** (new, live): the world mirrored on the water. The game's own water shows a glow under a lit
+  pillar but no mirror image of it (Zora's Domain). Screen-space reflections drawn into the lit scene after the
+  game's lighting: each water pixel's reflected ray is traced through the depth buffer and mixed in by Fresnel.
+  Natural keeps the water's ripples in the reflection, Clear fewer of them. Only what is on screen can be reflected:
+  reflections fade at the picture's edges, and Link's reflection shows his back.
 - **Colour textures compressed on the GPU:** ASTC textures are decoded on the GPU and re-encoded to BC7, a quarter
   of the video memory of RGBA8.
 - **VRAM management:** unused textures and render targets are given back near Windows' video memory budget (this
@@ -155,7 +158,7 @@ No game files are included. You need your own dump of the game (see [Game files]
   rebuilds only what changed. Your game files, saves and mods are not touched.
 - **Settings:** upscaler, sharpness, display mode, window size, VSync, output resolution, aspect ratio, 3D
   resolution, DLSS model, frame rate limit, frame timing, FPS counter, anisotropic filtering, shadow resolution and
-  distance, reflection quality, Reflex, button icons,
+  distance, water reflections, Reflex, button icons,
   mouse camera and sensitivity, mods folder, save folder, log file.
 - **Save folder:** pick a folder that OneDrive or Google Drive syncs to share saves between PCs. The first time, the
   install's saves are copied into it (the originals stay), unless it already has saves, which are then used.

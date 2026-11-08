@@ -434,6 +434,10 @@ extern SceneCamera scene_camera, scene_camera_prev;
 extern WGPUTexture scene_depth;         // the G-buffer's depth (a reference held), for the motion vectors
 extern WGPUTexture scene_color;         // its HDR colour target (rx_fsr2.cpp)
 extern WGPUTexture scene_mask;          // its object channel target (rx_fsr2.cpp)
+extern WGPUTexture scene_normal;        // its normal target (rx_ssr.cpp)
+/// Water reflections (rx_ssr.cpp): each NVN draw, before it is recorded; after the game's lighting pass it draws
+/// screen-space reflections on the water into the lit scene.
+void ssr_on_draw(const Attachments& at, uint64_t vs_key, uint64_t fs_key);
 /// FSR 2 (rx_fsr2.cpp): the 3D draws' jitter; the game's scale-up draw replaced (true: skip it)
 bool fsr2_jitter(uint32_t w, uint32_t h, float* ndc_x, float* ndc_y);
 /// The motion vectors FSR 2 / DLSS made for the latest frame (rx_fsr2.cpp), for frame interpolation: the camera's motion
