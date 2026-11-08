@@ -3377,6 +3377,105 @@ void nvn_dump_draw_storage(const NvnState& s, const ProgramPair* prog) {
 bool nvn_watched_draw;
 uint64_t nvn_watched_fs;
 const Image* nvn_watched_tex[32];   // (a watched draw's pixel-stage textures that are render targets: RX_WATCH_COVER)
+uint64_t nvn_watched_vs_ssbo;       // (its vertex stage's first storage buffer: RX_WATCH_TILES)
+/* RX_WATCH_TILES=1 (debugging the Depths' gloom flickering; light, no frame dump): after each gloom composite
+   (fs ce51f5ea116fe892), the gloom pass's output (its texture 2) and the tile flags the composite's vertex program read
+   (its storage buffer + 448, 16 bytes a tile, the word at +8: 1 = drawn), copied in command order and read back after
+   the batch without waiting. The pass writes a tile's flags in the same invocation as a pixel with gloom (red above
+   zero), so a tile with gloom in the output and no flag is gloom the composite drops (rx-tiles, up to 20000 lines).
+   Tiles: 64 scene pixels square, 32 of the half-size output. */
+void watch_tiles_after_composite(const Image* gloom, uint64_t flags_va) {
+    static int lines;
+    if (!gloom || !gloom->tex || !flags_va || lines >= 20000) return;
+    if (gloom->format != WGPUTextureFormat_RGBA8Unorm && gloom->format != WGPUTextureFormat_RGBA8UnormSrgb) return;
+    const uint32_t w = gloom->width, h = gloom->height, cols = (w + 31) / 32, rows = (h + 31) / 32;
+    const uint64_t fsize = (uint64_t)cols * rows * 16;
+    const BufferRef ref = guest_buffer(flags_va, fsize);
+    if (!ref.buffer || ref.offset % 4) return;
+    lines++;
+    end_render_pass("pe_watch_tiles");
+    const uint32_t stride = (w * 4 + 255) & ~255u;
+    WGPUBufferDescriptor bd{};
+    bd.label = sv("rx watch tiles");
+    bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+    bd.size = (uint64_t)stride * h;
+    WGPUBuffer img = wgpuDeviceCreateBuffer(dev.device, &bd);
+    bd.size = fsize;
+    WGPUBuffer flags = wgpuDeviceCreateBuffer(dev.device, &bd);
+    if (!img || !flags) {
+        if (img) wgpuBufferRelease(img);
+        if (flags) wgpuBufferRelease(flags);
+        return;
+    }
+    WGPUTexelCopyTextureInfo src{};
+    src.texture = gloom->tex;
+    src.aspect = WGPUTextureAspect_All;
+    WGPUTexelCopyBufferInfo dst{};
+    dst.buffer = img;
+    dst.layout.bytesPerRow = stride;
+    dst.layout.rowsPerImage = h;
+    const WGPUExtent3D extent{w, h, 1};
+    ce_copy_texture_to_buffer(encoder(), &src, &dst, &extent);
+    ce_copy_buffer_to_buffer(encoder(), ref.buffer, ref.offset, flags, 0, fsize);
+    struct Pending {
+        WGPUBuffer img, flags;
+        uint64_t img_size, flags_size;
+        uint32_t stride, w, h, cols, rows;
+        int64_t frame;
+        std::atomic<int> left{2};
+        std::atomic<bool> ok{true};
+    };
+    auto* p = new Pending{img, flags, (uint64_t)stride * h, fsize, stride, w, h, cols, rows, frame_number};
+    after_this_batch([p](bool submitted) {
+        if (!submitted) {
+            wgpuBufferRelease(p->img);
+            wgpuBufferRelease(p->flags);
+            delete p;
+            return;
+        }
+        auto done = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+            auto* p = static_cast<Pending*>(u1);
+            if (status != WGPUMapAsyncStatus_Success) p->ok = false;
+            if (--p->left) return;
+            if (p->ok) {
+                const auto* px = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(p->img, 0, p->img_size));
+                const auto* fl = static_cast<const uint32_t*>(wgpuBufferGetConstMappedRange(p->flags, 0, p->flags_size));
+                const uint32_t n = p->cols * p->rows;
+                std::vector<uint8_t> gloom(n, 0);
+                for (uint32_t y = 0; px && y < p->h; y++)
+                    for (uint32_t x = 0; x < p->w; x++)
+                        if (px[(size_t)y * p->stride + (size_t)x * 4]) gloom[(y / 32) * p->cols + x / 32] = 1;
+                uint32_t with = 0, flagged = 0, dropped = 0, extra = 0, first = ~0u;
+                for (uint32_t t = 0; fl && t < n; t++) {
+                    const bool f = fl[t * 4 + 2] == 1;
+                    with += gloom[t], flagged += f;
+                    if (gloom[t] && !f) {
+                        if (!dropped) first = t;
+                        dropped++;
+                    }
+                    extra += f && !gloom[t];
+                }
+                char where[48] = "";
+                if (dropped) std::snprintf(where, sizeof where, " (first tile %u: column %u, row %u)", first, first % p->cols,
+                                           first / p->cols);
+                hos_log("rx-tiles: frame %lld: %u tiles: %u with gloom in the pass's output, %u flagged; %u with gloom "
+                        "not flagged (dropped by the composite)%s, %u flagged without", (long long)p->frame, n, with,
+                        flagged, dropped, where, extra);
+                wgpuBufferUnmap(p->img);
+                wgpuBufferUnmap(p->flags);
+            }
+            wgpuBufferRelease(p->img);
+            wgpuBufferRelease(p->flags);
+            delete p;
+        };
+        WGPUBufferMapCallbackInfo mc{};
+        mc.mode = WGPUCallbackMode_AllowSpontaneous;
+        mc.callback = done;
+        mc.userdata1 = p;
+        wgpuBufferMapAsync(p->img, WGPUMapMode_Read, 0, p->img_size, mc);
+        wgpuBufferMapAsync(p->flags, WGPUMapMode_Read, 0, p->flags_size, mc);
+    });
+}
 /* RX_WATCH_COVER=<pixel program hex>:<b|a>:<c|t><slot>[s][;...] (debugging): at each draw of that program, before
    (b) or after (a) it, the coverage of its color target <slot> (c) or of the render target its pixel texture <slot>
    samples (t; measured after the draw, which does not change it), all of it or a strip (s): watch_cover, rx_debug.cpp.
@@ -3689,6 +3788,7 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
                           (int)(raw_va && gpu_written(raw_va, raw_size ? raw_size : 16)));
             dump_draw(line);
         }
+        if (nvn_watched_draw && stage == 0 && &d == &info.storage_buffers_descriptors.front()) nvn_watched_vs_ssbo = raw_va;
         const StorageBinding sb = draw_storage(raw_va ? va : 0, size, writable);
         if (!sb.ok) {
             out.ok = false;
@@ -4291,6 +4391,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         for (int i = 0; i < 8; i++) watch_binding(-1, (uint32_t)i, at.color[i], nullptr);   // (its targets)
         watch_binding(-1, 8, at.depth, nullptr);
         std::fill(std::begin(nvn_watched_tex), std::end(nvn_watched_tex), nullptr);
+        nvn_watched_vs_ssbo = 0;
         if (!cover_specs().empty()) watch_cover_draw(false, at);   // (RX_WATCH_COVER: before it)
     }
     if (prog->has_fs) watch_flags_draw(prog->fs.key);   // (RX_WATCH_FLAGS)
@@ -5161,6 +5262,8 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     st_draws++;
     count("draws");
     if (nvn_watched_draw && !cover_specs().empty()) watch_cover_draw(true, at);   // (RX_WATCH_COVER: after it)
+    if (static const bool tiles = env_flag("RX_WATCH_TILES"); tiles && nvn_watched_draw && prog->fs.key == 0xce51f5ea116fe892ull)
+        watch_tiles_after_composite(nvn_watched_tex[2], nvn_watched_vs_ssbo ? nvn_watched_vs_ssbo + 448 : 0);
 }
 
 } // namespace rx
