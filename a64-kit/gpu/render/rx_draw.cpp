@@ -3366,6 +3366,98 @@ void nvn_dump_draw_storage(const NvnState& s, const ProgramPair* prog) {
     }
 }
 
+/* RX_WATCH_FS's programs (debugging the Depths' gloom flickering off for whole frames): a uniform buffer the draw's
+   block takes from guest memory while the GPU holds newer contents (a dispatch or a GPU copy wrote it). Guest memory
+   gets those by readback, after the batch and only the words that batch changed, so a draw can read an older or a
+   half-updated state (a dispatch that zeroes fields at the frame's start and one that refills them: zeros), and a
+   frame dump, which waits for the GPU, never shows it. Logged where (rx-watch), and for up to 3000 draws whether guest
+   memory's bytes differ from the GPU's at the draw (rx-ub); RX_UB_FROM_GPU=1: that part of the block is copied from
+   the buffer cache on the GPU, in command order, so the draw reads what the GPU holds. True when it was. */
+bool nvn_watched_draw;
+namespace {
+bool watch_ub_bank(const NvnState& s, int stage, uint32_t index, const uint8_t* cpu, uint64_t dst, uint64_t size) {
+    if (index < 3 || index >= 3 + 16) return false;
+    const nvn_p_bind_buf& u = s.ubo[stage][index - 3];
+    const uint64_t n = std::min<uint64_t>(size, nvn_ubo_size(u.size)) & ~3ull;
+    if (!u.addr || !n || n > 0x10000 || !buffer_cache_active() || !gpu_written(u.addr, n)) return false;
+    count("watch_ub_gpu_newer");
+    static const bool patch = env_flag("RX_UB_FROM_GPU");
+    log_limited("watch_ub", 60, "rx-watch: frame %lld: a %s program reads uniform buffer %u at %llx+%llx from guest "
+                "memory while the GPU holds newer contents%s", (long long)frame_number, stage ? "pixel" : "vertex",
+                index - 3, (unsigned long long)u.addr, (unsigned long long)n,
+                patch ? " (copied from the GPU: RX_UB_FROM_GPU)" : "");
+    const BufferRef c = guest_buffer(u.addr, n);
+    if (!c.buffer || c.offset % 4) return false;
+    end_render_pass("pe_watch_ub");
+    static std::atomic<int> compares{0};
+    if (compares.fetch_add(1) < 3000) {   // (guest memory's bytes now against the GPU's at this point)
+        WGPUBufferDescriptor bd{};
+        bd.label = sv("rx watch ub");
+        bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+        bd.size = n;
+        if (WGPUBuffer staging = wgpuDeviceCreateBuffer(dev.device, &bd)) {
+            ce_copy_buffer_to_buffer(encoder(), c.buffer, c.offset, staging, 0, n);
+            struct Pending {
+                WGPUBuffer buffer;
+                std::vector<uint32_t> cpu;
+                int64_t frame;
+                uint64_t addr;
+                int stage;
+                uint32_t index;
+            };
+            auto* p = new Pending{staging, std::vector<uint32_t>(n / 4), frame_number, u.addr, stage, index - 3};
+            std::memcpy(p->cpu.data(), cpu, n);
+            after_this_batch([p](bool submitted) {
+                if (!submitted) {
+                    wgpuBufferRelease(p->buffer);
+                    delete p;
+                    return;
+                }
+                WGPUBufferMapCallbackInfo mc{};
+                mc.mode = WGPUCallbackMode_AllowSpontaneous;
+                mc.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+                    auto* p = static_cast<Pending*>(u1);
+                    static std::atomic<int> done{0}, differed{0};
+                    if (status == WGPUMapAsyncStatus_Success) {
+                        const uint64_t bytes = p->cpu.size() * 4;
+                        const auto* g = static_cast<const uint32_t*>(wgpuBufferGetConstMappedRange(p->buffer, 0, bytes));
+                        uint32_t diff = 0, first = 0, zero_cpu = 0;
+                        for (size_t i = 0; g && i < p->cpu.size(); i++)
+                            if (p->cpu[i] != g[i]) {
+                                if (!diff) first = (uint32_t)i;
+                                diff++;
+                                zero_cpu += p->cpu[i] == 0;
+                            }
+                        const int k = done.fetch_add(1) + 1;
+                        if (diff) {
+                            const int m = differed.fetch_add(1) + 1;
+                            if (m <= 2000)
+                                hos_log("rx-ub: frame %lld: %s uniform buffer %u at %llx: %u of %zu words differ from the "
+                                        "GPU's (%u of them zero in guest memory; first +%x: guest %08x, GPU %08x)",
+                                        (long long)p->frame, p->stage ? "pixel" : "vertex", p->index,
+                                        (unsigned long long)p->addr, diff, p->cpu.size(), zero_cpu, first * 4,
+                                        p->cpu[first], g[first]);
+                        }
+                        if (k % 250 == 0)
+                            hos_log("rx-ub: %d draws compared, %d read guest memory that differed from the GPU", k,
+                                    differed.load());
+                        wgpuBufferUnmap(p->buffer);
+                    }
+                    wgpuBufferRelease(p->buffer);
+                    delete p;
+                };
+                mc.userdata1 = p;
+                wgpuBufferMapAsync(p->buffer, WGPUMapMode_Read, 0, p->cpu.size() * 4, mc);
+            });
+        }
+    }
+    if (!patch) return false;
+    ce_copy_buffer_to_buffer(encoder(), c.buffer, c.offset, stream_ro.buffer, dst, n);
+    count("ub_from_gpu", (int64_t)n);
+    return true;
+}
+} // namespace
+
 /// One stage's uniform block, constant / storage buffers and textures for an NVN draw (stage_resources' twin; the
 /// layout is the WGSL backend's)
 bool nvn_vs_storage_writable;   // (nvn_vs_compute: the vertex stage's stores are made, by a compute program)
@@ -3597,11 +3689,15 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
     }
     uint8_t* block = stream_ro.at(ub);
     std::memcpy(block, rescale, 64);
+    bool patched = false;   // (a part of the block copied on the GPU: not shared with another draw's equal bytes)
     for (const auto& d : info.constant_buffer_descriptors) {
         if (!in_ub[d.index % 18]) continue;
         const uint64_t size = (uint64_t)std::max(Common::DivCeil(info.constant_buffer_used_sizes[d.index], 16U), 1U) * 16;
         banks.read(s, stage, d.index, 0, block + (uint64_t)base[d.index % 18] * 16, size);
         count("up_cbuf", (int64_t)size);
+        if (nvn_watched_draw)   // (RX_WATCH_FS's programs)
+            patched |= watch_ub_bank(s, stage, d.index, block + (uint64_t)base[d.index % 18] * 16,
+                                     ub + (uint64_t)base[d.index % 18] * 16, size);
     }
     if (!slot_bytes.empty()) std::memcpy(block + 64, slot_bytes.data(), slot_bytes.size());
     if (nvn_dump_vs_ub && stage == 0) dump_words("ub", 0, block, (uint64_t)ub_size * 16);
@@ -3611,7 +3707,7 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
     // less is uploaded: the browser's GPU process was the limit on the web. RX_NO_UB_DEDUPE=1 off)
     uint64_t bound = ub;
     static const bool no_dedupe = env_flag("RX_NO_UB_DEDUPE");
-    if (!no_dedupe) {
+    if (!no_dedupe && !patched) {
         // (a direct-mapped table tagged with the batch: no allocation per block and nothing to clear; a slot taken
         // by another block only misses a dedupe. An unordered_map's node per block was ~3% of the replay thread)
         struct Same { uint64_t h = 0, ub = 0; int64_t batch = -1; };
@@ -4083,9 +4179,10 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     }
     ProgramPair* prog = nvn_programs(s, out_types);
     if (!prog) return skip("programs");
+    nvn_watched_draw = false;
     if (!watch_fs().empty() && prog->has_fs)
         for (WatchFs& x : watch_fs())
-            if (x.key == prog->fs.key) watch_outcome.w = &x, watch_outcome.instances = d.instances;
+            if (x.key == prog->fs.key) watch_outcome.w = &x, watch_outcome.instances = d.instances, nvn_watched_draw = true;
     if (prog->has_fs) watch_flags_draw(prog->fs.key);   // (RX_WATCH_FLAGS)
     if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) {   // (rx_fsr2.cpp)
         watch_outcome.skipped = "replaced by the upscaler";
