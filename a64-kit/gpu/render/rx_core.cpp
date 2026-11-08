@@ -2766,6 +2766,7 @@ void present_on_submit_thread(WGPUTextureView view, uint32_t sw, uint32_t sh, LO
     // frame interpolation (F7): the frame and the ones made between it and the last go to the display thread, with the
     // camera's motion of this frame (taken when it was queued: the render thread may have recorded the next by now)
     if (view && !debug_present && present_framegen() && framegen_frame(view, sw, sh, ww, wh, sm)) return;
+    if (!present_framegen()) framegen_idle();
     if (sm.mv) wgpuTextureViewRelease(sm.mv);
     if (sm.mask) wgpuTextureViewRelease(sm.mask);
     surface_present(view, sw, sh, ww, wh, debug_present);

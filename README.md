@@ -199,6 +199,7 @@ are less tested.
 | Weapon and shield wheel background | **Reported** | Can be black instead of blurred. |
 | Zonai Portable Pot particles | **Workaround** | Disappearing-effect spikes greatly reduced; short stray lines remain. |
 | Fused-weapon inventory icons | **Workaround** | Icons rendered transparent; a cache workaround redraws them. |
+| Over the VRAM budget | **Open** | On an 8 GB card at 2560x1600 with frame generation, reflections and higher shadows, a busy place (Kakariko Village) went over Windows' budget for the game (~6.5 GB of 8 GB with other programs open): textures moved to system memory and the game's GPU time went from ~7 to 31-38 ms a frame (13-21 fps). Unused textures are given back near the budget, but there was little left to give. Close GPU-heavy programs (browsers, recorders), or lower the 3D resolution or turn frame generation off. |
 | Crashes | **Rare, open** | One crash on a loading screen (no log). Two GPU device losses, both with frame generation on and VSync off: after ~16 minutes at 3x, and on a loading screen at 2x while the window's surface kept going out of date (2026-11-08). Cause unknown; frame generation with VSync on has not crashed so far. |
 | Above ~63 fps | **Beta** | As in other ports: the camera can turn faster and Link may fail to climb steps. |
 | Above 200 fps | **Capped** | The game's own audio mix fades to silence at 230+ fps; the cause in the game isn't found yet, so 200 is the limit. |

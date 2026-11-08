@@ -88,48 +88,61 @@ const char* kFlowWgsl = R"(
 }
 )";
 
-// The same search with the new frame's search area in workgroup memory: each group of 8x8 vectors loads the
-// (36 + 2 RADIUS)^2 quarter-size texels its blocks can reach once, instead of every vector reading its 64 x (2 RADIUS
-// + 1)^2 from the texture (~18,500 texture reads a vector at RADIUS 8: ~300 M a frame at 2560x1600). Same texels, same
-// order, same costs: the same vectors (checked on lavapipe against kFlowWgsl). RADIUS up to 14 (16 KB of workgroup
-// memory); above, kFlowWgsl.
-const char* kFlowSharedWgsl = R"(
+// The same search, one workgroup of 64 a vector: its 8x8 patch and the (8 + 2 RADIUS)^2 texels the candidates reach
+// in workgroup memory, the (2 RADIUS + 1)^2 candidates split over the 64 threads, then the lowest cost (the first in
+// the old loop's order on a tie: the same vector). kFlowWgsl gave each vector one thread and its 289 candidates in a
+// row: 16,000 threads at 2560x1600, too few to keep the GPU busy, 5.7..6.5 ms a game frame on an RTX 3060 Ti
+// (RX_GPU_TIMING, run_launcher.log 2026-11-08 18:16; the search area in workgroup memory alone did not change that).
+// Checked on lavapipe: the same vectors as kFlowWgsl.
+const char* kFlowParWgsl = R"(
 @group(0) @binding(0) var la: texture_2d<f32>;
 @group(0) @binding(1) var lb: texture_2d<f32>;
 @group(0) @binding(2) var flow: texture_storage_2d<rgba16float, write>;
+const SIDE: i32 = 2 * RADIUS + 1;
+const N: i32 = SIDE * SIDE;
+const SPAN: i32 = 8 + 2 * RADIUS;
 var<workgroup> tile: array<f32, TILE>;
-@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g: vec3<u32>,
-                                       @builtin(workgroup_id) wg: vec3<u32>,
-                                       @builtin(local_invocation_index) li: u32) {
+var<workgroup> pa: array<f32, 64>;
+var<workgroup> costs: array<f32, 64>;
+var<workgroup> idxs: array<i32, 64>;
+@compute @workgroup_size(64) fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let fd = textureDimensions(flow);
   let lm = vec2<i32>(textureDimensions(la)) - vec2<i32>(1);
-  // the group's search area in the new frame, from its corner (texels clamped as the texture reads were)
-  let org = vec2<i32>(wg.xy) * 32 - vec2<i32>(2 + RADIUS);
-  for (var k = i32(li); k < SPAN * SPAN; k += 64) {
+  let c = vec2<i32>(wg.xy) * 4 + vec2<i32>(2);
+  let l = i32(li);
+  pa[l] = textureLoad(la, clamp(c + vec2<i32>(l % 8 - 4, l / 8 - 4), vec2<i32>(0), lm), 0).r;
+  let org = c - vec2<i32>(4 + RADIUS);
+  for (var k = l; k < SPAN * SPAN; k += 64) {
     tile[k] = textureLoad(lb, clamp(org + vec2<i32>(k % SPAN, k / SPAN), vec2<i32>(0), lm), 0).r;
   }
   workgroupBarrier();
-  if (g.x >= fd.x || g.y >= fd.y) { return; }
-  let c = vec2<i32>(g.xy) * 4 + vec2<i32>(2);
-  var pa: array<f32, 64>;
-  for (var i = 0; i < 64; i++) {
-    pa[i] = textureLoad(la, clamp(c + vec2<i32>(i % 8 - 4, i / 8 - 4), vec2<i32>(0), lm), 0).r;
-  }
-  let lc = c - org;
   var best = 1e9;
-  var bv = vec2<i32>(0);
-  for (var dy = -RADIUS; dy <= RADIUS; dy++) {
-    for (var dx = -RADIUS; dx <= RADIUS; dx++) {
-      var sad = 0.0;
-      for (var i = 0; i < 64; i++) {
-        let q = lc + vec2<i32>(i % 8 - 4 + dx, i / 8 - 4 + dy);
-        sad += abs(pa[i] - tile[q.y * SPAN + q.x]);
-      }
-      let cost = sad + 0.04 * f32(abs(dx) + abs(dy));
-      if (cost < best) { best = cost; bv = vec2<i32>(dx, dy); }
+  var bi = 0x7fffffff;
+  for (var n = l; n < N; n += 64) {
+    let dx = n % SIDE - RADIUS;
+    let dy = n / SIDE - RADIUS;
+    var sad = 0.0;
+    for (var i = 0; i < 64; i++) {
+      sad += abs(pa[i] - tile[(i / 8 + dy + RADIUS) * SPAN + (i % 8 + dx + RADIUS)]);
     }
+    let cost = sad + 0.04 * f32(abs(dx) + abs(dy));
+    if (cost < best) { best = cost; bi = n; }
   }
-  textureStore(flow, g.xy, vec4<f32>(vec2<f32>(bv) * 4.0, best / 64.0, 1.0));
+  costs[l] = best;
+  idxs[l] = bi;
+  workgroupBarrier();
+  for (var s = 32; s > 0; s = s >> 1u) {
+    if (l < s) {
+      let oc = costs[l + s];
+      let oi = idxs[l + s];
+      if (oc < costs[l] || (oc == costs[l] && oi < idxs[l])) { costs[l] = oc; idxs[l] = oi; }
+    }
+    workgroupBarrier();
+  }
+  if (l == 0 && wg.x < fd.x && wg.y < fd.y) {
+    let bv = vec2<i32>(idxs[0] % SIDE - RADIUS, idxs[0] / SIDE - RADIUS);
+    textureStore(flow, wg.xy, vec4<f32>(vec2<f32>(bv) * 4.0, costs[0] / 64.0, 1.0));
+  }
 }
 )";
 
@@ -265,6 +278,9 @@ struct State {
     bool init = false;
     uint32_t w = 0, h = 0;
     WGPUComputePipeline copy = nullptr, luma = nullptr, flow = nullptr, median = nullptr, synth = nullptr;
+    bool flow_par = true;   // (the search: a workgroup a vector, kFlowParWgsl)
+    int mult = 0;           // (the shown sets' frames: for this many frames shown a game frame)
+    int64_t off_since = 0;  // (frame interpolation off since: its textures released after a while)
     WGPUSampler sampler = nullptr;
     WGPUBuffer t_buf[kMaxMult] = {};
     Tex none;   // (1x1: the camera's motion and Link's mark when FSR 2 / DLSS do not run)
@@ -307,14 +323,14 @@ void init_pipelines() {
     {   // RX_FRAMEGEN_RADIUS=<quarter-size texels> searched each way (default 8: +-32 pixels)
         const char* e = getenv("RX_FRAMEGEN_RADIUS");
         const int r = e ? std::clamp(atoi(e), 1, 16) : 8;
-        // (RX_FRAMEGEN_SHARED_FLOW=0: the texture-read search, as before 2026-11-08)
-        const bool shared = r <= 14 && !(getenv("RX_FRAMEGEN_SHARED_FLOW") && *getenv("RX_FRAMEGEN_SHARED_FLOW") == '0');
-        const int span = 36 + 2 * r;
-        std::string src = std::string("const RADIUS: i32 = ") + std::to_string(r) + ";\nconst SPAN: i32 = " +
-                          std::to_string(span) + ";\nconst TILE: u32 = " + std::to_string(span * span) + "u;\n" +
-                          (shared ? kFlowSharedWgsl : kFlowWgsl);
+        // (RX_FRAMEGEN_FLOW=0: a thread a vector, as before 2026-11-08)
+        fg.flow_par = !(getenv("RX_FRAMEGEN_FLOW") && *getenv("RX_FRAMEGEN_FLOW") == '0');
+        const int span = 8 + 2 * r;
+        std::string src = std::string("const RADIUS: i32 = ") + std::to_string(r) + ";\nconst TILE: u32 = " +
+                          std::to_string(span * span) + "u;\n" + (fg.flow_par ? kFlowParWgsl : kFlowWgsl);
         fg.flow = make_compute(src.c_str(), "rx framegen flow");
-        hos_log("rx: frame interpolation: motion search +-%d pixels%s", 4 * r, shared ? " (workgroup memory)" : "");
+        hos_log("rx: frame interpolation: motion search +-%d pixels%s", 4 * r,
+                fg.flow_par ? " (a workgroup a vector)" : " (a thread a vector)");
     }
     fg.median = make_compute(kMedianWgsl, "rx framegen median");
     fg.synth = make_compute(kSynthWgsl, "rx framegen synth");
@@ -335,8 +351,10 @@ void init_pipelines() {
     }
 }
 
-void ensure_size(uint32_t w, uint32_t h) {
-    if (fg.w == w && fg.h == h) return;
+/// The textures for frames of w x h shown `mult` times a game frame (each shown set holds mult frames: was 4 always,
+/// 66 MB more than 2x needs at 2560x1600); w 0: all released
+void ensure_size(uint32_t w, uint32_t h, int mult) {
+    if (fg.w == w && fg.h == h && fg.mult == mult) return;
     {   // (the display thread is done with the old sets first)
         std::unique_lock lk(fg.mu);
         fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy; });
@@ -347,16 +365,18 @@ void ensure_size(uint32_t w, uint32_t h) {
         drop_tex(fg.flows[i]);
         for (Tex& t : fg.sets[i].frame) drop_tex(t);
     }
-    fg.w = w, fg.h = h;
+    fg.w = w, fg.h = h, fg.mult = mult;
+    fg.have_prev = false;
+    if (!w || !h) return;
     const uint32_t qw = (w + 3) / 4, qh = (h + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
     const WGPUTextureUsage rw = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
     for (int i = 0; i < 2; i++) {
         fg.frames[i] = make_tex(w, h, WGPUTextureFormat_RGBA8Unorm, rw | WGPUTextureUsage_CopySrc, "rx framegen frame");
         fg.lumas[i] = make_tex(qw, qh, WGPUTextureFormat_RGBA16Float, rw, "rx framegen luma");
         fg.flows[i] = make_tex(cw, ch, WGPUTextureFormat_RGBA16Float, rw, "rx framegen flow");
-        for (Tex& t : fg.sets[i].frame)
-            t = make_tex(w, h, WGPUTextureFormat_RGBA8Unorm, rw | WGPUTextureUsage_CopyDst | WGPUTextureUsage_CopySrc,
-                         "rx framegen shown");
+        for (int k = 0; k < mult && k < kMaxMult; k++)
+            fg.sets[i].frame[k] = make_tex(w, h, WGPUTextureFormat_RGBA8Unorm,
+                                           rw | WGPUTextureUsage_CopyDst | WGPUTextureUsage_CopySrc, "rx framegen shown");
     }
     fg.have_prev = false;
 }
@@ -378,7 +398,8 @@ void dispatch(WGPUCommandEncoder e, WGPUComputePipeline pipe, std::initializer_l
     WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(e, tw ? &cd : nullptr);
     wgpuComputePassEncoderSetPipeline(p, pipe);
     wgpuComputePassEncoderSetBindGroup(p, 0, bg, 0, nullptr);
-    wgpuComputePassEncoderDispatchWorkgroups(p, (w + 7) / 8, (h + 7) / 8, 1);
+    if (w & 0x80000000u) wgpuComputePassEncoderDispatchWorkgroups(p, w & 0x7fffffffu, h, 1);   // (groups as given)
+    else wgpuComputePassEncoderDispatchWorkgroups(p, (w + 7) / 8, (h + 7) / 8, 1);
     wgpuComputePassEncoderEnd(p);
     wgpuComputePassEncoderRelease(p);
     wgpuBindGroupRelease(bg);
@@ -551,6 +572,26 @@ int64_t framegen_web_tick() {
 }
 #endif
 
+/// (rx_core.cpp: each frame shown with frame interpolation off, on the submit thread) its textures (~200 MB at
+/// 2560x1600) released 3 s after it was turned off, once the display thread is done with them
+void framegen_idle_impl() {
+#if !RX_WEB
+    if (!fg.w) return;
+    const int64_t now = hos_now_ns();
+    if (!fg.off_since) {
+        fg.off_since = now;
+        return;
+    }
+    if (now - fg.off_since < 3000000000LL) return;
+    {
+        std::lock_guard lk(fg.mu);
+        if (!fg.jobs.empty() || fg.sets[0].busy || fg.sets[1].busy) return;
+    }
+    ensure_size(0, 0, 0);   // (no wait: the jobs come from this thread, and there are none)
+    hos_log("rx: frame interpolation off: its textures released");
+#endif
+}
+
 // RX_GPU_TIMING=1 (measuring): each stage's GPU time on the frames that make in-between frames, logged every 5 s
 // (the copy into the shown set and the presents are not in it). Four readback buffers in turn; a frame finding none
 // free is not timed.
@@ -646,7 +687,9 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     web_flush();   // (the set still being shown: done now; this thread is the one that would free it)
 #endif
     init_pipelines();
-    ensure_size(sw, sh);
+    const int m = multiplier();
+    ensure_size(sw, sh, m);
+    fg.off_since = 0;
     if (!fg.thread_started) {
         fg.thread_started = true;
 #if !RX_WEB
@@ -682,7 +725,6 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     }
 #endif
     const int cur = fg.cur, prev = cur ^ 1;
-    const int m = multiplier();
     const bool blend = fg.have_prev && !gap;
     // the camera's motion from FSR 2 / DLSS: only when this frame made one (one new set since the last frame, counted
     // when each frame was queued; read on this thread it miscounted whenever the render thread was a frame ahead, and
@@ -704,7 +746,7 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     set->made = 0;
     if (blend) {
         dispatch(e, fg.flow, {tex_entry(fg.lumas[prev].view), tex_entry(fg.lumas[cur].view), tex_entry(fg.flows[0].view)},
-                 cw, ch, tw(2));
+                 fg.flow_par ? (cw | 0x80000000u) : cw, ch, tw(2));   // (a workgroup a vector: cw x ch groups)
         dispatch(e, fg.median, {tex_entry(fg.flows[0].view), tex_entry(fg.flows[1].view)}, cw, ch, tw(3));
         for (int k = 1; k < m; k++) {
             WGPUBindGroupEntry s{}, b{};
@@ -781,6 +823,8 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     return true;
 #endif
 }
+void framegen_idle() { framegen_idle_impl(); }
+
 }  // namespace rx
 
 /* nn_vi.c: frames shown per game frame (1: frame interpolation off). With it on, the game's frame rate is held to the
