@@ -3725,6 +3725,13 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
             if (attached) {
                 Image* source = t.image;
                 if (Image* snapshot = snapshot_for_feedback(*source)) {
+                    if (nvn_watched_draw) {   // (RX_WATCH_FS: each feedback snapshot a watched draw samples)
+                        static int snap_lines;
+                        if (snap_lines++ < 8000)
+                            hos_log("rx-snap: frame %lld fs %08x texture %u (%08llx %ux%u): %s", (long long)frame_number,
+                                    (unsigned)(nvn_watched_fs >> 32), t_index, (unsigned long long)source->guest,
+                                    source->width, source->height, snapshot_how);
+                    }
                     t.view = snapshot->view(view_dimension(d.type), has_stencil(source->format));
                     t.image = nullptr;
                 } else {

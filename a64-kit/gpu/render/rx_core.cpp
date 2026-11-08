@@ -3032,8 +3032,10 @@ void texture_barrier(uint32_t method, uint32_t arg) {
 }
 
 uint64_t feedback_program = 0;
+const char* snapshot_how = "";   // (how the last snapshot_for_feedback answered: RX_WATCH_FS's rx-snap lines)
 
 Image* snapshot_for_feedback(Image& image) {
+    snapshot_how = "not made";
     if (!image.sampled_copy) {
         auto copy = std::make_unique<Image>();
         copy->width = image.width;
@@ -3069,6 +3071,7 @@ Image* snapshot_for_feedback(Image& image) {
     if (!every_draw && image.snapshot_epoch == barrier_epoch) {
         if (!same_draw) image.snapshot_uses++, image.snapshot_request = rp_draws;
         count("feedback_snapshot_reused");
+        snapshot_how = "reused (no texture barrier since it was taken)";
         return image.sampled_copy.get();
     }
     // A run of feedback draws with a barrier before each: TOTK's shrine wall decals, ~640 a frame looking into a
@@ -3087,6 +3090,7 @@ Image* snapshot_for_feedback(Image& image) {
     }();
     if (!every_draw && same_draw && image.snapshot_uses) {   // (nothing drawn since: still current)
         image.snapshot_epoch = barrier_epoch;
+        snapshot_how = "reused (no draw since it was taken)";
         return image.sampled_copy.get();
     }
     if (!every_draw && window > 1 && pass && passes_begun == image.snapshot_pass && feedback_program &&
@@ -3096,10 +3100,12 @@ Image* snapshot_for_feedback(Image& image) {
         image.snapshot_request = rp_draws;
         image.snapshot_epoch = barrier_epoch;
         count("feedback_snapshot_window");
+        snapshot_how = "reused (a run of feedback draws)";
         return image.sampled_copy.get();
     }
     image.snapshot_epoch = barrier_epoch;
     count("feedback_snapshots");
+    snapshot_how = "taken";
     end_render_pass("pe_feedback");
     image.snapshot_pass = passes_begun + 1;   // (the pass the draw begins next)
     image.snapshot_draws = rp_draws;

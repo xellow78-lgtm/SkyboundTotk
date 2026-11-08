@@ -166,6 +166,7 @@ uint64_t images_generation();
 bool images_changed_in(uint64_t since, uint64_t lo, uint64_t hi);
 /// Ends the current pass and snapshots an attachment before a draw samples and writes it.
 Image* snapshot_for_feedback(Image& image);
+extern const char* snapshot_how;   // (how the last one answered: taken, or reused and why)
 extern uint64_t feedback_program;   // the program pair of the draw being prepared (0: none known)
 /// A texture barrier (texture data cache invalidation, tiled cache barrier) in the command stream.
 void texture_barrier(uint32_t method, uint32_t arg);
