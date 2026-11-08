@@ -90,6 +90,8 @@ No game files are included. You need your own dump of the game (see [Game files]
   2048 instead of the game's own (up to 960, and smaller near the ground, which makes leaf shadows blocky and jumpy),
   and the sharp shadow cascades reaching x1.5, x2 or x3 as far as the game's 20 / 40 / 80 / 160 m. Adapted from
   totk-pc-recomp (MIT).
+- **Reflection quality** (new, 1.4.3, at the next start): the game's reflection buffer (water, shiny floors) x1.5
+  or x2 on each side, at most the 3D scene's size.
 - **Colour textures compressed on the GPU:** ASTC textures are decoded on the GPU and re-encoded to BC7, a quarter
   of the video memory of RGBA8.
 - **VRAM management:** unused textures and render targets are given back near Windows' video memory budget (this
@@ -153,7 +155,7 @@ No game files are included. You need your own dump of the game (see [Game files]
   rebuilds only what changed. Your game files, saves and mods are not touched.
 - **Settings:** upscaler, sharpness, display mode, window size, VSync, output resolution, aspect ratio, 3D
   resolution, DLSS model, frame rate limit, frame timing, FPS counter, anisotropic filtering, shadow resolution and
-  distance, Reflex, button icons,
+  distance, reflection quality, Reflex, button icons,
   mouse camera and sensitivity, mods folder, save folder, log file.
 - **Save folder:** pick a folder that OneDrive or Google Drive syncs to share saves between PCs. The first time, the
   install's saves are copied into it (the originals stay), unless it already has saves, which are then used.

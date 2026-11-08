@@ -158,41 +158,52 @@ static int make_heapdef(uint64_t extra_kib) {
 void hos_shadow_decide(void);
 uint64_t hos_shadow_heap_kib(void);
 void hos_shadow_enable(int heap_ok);
+/* ...and so do the bigger reflection buffers (totk_reflections.c) */
+void hos_reflection_decide(void);
+uint64_t hos_reflection_heap_kib(unsigned sw, unsigned sh);
+void hos_reflection_enable(int heap_ok);
 
 /* hos_main.c, after the mods are known and before the game starts: the sizes, the heap */
 void hos_res_init(void) {
 #if GAME_VERSION == 143 && !defined(__EMSCRIPTEN__)
     decide();
     hos_shadow_decide();
+    hos_reflection_decide();
     const int res = !(hos_out_w == BASE_W && hos_out_h == BASE_H && !R.scene_set);
     const uint64_t shadow = hos_shadow_heap_kib();
+    const uint64_t refl = res ? hos_reflection_heap_kib(R.sw, R.sh) : hos_reflection_heap_kib(SCENE_W, SCENE_H);
     if (!res) hos_log("res: the game's own (output 1920x1080, scene 1600x900)");
-    if (!res && !shadow) {
+    if (!res && !shadow && !refl) {
         hos_shadow_enable(1);
+        hos_reflection_enable(1);
         return;
     }
     uint64_t extra = res ? heap_extra_kib() : 0;
-    extra = (extra + shadow + 1023) / 1024 * 1024;   /* (whole MiB) */
+    extra = (extra + shadow + refl + 1023) / 1024 * 1024;   /* (whole MiB) */
     if (extra && !make_heapdef(extra)) {
         hos_out_w = BASE_W, hos_out_h = BASE_H, R.scene_set = 0, R.native = 0;
         hos_shadow_enable(0);
+        hos_reflection_enable(0);
         return;
     }
     hos_total_memory += ((extra << 10) + 0x1fffff) & ~0x1fffffull;
     R.on = res;
     if (res)
-        hos_log("res: output %ux%u, scene %ux%u%s; texture heap +%llu MB (shadows %llu), game memory %llu MB", hos_out_w,
-                hos_out_h, R.sw, R.sh, R.native ? " (Native)" : " (5/6 of the output)",
-                (unsigned long long)(extra >> 10), (unsigned long long)(shadow >> 10),
+        hos_log("res: output %ux%u, scene %ux%u%s; texture heap +%llu MB (shadows %llu, reflections %llu), game memory "
+                "%llu MB", hos_out_w, hos_out_h, R.sw, R.sh, R.native ? " (Native)" : " (5/6 of the output)",
+                (unsigned long long)(extra >> 10), (unsigned long long)(shadow >> 10), (unsigned long long)(refl >> 10),
                 (unsigned long long)(hos_total_memory >> 20));
     else
-        hos_log("res: texture heap +%llu MB for the shadow map, game memory %llu MB", (unsigned long long)(extra >> 10),
-                (unsigned long long)(hos_total_memory >> 20));
+        hos_log("res: texture heap +%llu MB for shadows and reflections, game memory %llu MB",
+                (unsigned long long)(extra >> 10), (unsigned long long)(hos_total_memory >> 20));
     hos_shadow_enable(1);
+    hos_reflection_enable(1);
 #else
     hos_log("res: a bigger resolution needs TOTK 1.4.3: the game's own");
     hos_shadow_decide();
     hos_shadow_enable(0);
+    hos_reflection_decide();
+    hos_reflection_enable(0);
 #endif
 }
 

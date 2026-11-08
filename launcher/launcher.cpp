@@ -259,7 +259,7 @@ struct Setting {
 };
 
 enum SettingId {
-    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_VSYNC, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_DLSSMODEL, S_FPS, S_FRAMETIMING, S_FPSCOUNTER, S_ANISO, S_SHADOWRES, S_SHADOWDIST, S_REFLEX, S_BUTTONS, S_MOUSECAM,
+    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_VSYNC, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_DLSSMODEL, S_FPS, S_FRAMETIMING, S_FPSCOUNTER, S_ANISO, S_SHADOWRES, S_SHADOWDIST, S_REFLECT, S_REFLEX, S_BUTTONS, S_MOUSECAM,
     S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_SAVES, S_LOG, S_COUNT
 };
 std::vector<Setting> settings_list() {
@@ -295,6 +295,8 @@ std::vector<Setting> settings_list() {
                       {L"Game's own", L"1024", L"1536", L"2048"}};
     s[S_SHADOWDIST] = {K_OPTION, L"Shadow distance", L"Sharp shadows further out: raise Shadow resolution with it.",
                        {L"Game's own", L"x1.5", L"x2", L"x3"}};
+    s[S_REFLECT] = {K_OPTION, L"Reflection quality", L"Sharper reflections on water and shiny floors. At the next start.",
+                    {L"Game's own", L"x1.5", L"x2"}};
     s[S_REFLEX] = {K_OPTION, L"NVIDIA Reflex", L"Less input lag (NVIDIA, with the DLSS library).",
                    {L"Off", L"On", L"On + Boost"}};
     s[S_BUTTONS] = {K_OPTION, L"Button icons", L"Automatic: the device you play with.",
@@ -434,6 +436,7 @@ double setting_value(int id) {
     case S_ANISO: return g.geti("anisotropic_filtering", 0);
     case S_SHADOWRES: return g.geti("shadow_resolution", 0);
     case S_SHADOWDIST: return g.geti("shadow_distance", 0);
+    case S_REFLECT: return g.geti("reflection_quality", 0);
     case S_REFLEX: return g.geti("nvidia_reflex", 0);
     case S_BUTTONS: return g.geti("button_icons", 0);
     case S_MOUSECAM: return g.geti("mouse_camera", 1);
@@ -468,6 +471,7 @@ void set_setting(int id, double v) {
     case S_ANISO: g.set("anisotropic_filtering", std::to_string((int)v)); return;
     case S_SHADOWRES: g.set("shadow_resolution", std::to_string((int)v)); return;
     case S_SHADOWDIST: g.set("shadow_distance", std::to_string((int)v)); return;
+    case S_REFLECT: g.set("reflection_quality", std::to_string((int)v)); return;
     case S_REFLEX: g.set("nvidia_reflex", std::to_string((int)v)); return;
     case S_BUTTONS: g.set("button_icons", std::to_string((int)v)); return;
     case S_MOUSECAM: g.set("mouse_camera", std::to_string((int)v)); return;
