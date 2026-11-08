@@ -5,6 +5,7 @@
 #include <bitset>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -768,6 +769,8 @@ struct NvnDraw {
     uint64_t index_gpu = 0;
 };
 void nvn_draw(NvnState& s, const NvnDraw& d);                              // rx_draw.cpp
+void watch_fs_present();     // (RX_WATCH_FS: the frame's counts, at its present; rx_draw.cpp)
+void watch_fs_render_off();  // (RX_WATCH_FS: a draw the render condition skipped)
 void nvn_dispatch(NvnState& s, uint32_t x, uint32_t y, uint32_t z);        // rx_compute.cpp
 void nvn_clear_color(Image* im, const float rgba[4], uint32_t mask, const int32_t* scissor);           // rx_core.cpp
 void nvn_clear_depth_stencil(Image* im, bool depth, float d, bool stencil, uint32_t sv, uint32_t smask,

@@ -997,6 +997,7 @@ void cond_recheck_present() {
         case NOP_DRAW: {
             if (!s.render_enabled || s.raster_discard) {
                 if (frame_dump_active()) dump_draw(s.raster_discard ? "nvn draw skipped (raster discard)" : "nvn draw skipped (render off)");
+                watch_fs_render_off();
                 break;
             }
             const auto d = payload<nvn_p_draw>(a, avail);
@@ -1011,6 +1012,7 @@ void cond_recheck_present() {
         case NOP_DRAW_IDX: {
             if (!s.render_enabled || s.raster_discard) {
                 if (frame_dump_active()) dump_draw(s.raster_discard ? "nvn draw skipped (raster discard)" : "nvn draw skipped (render off)");
+                watch_fs_render_off();
                 break;
             }
             const auto d = payload<nvn_p_draw_idx>(a, avail);

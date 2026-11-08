@@ -4657,6 +4657,7 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
         if (set_phase) set_phase(ab_flipped() ? 1u : 0u);
     }
 #endif
+    watch_fs_present();   // (RX_WATCH_FS: this frame's counts)
     // RX_DUMP_ON_DRAWS=<n> (with RX_DUMP_FRAME=99999999): the dump starts RX_DUMP_ON_DELAY frames after the first
     // frame with more than n draws (gameplay: thousands; title and loading screens: ~100)
     if (static const int64_t on_draws = getenv("RX_DUMP_ON_DRAWS") ? atoll(getenv("RX_DUMP_ON_DRAWS")) : 0; on_draws) {

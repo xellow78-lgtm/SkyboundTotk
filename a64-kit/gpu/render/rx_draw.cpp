@@ -3739,6 +3739,64 @@ void mark_rt_pages(Image*) {}
 void rt_pages_clean(Image*) {}
 #endif
 
+/* RX_WATCH_FS=<pixel program hex>[,...] (debugging, light: no frame dump, which slows the frame and hides races):
+   per frame, how many draws of those programs ran and how many were skipped (and why), one log line per frame whose
+   counts differ from the last one's (up to RX_WATCH_FS_LINES, default 3000). The Depths' gloom flickering off for
+   whole frames never showed in a frame dump. */
+namespace {
+struct WatchFs {
+    uint64_t key = 0;
+    uint32_t drawn = 0, instances = 0;
+    std::map<std::string, uint32_t> skipped;
+};
+std::vector<WatchFs>& watch_fs() {
+    static std::vector<WatchFs> w = [] {
+        std::vector<WatchFs> v;
+        if (const char* e = getenv("RX_WATCH_FS"))
+            for (const char* p = e; *p;) {
+                char* end;
+                const uint64_t k = strtoull(p, &end, 16);
+                if (end == p) break;
+                v.push_back({k});
+                p = *end == ',' ? end + 1 : end;
+            }
+        return v;
+    }();
+    return w;
+}
+uint32_t watch_render_off;   // (draws the render condition skipped this frame, any program)
+uint32_t watch_draws;        // (draws this frame, any program)
+} // namespace
+
+void watch_fs_render_off() { watch_render_off++; }
+
+void watch_fs_present() {
+    std::vector<WatchFs>& w = watch_fs();
+    if (w.empty()) return;
+    static std::string last;
+    static int lines = 0;
+    static const int max_lines = getenv("RX_WATCH_FS_LINES") ? atoi(getenv("RX_WATCH_FS_LINES")) : 3000;
+    std::string now;
+    char b[96];
+    for (WatchFs& x : w) {
+        std::snprintf(b, sizeof b, " %08llx=%u", (unsigned long long)(x.key >> 32), x.drawn);
+        now += b;
+        if (x.instances > 1) std::snprintf(b, sizeof b, "(x%u)", x.instances), now += b;
+        for (const auto& [why, n] : x.skipped) std::snprintf(b, sizeof b, " [skipped %u: %s]", n, why.c_str()), now += b;
+        x.drawn = x.instances = 0;
+        x.skipped.clear();
+    }
+    std::snprintf(b, sizeof b, " | render-off %u", watch_render_off);
+    std::string tail = b;
+    const bool changed = now != last;
+    last = now;
+    if (changed && lines < max_lines) {
+        lines++;
+        hos_log("rx-watch: frame %lld:%s%s, draws %u", (long long)frame_number, now.c_str(), tail.c_str(), watch_draws);
+    }
+    watch_render_off = watch_draws = 0;
+}
+
 void nvn_draw(NvnState& s, const NvnDraw& d) {
     // RX_NVN_NO_DRAWS=1 (measurement only: the screen is wrong): no draw is prepared, so the frame rate is what the
     // game's own threads allow (the web: how far preparing draws faster could go)
@@ -3761,10 +3819,23 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         const float v[4] = {0, 0, 0, 1};
         wgpuQueueWriteBuffer(dev.queue, const_vertex_buffer, 0, v, 16);
     }
+    // (RX_WATCH_FS: this draw's outcome, counted when it returns)
+    struct WatchOutcome {
+        WatchFs* w = nullptr;
+        const char* skipped = nullptr;
+        uint32_t instances = 0;
+        ~WatchOutcome() {
+            if (!w) return;
+            if (skipped) w->skipped[skipped]++;
+            else w->drawn++, w->instances = std::max(w->instances, instances);
+        }
+    } watch_outcome;
+    watch_draws++;
     auto skip = [&](const char* why) {
         st_skipped++;
         count("skipped");
         count(why);
+        watch_outcome.skipped = why;
     };
     if (!d.count) return count("draws_empty");
     trim_bind_groups();
@@ -3797,7 +3868,13 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     }
     ProgramPair* prog = nvn_programs(s, out_types);
     if (!prog) return skip("programs");
-    if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) return;   // (rx_fsr2.cpp)
+    if (!watch_fs().empty() && prog->has_fs)
+        for (WatchFs& x : watch_fs())
+            if (x.key == prog->fs.key) watch_outcome.w = &x, watch_outcome.instances = d.instances;
+    if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) {   // (rx_fsr2.cpp)
+        watch_outcome.skipped = "replaced by the upscaler";
+        return;
+    }
     // RX_DUMP_DRAW (debugging): before anything of this draw is in the batch
     nvn_dump_draw_ub = frame_dump_active() && dump_draw_wanted(prog);
     static const bool gloom_watch = env_flag("RX_WATCH_GLOOM") || env_flag("RX_GUARD_GLOOM");
