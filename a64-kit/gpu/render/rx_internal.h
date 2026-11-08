@@ -294,7 +294,10 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
                      bool made = false);
 /// Frame interpolation (rx_framegen.cpp): the frame (its view released) and the frames made between it and the last
 /// handed to the display thread; false: not done (the caller presents it as usual)
-bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh);
+struct SceneMotion;
+/// (rx_framegen.cpp) `sm`: the camera's motion as it was when this frame was queued (render thread): its views are
+/// released when this returns true, by the caller when false.
+bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh, const SceneMotion& sm);
 /// (the threaded web build's WebGPU thread: its loop, between jobs and between a batch's commands) the next made frame
 /// shown if due; ns until the one after (-1: none waiting). framegen_web_due: when it is due (0: none).
 int64_t framegen_web_tick();

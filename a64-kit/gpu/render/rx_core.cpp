@@ -2761,9 +2761,13 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
     if (view) wgpuTextureViewRelease(view);
 }
 
-void present_on_submit_thread(WGPUTextureView view, uint32_t sw, uint32_t sh, LONG ww, LONG wh, bool debug_present) {
-    // frame interpolation (F7): the frame and the ones made between it and the last go to the display thread
-    if (view && !debug_present && present_framegen() && framegen_frame(view, sw, sh, ww, wh)) return;
+void present_on_submit_thread(WGPUTextureView view, uint32_t sw, uint32_t sh, LONG ww, LONG wh, bool debug_present,
+                              const SceneMotion& sm) {
+    // frame interpolation (F7): the frame and the ones made between it and the last go to the display thread, with the
+    // camera's motion of this frame (taken when it was queued: the render thread may have recorded the next by now)
+    if (view && !debug_present && present_framegen() && framegen_frame(view, sw, sh, ww, wh, sm)) return;
+    if (sm.mv) wgpuTextureViewRelease(sm.mv);
+    if (sm.mask) wgpuTextureViewRelease(sm.mask);
     surface_present(view, sw, sh, ww, wh, debug_present);
 }
 
@@ -4960,7 +4964,11 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
     }
     const LONG ww = want_w, wh = want_h;
     const uint32_t sw = im ? im->width : 0, sh = im ? im->height : 0;
-    queue_present([view, sw, sh, ww, wh, debug_present] { present_on_submit_thread(view, sw, sh, ww, wh, debug_present); });
+    // (frame interpolation: the camera's motion vectors this frame made, if any, go with it: held until it is shown)
+    const SceneMotion sm = present_framegen() ? scene_motion() : SceneMotion{};
+    queue_present([view, sw, sh, ww, wh, debug_present, sm] {
+        present_on_submit_thread(view, sw, sh, ww, wh, debug_present, sm);
+    });
     return im != nullptr;
 }
 

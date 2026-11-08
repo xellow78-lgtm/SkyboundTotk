@@ -634,9 +634,9 @@ int fg_timer_slot() {
     return -1;
 }
 
-bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh) {
+bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh, const SceneMotion& sm) {
 #if RX_WEB && !RX_WEB_MT
-    (void)view, (void)sw, (void)sh, (void)ww, (void)wh;
+    (void)view, (void)sw, (void)sh, (void)ww, (void)wh, (void)sm;
     log_limited("framegen_web", 1, "rx: frame interpolation: the threaded web build only (index_mt.html)");
     return false;
 #else
@@ -684,8 +684,10 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     const int cur = fg.cur, prev = cur ^ 1;
     const int m = multiplier();
     const bool blend = fg.have_prev && !gap;
-    // the camera's motion from FSR 2 / DLSS: only when made for this frame (one new set since the last frame)
-    SceneMotion sm = scene_motion();
+    // the camera's motion from FSR 2 / DLSS: only when this frame made one (one new set since the last frame, counted
+    // when each frame was queued; read on this thread it miscounted whenever the render thread was a frame ahead, and
+    // the made frames switched between the camera's motion and block matching alone a few times a second:
+    // run_launcher.log 2026-11-08 18:00)
     const bool camera = sm.mv && sm.mask && sm.seq == fg.motion_seq + 1 && !getenv("RX_FRAMEGEN_NO_CAMERA");
     fg.motion_seq = sm.seq;
     for (int k = 1; k < m && blend; k++) {
@@ -750,8 +752,9 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
         static int last = -1;
         if (blend && (int)camera != last) {
             last = camera;
-            hos_log("rx: frame interpolation: %s", camera ? "the camera's motion vectors (FSR 2 / DLSS) with the "
-                    "block matching" : "block matching only (FSR 2 / DLSS not running)");
+            log_limited("framegen_motion", 20, "rx: frame interpolation: %s",
+                        camera ? "the camera's motion vectors (FSR 2 / DLSS) with the block matching"
+                               : "block matching only (no motion vectors for this frame)");
         }
     }
     if (static const double dump_at = getenv("RX_FRAMEGEN_DUMP") ? atof(getenv("RX_FRAMEGEN_DUMP")) : 0; dump_at && blend) {
