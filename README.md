@@ -174,7 +174,7 @@ are less tested.
 | Issue | Status | Details |
 | --- | --- | --- |
 | Orange sky / giant orange triangles over the screen | **Fixed (Nov 5); needs testing** | A mesh drawn with a base vertex that puts every vertex past its vertex data. The Switch reads zeros there and draws nothing; we read the memory after it (the mesh's normals and texture coordinates as positions). Draws like that are now copied with zeros past the end. Confirmed by replaying the captured draw. The "randomly stretched terrain" reports may be the same bug; retest. |
-| Depths gloom | **Flat sheet fixed; flicker open** | The gloom on the ground in the Depths was a flat sheet: the game draws its noise volumes once at boot, before the renderer had started, and that work was dropped. The game's first GPU work now waits for the renderer. The gloom still flickers off for whole frames from some angles (being investigated). |
+| Depths gloom | **Fixed** (a small brightness flicker remains) | It was a flat sheet: the game draws its noise volumes once at boot, before the renderer had started, and that work was dropped; the game's first GPU work now waits for the renderer. It also vanished for whole frames: the gloom pass marks the screen tiles that have gloom and the composite draws only those, but the renderer copied the pass's marks back before the pass had written them (a draw's storage writes were tied to whichever render pass was open while its resources were built). They now belong to the pass the draw is recorded in. Left: the gloom's brightness still pulses a little from frame to frame. |
 | Fuse mode streaks | **Fix not ported yet** | Upstream (1.0.0) saw long green lines from Link's hand in Fuse mode and fixed them in its wgpu build (the shaders declare that they need infinity and NaN preserved). Its published wgpu patch uses a naga flag (`WriterFlags::PRESERVE_INF_NAN`) that naga 29 does not have, so this branch's DLSS wgpu build cannot take it as is; the plain `wgpu_native.dll` from upstream has it. Not checked on 1.4.3. |
 | Sky flicker | **Open** | Reported, not investigated yet. |
 | Dark ground patch (Hateno) | **Open** | Captured with F12, not investigated yet. |
@@ -197,7 +197,7 @@ are less tested.
 **Needs doing (in this project):**
 
 - [ ] Verify a full playthrough on 1.4.3, start to credits.
-- [ ] Fix the open graphics issues above (Depths gloom next, then sky flicker, terrain textures, shadows, the wheel
+- [ ] Fix the open graphics issues above (sky flicker, terrain textures, shadows, the wheel
       background).
 - [ ] Find why audio fades above 200 fps, and fix climbing steps at high frame rates.
 - [ ] Port the remaining 1.0.0-only optimizations to 1.4.3: native frustum culling (~5% of the busiest frames on
