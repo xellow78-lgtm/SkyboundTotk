@@ -11,6 +11,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdlib>
+#include <tuple>
 
 #include "common/div_ceil.h"
 #include "shader_recompiler/runtime_info.h"
@@ -3374,6 +3375,51 @@ void nvn_dump_draw_storage(const NvnState& s, const ProgramPair* prog) {
    memory's bytes differ from the GPU's at the draw (rx-ub); RX_UB_FROM_GPU=1: that part of the block is copied from
    the buffer cache on the GPU, in command order, so the draw reads what the GPU holds. True when it was. */
 bool nvn_watched_draw;
+uint64_t nvn_watched_fs;
+/* ...and what they draw into and sample, logged when it differs from that program's last draw (rx-tex: up to 4000
+   lines): a texture's source (r a render target, t decoded from memory, d the placeholder a binding gets while its
+   texture cannot be used or is being decoded), its view, size, format and memory; a target's image. A frame whose gloom
+   pass output the composite reads as another image, or as a placeholder, shows as a pair of changes. */
+void watch_binding(int stage, uint32_t slot, const Image* target, const BoundTexture* t) {
+    struct Seen {
+        char source = 0;
+        const void* view = nullptr;
+        uint64_t id = 0, guest = 0;
+        uint32_t w = 0, h = 0;
+        int format = 0;
+        bool operator==(const Seen& o) const {
+            return source == o.source && view == o.view && id == o.id && guest == o.guest && w == o.w && h == o.h &&
+                   format == o.format;
+        }
+    };
+    Seen now;
+    if (t) now = {t->source, t->view, t->image ? t->image->id : 0, t->guest, t->width, t->height, t->format};
+    else if (target) now = {'r', target, target->id, target->guest, target->width, target->height, (int)target->format};
+    static std::map<std::tuple<uint64_t, int, uint32_t>, Seen> last;
+    static int lines;
+    const auto key = std::make_tuple(nvn_watched_fs, stage, slot);
+    const auto it = last.find(key);
+    if (it != last.end() && it->second == now) return;
+    const bool first = it == last.end();
+    if (first && !now.source) {   // (an unused target slot)
+        last[key] = now;
+        return;
+    }
+    if (lines++ < 4000) {
+        char was[96] = "";
+        if (!first)
+            std::snprintf(was, sizeof was, " (was %c #%llu %ux%u fmt %d guest %llx)", it->second.source ? it->second.source : '-',
+                          (unsigned long long)it->second.id, it->second.w, it->second.h, it->second.format,
+                          (unsigned long long)it->second.guest);
+        char what[32];
+        if (stage < 0) std::snprintf(what, sizeof what, slot == 8 ? "depth target" : "target %u", slot);
+        else std::snprintf(what, sizeof what, "%s texture %u", stage ? "fs" : "vs", slot);
+        hos_log("rx-tex: frame %lld fs %08x %s: %c #%llu %ux%u fmt %d guest %llx view %p%s", (long long)frame_number,
+                (unsigned)(nvn_watched_fs >> 32), what, now.source ? now.source : '-', (unsigned long long)now.id, now.w,
+                now.h, now.format, (unsigned long long)now.guest, now.view, was);
+    }
+    last[key] = now;
+}
 namespace {
 bool watch_ub_bank(const NvnState& s, int stage, uint32_t index, const uint8_t* cpu, uint64_t dst, uint64_t size) {
     if (index < 3 || index >= 3 + 16) return false;
@@ -3640,6 +3686,7 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
             }
         }
         if (nvn_gloom_watch_draw && stage == 1) gloom_watch_texture(t_index, t);   // (RX_WATCH_GLOOM)
+        if (nvn_watched_draw) watch_binding(stage, t_index, nullptr, &t);         // (RX_WATCH_FS)
         std::memcpy(slot_bytes.data() + (size_t)t_index++ * 32, t.slots, sizeof t.slots);
         watch_tex_size(at, t);
         if (frame_dump_active()) {
@@ -4183,6 +4230,11 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     if (!watch_fs().empty() && prog->has_fs)
         for (WatchFs& x : watch_fs())
             if (x.key == prog->fs.key) watch_outcome.w = &x, watch_outcome.instances = d.instances, nvn_watched_draw = true;
+    if (nvn_watched_draw) {
+        nvn_watched_fs = prog->fs.key;
+        for (int i = 0; i < 8; i++) watch_binding(-1, (uint32_t)i, at.color[i], nullptr);   // (its targets)
+        watch_binding(-1, 8, at.depth, nullptr);
+    }
     if (prog->has_fs) watch_flags_draw(prog->fs.key);   // (RX_WATCH_FLAGS)
     if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) {   // (rx_fsr2.cpp)
         watch_outcome.skipped = "replaced by the upscaler";
