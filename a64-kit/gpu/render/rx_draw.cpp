@@ -734,6 +734,9 @@ StorageBinding draw_storage(uint64_t va, uint64_t size, bool writable) {
         if (va) gpu_read(va, s.at(off), size);
         else std::memset(s.at(off), 0, size);
         count("up_ssbo", (int64_t)size);
+        if (writable && va)
+            buffer_watch_note(va, size, gpu_written(va, size) ? "a writable copy made (from the buffer cache):"
+                                                              : "a writable copy made (from guest memory):", s.buffer, off);
         if (writable && va) {
             // newer on the GPU (a dispatch or an earlier pass wrote it): the copy starts from the buffer cache
             if (gpu_written(va, size))
@@ -3865,6 +3868,14 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
         }
         if (nvn_watched_draw && stage == 0 && &d == &info.storage_buffers_descriptors.front()) nvn_watched_vs_ssbo = raw_va;
         const StorageBinding sb = draw_storage(raw_va ? va : 0, size, writable);
+        if (nvn_watched_draw && raw_va) {   // (RX_WATCH_TILES: the gloom's tile flags, and where its draws find them)
+            if (static const bool tiles = env_flag("RX_WATCH_TILES"); tiles) {
+                if (stage == 0 && nvn_watched_fs == 0xce51f5ea116fe892ull) buffer_watch_range(raw_va + 448, 459 * 16);
+                buffer_watch_note(va, size, stage ? (writable ? "a watched pixel program writes" : "a watched pixel program reads")
+                                                  : "a watched vertex program reads",
+                                  sb.buffer, sb.offset);
+            }
+        }
         if (!sb.ok) {
             out.ok = false;
             return;

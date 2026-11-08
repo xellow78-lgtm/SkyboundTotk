@@ -1778,6 +1778,8 @@ void end_render_pass(const char* why) {
             }
             ce_copy_buffer_to_buffer(encoder(), stream_rw.buffer, r.rw_offset, ref.buffer, ref.offset,
                                                  (r.size + 3) & ~3ull);
+            buffer_watch_note(r.gpu_va, r.size, "a pass's pixel-program results copied into the buffer cache:", ref.buffer,
+                              ref.offset);
             buffer_cache_gpu_written(ref);
             count("pass_results_cached", (int64_t)r.size);
         }

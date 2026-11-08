@@ -13,6 +13,9 @@
 // are reported through rx_memory_written; if a page they change was read earlier in the open batch, the batch is
 // submitted first, so earlier draws see the old contents.
 #include <algorithm>
+#include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -51,6 +54,24 @@ struct Segment {
 
 std::vector<Segment*> segments;   // by base / kStep
 int64_t batch_id;
+
+/* RX_WATCH_TILES: what happens to the pages of one range (the gloom's tile flags, set from the composite's binding)
+   in the buffer cache: CPU writes merged or invalidating, pages uploaded from guest memory, GPU writes, syncs to guest
+   memory and readbacks, each logged with the frame and the batch (rx-fpage, up to 8000 lines) */
+uint64_t watch_lo, watch_hi;   // guest offsets
+bool watched_pages(uint64_t p0, uint64_t p1) {   // [p0, p1] inclusive
+    return watch_hi && p0 * kPage < watch_hi && (p1 + 1) * kPage > watch_lo;
+}
+void watch_event(const char* fmt, ...) {
+    static std::atomic<int> lines{0};
+    if (lines.fetch_add(1) >= 8000) return;
+    char b[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    hos_log("rx-fpage: frame %lld batch %lld: %s", (long long)frame_number, (long long)batch_id, b);
+}
 bool watch_ok = true;
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 extern "C" uint8_t a64_dirty[];   // (rt/a64_rt.c: a mark a 4 KB page of the guest window, hos_guest_size() / 4096)
@@ -75,6 +96,9 @@ bool page_merge_on() {
 }
 
 void page_written(uint64_t page) {
+    if (watched_pages(page, page))
+        watch_event("the CPU wrote page %llx: not merged, invalidated (its GPU-written mark was %d)",
+                    (unsigned long long)page, (int)(page < gpu_pages.size() && gpu_pages[page]));
     if (page_seq.empty()) page_seq.assign(hos_guest_size() / kPage, 0);
     if (page < page_seq.size()) page_seq[page] = mem_seq;
     if (page < gpu_pages.size() && gpu_pages[page]) {
@@ -147,6 +171,9 @@ bool merge_cpu_write(uint64_t page) {
             w = e;
         }
     }
+    if (watched_pages(page, page) && !runs.empty())
+        watch_event("the CPU wrote page %llx: merged, %zu runs of words, first +%x..+%x", (unsigned long long)page,
+                    runs.size(), runs[0].first * 4, runs[0].second * 4);
     const uint64_t addr = page * kPage, index = addr / kStep;
     for (const auto& [w, e] : runs) {
         for (uint64_t i : {index, index - 1}) {
@@ -337,6 +364,11 @@ BufferRef guest_buffer(uint64_t gpu_va, uint64_t size) {
         const uint64_t off = p * kPage, n = std::min((q - p) * kPage, s->size - off);
         queue_upload(s->buffer, off, hos_guest_base() + s->base + off, n);
         count("up_cache", (int64_t)n);
+        if (watched_pages((s->base + off) / kPage, (s->base + off + n - 1) / kPage))
+            watch_event("segment %llx (buffer %p): pages %llx..%llx uploaded from guest memory (GPU-written marks: %d)",
+                        (unsigned long long)s->base, (void*)s->buffer, (unsigned long long)((s->base + off) / kPage),
+                        (unsigned long long)((s->base + off + n - 1) / kPage),
+                        (int)range_gpu_written(s->base + off, n));
         fill_gpu_pages(*s, p, q);
         p = q;
     }
@@ -523,6 +555,12 @@ int64_t readback_to_guest(uint8_t* guest, const uint8_t* now, const uint8_t* was
         }
         if (shadow) std::memcpy(shadow + at % kPage, &v, 4);
     }
+    if (changed && n && watch_hi) {
+        const uint64_t g0 = (uint64_t)(guest - hos_guest_base());
+        if (watched_pages(g0 / kPage, (g0 + n - 1) / kPage))
+            watch_event("a readback wrote %lld changed words into guest memory at %llx+%llx", (long long)changed,
+                        (unsigned long long)g0, (unsigned long long)n);
+    }
     return changed;
 }
 
@@ -535,6 +573,9 @@ void buffer_cache_gpu_written(const BufferRef& ref) {
         }
     if (!s) return;
     const uint64_t g0 = s->base + ref.offset, g1 = g0 + ref.size;
+    if (watched_pages(g0 / kPage, (g1 - 1) / kPage))
+        watch_event("the GPU wrote %llx+%llx in segment %llx (buffer %p)", (unsigned long long)g0,
+                    (unsigned long long)ref.size, (unsigned long long)s->base, (void*)ref.buffer);
     if (gpu_pages.empty()) {
         gpu_pages.assign(hos_guest_size() / kPage, 0);
         gpu_pages_data.store(gpu_pages.data(), std::memory_order_release);
@@ -663,6 +704,9 @@ void buffer_cache_sync_to_guest(uint64_t gpu_va, uint64_t size) {
         }
         if (watched && ndirty == 0) ResetWriteWatch(dst, n);
         wgpuBufferUnmap(staging);
+        if (watched_pages(p0, p1))
+            watch_event("pages %llx..%llx synced to guest memory (their GPU-written marks dropped)",
+                        (unsigned long long)p0, (unsigned long long)p1);
         for (uint64_t p = p0; p <= p1; p++) {
             gpu_pages[p] = 0;
             gpu_page_shadow.erase(p);
@@ -693,6 +737,28 @@ void sync_dispatch_writes() {
 
 int64_t batch_number() {
     return batch_id;
+}
+
+void buffer_watch_range(uint64_t gpu_va, uint64_t size) {
+    uint64_t avail = 0;
+    const uint8_t* host = size ? hos_gpu_ptr(gpu_va, &avail) : nullptr;
+    if (!host) return;
+    const uint64_t guest = (uint64_t)((uintptr_t)host - (uintptr_t)hos_guest_base());
+    if (guest == watch_lo && guest + size == watch_hi) return;
+    watch_lo = guest, watch_hi = guest + size;
+    watch_event("watching %llx+%llx (GPU %llx)", (unsigned long long)guest, (unsigned long long)size,
+                (unsigned long long)gpu_va);
+}
+
+void buffer_watch_note(uint64_t gpu_va, uint64_t size, const char* what, WGPUBuffer buffer, uint64_t offset) {
+    if (!watch_hi || !size) return;
+    uint64_t avail = 0;
+    const uint8_t* host = hos_gpu_ptr(gpu_va, &avail);
+    if (!host) return;
+    const uint64_t guest = (uint64_t)((uintptr_t)host - (uintptr_t)hos_guest_base());
+    if (guest < watch_hi && guest + size > watch_lo)
+        watch_event("%s %llx+%llx: buffer %p offset %llx", what, (unsigned long long)guest, (unsigned long long)size,
+                    (void*)buffer, (unsigned long long)offset);
 }
 
 bool buffer_cache_active() {
