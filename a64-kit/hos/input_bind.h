@@ -42,6 +42,10 @@ typedef struct {
                                               the last 5 frame times), 1 responsive (the last frame's time) */
     int dlss_preset;                       /* DLSS's model (rx_dlss.cpp, live): 0 NVIDIA's default for the mode,
                                               1 K, 2 M, 3 L (transformer), 4 J */
+    int shadow_res;                        /* the sun's shadow map (totk_shadows.c, at the start): 0 the game's own
+                                              (up to 960, smaller near the ground), 1 1024, 2 1536, 3 2048 */
+    int shadow_dist;                       /* how far the sharp shadow cascades reach (totk_shadows.c, at the start):
+                                              0 the game's own (20 / 40 / 80 / 160 m), 1 x1.5, 2 x2, 3 x3 */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */

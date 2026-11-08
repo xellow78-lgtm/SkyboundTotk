@@ -51,7 +51,7 @@ const char* const kPageNames[kPages] = {"Graphics", "Mouse", "Controls"};
 
 enum Kind { kOption, kSlider, kToggle, kBinding, kButton, kInfo, kSection };
 enum Id {
-    kOutRes, kAspect, kRes, kFps, kFrameTiming, kFrameGen, kFpsCounter, kAniso, kReflex, kButtons, kUpscaler, kDlssModel, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
+    kOutRes, kAspect, kRes, kFps, kFrameTiming, kFrameGen, kFpsCounter, kAniso, kShadowRes, kShadowDist, kReflex, kButtons, kUpscaler, kDlssModel, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
 };
 
 struct Row {
@@ -65,6 +65,8 @@ struct Row {
 };
 
 const char* const kAnisoNames[5] = {"Game's own", "2x", "4x", "8x", "16x"};
+const char* const kShadowResNames[4] = {"Game's own", "1024", "1536", "2048"};   // (input.ini shadow_resolution)
+const char* const kShadowDistNames[4] = {"Game's own", "x1.5", "x2", "x3"};     // (input.ini shadow_distance)
 const char* const kReflexNames[3] = {"Off", "On", "On + Boost"};
 const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 200, 0};   // (200 at most: nn_vi.c FPS_MAX)
 const char* const kFpsNames[8] = {"30", "60", "90", "120", "144", "165", "200", "Display's rate"};
@@ -132,6 +134,12 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
             "In the top left corner: frames shown a second.");
         add(kOption, kAniso, "Anisotropic filtering", kAnisoNames[std::clamp(b.aniso, 0, 4)],
             "Sharper ground and walls at an angle. Cheap on a PC.");
+        add(kOption, kShadowRes, "Shadow resolution", kShadowResNames[std::clamp(b.shadow_res, 0, 3)],
+            b.shadow_res ? "At the next start. Sharper, steadier sun shadows; more video memory."
+                         : "At the next start. The game's own shrinks near the ground: blocky, jumpy leaf shadows.");
+        add(kOption, kShadowDist, "Shadow distance", kShadowDistNames[std::clamp(b.shadow_dist, 0, 3)],
+            b.shadow_dist ? "At the next start. Sharp shadows further out; raise Shadow resolution with it."
+                          : "At the next start. Sharp shadows to 20 m, softer in steps to 160 m.");
         Row& rf = add(kOption, kReflex, "NVIDIA Reflex", kReflexNames[std::clamp(b.reflex, 0, 2)],
                       reflex_available() ? "Less input lag. Boost also keeps the GPU's clocks up."
                                          : "Needs an NVIDIA GPU on Vulkan.");
@@ -269,6 +277,8 @@ void change(State& s, const Row& r, int dir) {
     switch (r.id) {
     case kRes: b.render_mode = (b.render_mode + dir + hos_render_mode_count()) % hos_render_mode_count(); break;
     case kAniso: b.aniso = (b.aniso + dir + 5) % 5; break;
+    case kShadowRes: b.shadow_res = (b.shadow_res + dir + 4) % 4; break;
+    case kShadowDist: b.shadow_dist = (b.shadow_dist + dir + 4) % 4; break;
     case kReflex: b.reflex = (b.reflex + dir + 3) % 3; break;
     case kFps: b.fps_limit = kFpsValues[(fps_index(b.fps_limit) + dir + 8) % 8]; break;
     case kOutRes: b.output_res = (b.output_res + dir + 4) % 4; break;
@@ -315,6 +325,7 @@ void reset_controls(State& s) {
     d.render_mode = b.render_mode, d.aniso = b.aniso, d.reflex = b.reflex;   // (the graphics settings: kept)
     d.button_icons = b.button_icons, d.output_res = b.output_res, d.fps_limit = b.fps_limit;
     d.fps_counter = b.fps_counter, d.aspect = b.aspect, d.frame_timing = b.frame_timing, d.dlss_preset = b.dlss_preset;
+    d.shadow_res = b.shadow_res, d.shadow_dist = b.shadow_dist;
     hos_bind_set(&d);
     set_status(s, "Controls and mouse settings are back to the defaults.");
 }

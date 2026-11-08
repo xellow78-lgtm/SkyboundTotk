@@ -150,6 +150,8 @@ void hos_bind_defaults(Bindings *b) {
     b->aspect = 0;
     b->frame_timing = 0;
     b->dlss_preset = 0;
+    b->shadow_res = 0;
+    b->shadow_dist = 0;
 }
 
 volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting, hos_fps_limit = 60, hos_fps_counter, hos_frame_timing,
@@ -216,6 +218,8 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "aspect_ratio")) { b->aspect = atoi(v); continue; }
         if (!_stricmp(k, "frame_timing")) { b->frame_timing = atoi(v); continue; }
         if (!_stricmp(k, "dlss_preset")) { b->dlss_preset = atoi(v); continue; }
+        if (!_stricmp(k, "shadow_resolution")) { b->shadow_res = atoi(v); continue; }
+        if (!_stricmp(k, "shadow_distance")) { b->shadow_dist = atoi(v); continue; }
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
             if (!_stricmp(k, actions[a].ini)) act = a;
@@ -246,6 +250,8 @@ static void load(Bindings *b) {
     if (b->aspect < 0 || b->aspect > 4) b->aspect = 0;
     if (b->frame_timing < 0 || b->frame_timing > 1) b->frame_timing = 0;
     if (b->dlss_preset < 0 || b->dlss_preset > 4) b->dlss_preset = 0;
+    if (b->shadow_res < 0 || b->shadow_res > 3) b->shadow_res = 0;
+    if (b->shadow_dist < 0 || b->shadow_dist > 3) b->shadow_dist = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -279,8 +285,13 @@ static void save(const Bindings *b) {
                "# frame's time: on a G-Sync / FreeSync display, no speed-up after a slow frame)\n"
                "frame_timing = %d\n"
                "# DLSS's model: 0 NVIDIA's default for the mode, 1 K, 2 M, 3 L (transformer models), 4 J\n"
-               "dlss_preset = %d\n\n", b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit, b->fps_counter,
-               b->aspect, b->frame_timing, b->dlss_preset);
+               "dlss_preset = %d\n"
+               "# the sun's shadow map, at the next start: 0 the game's own (up to 960, smaller near the ground), 1 1024,\n"
+               "# 2 1536, 3 2048 (sharper, steadier shadows; more video memory)\nshadow_resolution = %d\n"
+               "# how far the sharp shadows reach, at the next start: 0 the game's own (20 / 40 / 80 / 160 m), 1 x1.5,\n"
+               "# 2 x2, 3 x3 (each cascade spread over more ground: raise shadow_resolution with it)\nshadow_distance = %d\n\n",
+               b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit, b->fps_counter, b->aspect,
+               b->frame_timing, b->dlss_preset, b->shadow_res, b->shadow_dist);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)

@@ -51,7 +51,7 @@ static struct {
     int scene_set;      /* the scene splice: Native, or an output that is not 16:9 */
     int native;         /* Native: the scene is the whole output */
     int on;             /* the splices are on: the heap table was grown (or did not need to be) */
-    char heapdef[MAX_PATH];
+    char heapdef[MAX_PATH];   /* the grown heap table (resolution and shadows), empty: the game's own */
 } R;
 
 extern uint64_t hos_total_memory;   /* hos_mem.c */
@@ -154,26 +154,45 @@ static int make_heapdef(uint64_t extra_kib) {
 }
 #endif
 
+/* the sun's shadows (totk_shadows.c): their map's size needs texture heap too */
+void hos_shadow_decide(void);
+uint64_t hos_shadow_heap_kib(void);
+void hos_shadow_enable(int heap_ok);
+
 /* hos_main.c, after the mods are known and before the game starts: the sizes, the heap */
 void hos_res_init(void) {
 #if GAME_VERSION == 143 && !defined(__EMSCRIPTEN__)
     decide();
-    if (hos_out_w == BASE_W && hos_out_h == BASE_H && !R.scene_set) {
-        hos_log("res: the game's own (output 1920x1080, scene 1600x900)");
+    hos_shadow_decide();
+    const int res = !(hos_out_w == BASE_W && hos_out_h == BASE_H && !R.scene_set);
+    const uint64_t shadow = hos_shadow_heap_kib();
+    if (!res) hos_log("res: the game's own (output 1920x1080, scene 1600x900)");
+    if (!res && !shadow) {
+        hos_shadow_enable(1);
         return;
     }
-    const uint64_t extra = heap_extra_kib();
+    uint64_t extra = res ? heap_extra_kib() : 0;
+    extra = (extra + shadow + 1023) / 1024 * 1024;   /* (whole MiB) */
     if (extra && !make_heapdef(extra)) {
         hos_out_w = BASE_W, hos_out_h = BASE_H, R.scene_set = 0, R.native = 0;
+        hos_shadow_enable(0);
         return;
     }
     hos_total_memory += ((extra << 10) + 0x1fffff) & ~0x1fffffull;
-    R.on = 1;
-    hos_log("res: output %ux%u, scene %ux%u%s; texture heap +%llu MB, game memory %llu MB", hos_out_w, hos_out_h, R.sw,
-            R.sh, R.native ? " (Native)" : " (5/6 of the output)", (unsigned long long)(extra >> 10),
-            (unsigned long long)(hos_total_memory >> 20));
+    R.on = res;
+    if (res)
+        hos_log("res: output %ux%u, scene %ux%u%s; texture heap +%llu MB (shadows %llu), game memory %llu MB", hos_out_w,
+                hos_out_h, R.sw, R.sh, R.native ? " (Native)" : " (5/6 of the output)",
+                (unsigned long long)(extra >> 10), (unsigned long long)(shadow >> 10),
+                (unsigned long long)(hos_total_memory >> 20));
+    else
+        hos_log("res: texture heap +%llu MB for the shadow map, game memory %llu MB", (unsigned long long)(extra >> 10),
+                (unsigned long long)(hos_total_memory >> 20));
+    hos_shadow_enable(1);
 #else
     hos_log("res: a bigger resolution needs TOTK 1.4.3: the game's own");
+    hos_shadow_decide();
+    hos_shadow_enable(0);
 #endif
 }
 
@@ -183,7 +202,7 @@ int hos_res_romfs(const char *rel, char *out, size_t cap) {
     (void)rel, (void)out, (void)cap;
     return 0;
 #endif
-    if (!R.on || !R.heapdef[0] || _stricmp(rel, HEAPDEF)) return 0;
+    if (!R.heapdef[0] || _stricmp(rel, HEAPDEF)) return 0;   /* (made only when the heap grows: the resolution, shadows) */
     snprintf(out, cap, "%s", R.heapdef);
     static int logged;
     if (!logged++) hos_log("res: %s <- %s", rel, R.heapdef);
