@@ -96,9 +96,9 @@ No game files are included. You need your own dump of the game (see [Game files]
   Natural keeps the water's ripples in the reflection, Clear fewer of them. Seen working at Zora's Domain and on a
   river. Only what is on screen can be reflected: reflections fade at the picture's edges, and Link's reflection
   shows his back.
-- **Surface reflections** (new, live, not yet seen in the game): the same on smooth surfaces (polished stone, ice,
-  metal), picked by the smoothness the game keeps in its G-buffer, blurrier on rougher surfaces. Characters are left
-  out.
+- **Surface reflections** (new, live): the same on smooth surfaces (polished stone, ice, metal), picked by the
+  smoothness the game keeps in its G-buffer. Soft: blurrier on rougher surfaces. Sharp: mirrors on every smooth
+  surface. Characters are left out.
 - **Colour textures compressed on the GPU:** ASTC textures are decoded on the GPU and re-encoded to BC7, a quarter
   of the video memory of RGBA8.
 - **VRAM management:** unused textures and render targets are given back near Windows' video memory budget (this

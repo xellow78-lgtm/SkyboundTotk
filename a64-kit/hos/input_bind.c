@@ -260,7 +260,7 @@ static void load(Bindings *b) {
     if (b->shadow_res < 0 || b->shadow_res > 3) b->shadow_res = 0;
     if (b->shadow_dist < 0 || b->shadow_dist > 3) b->shadow_dist = 0;
     if (b->water_reflections < 0 || b->water_reflections > 2) b->water_reflections = 0;
-    if (b->surface_reflections < 0 || b->surface_reflections > 1) b->surface_reflections = 0;
+    if (b->surface_reflections < 0 || b->surface_reflections > 2) b->surface_reflections = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -301,7 +301,8 @@ static void save(const Bindings *b) {
                "# 2 x2, 3 x3 (each cascade spread over more ground: raise shadow_resolution with it)\nshadow_distance = %d\n"
                "# reflections of the world on the water (screen space: only what is on screen): 0 off, 1 natural (with the\n"
                "# ripples), 2 clear\nwater_reflections = %d\n"
-               "# ...and on smooth surfaces (polished stone, ice, metal): 0 off, 1 on\nsurface_reflections = %d\n\n",
+               "# ...and on smooth surfaces (polished stone, ice, metal): 0 off, 1 soft (blurrier on rougher surfaces),\n"
+               "# 2 sharp (as polished)\nsurface_reflections = %d\n\n",
                b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit, b->fps_counter, b->aspect,
                b->frame_timing, b->dlss_preset, b->shadow_res, b->shadow_dist, b->water_reflections,
                b->surface_reflections);

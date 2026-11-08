@@ -15,13 +15,16 @@
 //   - Smooth surfaces: the G-buffer's normal target keeps a smoothness in its alpha. Read as that from two dumps:
 //     water 249 / 253, Zora's Domain's luminous stone 140..190, Link's shield bright, rock and cliffs 13..60, grass,
 //     wood and terrain below 100, the sky 0; in the field frame 5 % of the picture is over 140 (the pond and the
-//     shield). Pixels from 0.5 reflect, fully from 0.7, with F0 0.04 and Fresnel's rise at a glancing angle damped by
-//     roughness (Lagarde's approximation), their own (normal-mapped) normal, and the colour taken from a blurred copy
-//     of the scene, blurrier the rougher the surface and the longer the ray (a cone's footprint: the copy's mip
-//     log2(distance in pixels x roughness^2)). Characters (Link, what he holds: green) are left out.
-//   - The G-buffer's normal (its fourth target): a view-space normal as two 12-bit octahedral coordinates in RGB,
-//     x = R | G.hi << 8, y = G.lo | B << 4, z negated; on the Zora's Domain lake it matched the depth's normal to a
-//     median dot of 0.993.
+//     shield). Pixels from 0.5 reflect, fully from 0.7, with F0 0.04 and the depth's normal. Soft: Fresnel's rise at
+//     a glancing angle damped by roughness (Lagarde's approximation) and the colour from a blurred copy of the scene,
+//     blurrier the rougher the surface and the longer the ray (mip log2(1 + ray pixels x roughness^2 x 0.15), at most
+//     1/8 size). Sharp: as polished, no blur. Characters (Link, what he holds: green) are left out.
+//   - The G-buffer's normal (its fourth target), read as two 12-bit octahedral coordinates in RGB (x = R | G.hi << 8,
+//     y = G.lo | B << 4, z negated): right on water (the Zora's Domain lake: a median dot of 0.993 with the depth's
+//     normal), so water takes its ripples from it. Not on other surfaces: on Zora's Domain's polished floor (frame
+//     5155) that x moves in steps of 0.125 (G's high nibble flips while R stays 5..6), 13 degrees off the floor's
+//     normal at the median, and the reflections broke into blocks; no ordering of its six nibbles fit floors and
+//     walls together. So the surfaces use the depth's normal (exact on flat floors, faceted on rounded ones).
 //   - The ray: in screen space, 32 steps (denser near the start) from the pixel to where the ray leaves the scene or
 //     comes too near the camera, perspective-correct depth (1/w), a hit where it passes behind the depth buffer by
 //     less than a thickness, refined by 6 halvings. Rays that hit nothing leave the game's picture as it was.
@@ -30,7 +33,7 @@
 //     lighting pass has ended).
 //   Only what is on screen can be reflected, and only from the front: Link's reflection shows his back, a reflection
 //   fades out at the picture's edges, and what the camera does not see (behind it, above the picture) is not there.
-// RX_SSR=0/1/2 overrides Water reflections, RX_SSR_SURFACES=0/1 Surface reflections; RX_SSR_DEBUG=1 paints what
+// RX_SSR=0/1/2 overrides Water reflections, RX_SSR_SURFACES=0/1/2 Surface reflections; RX_SSR_DEBUG=1 paints what
 // reflects (water magenta, surfaces cyan by their weight), 2 shows the reflections alone; RX_SSR_STEPS=<n> (8..128);
 // RX_SSR_SURFACE_MIN=<smoothness from which surfaces reflect, 0..1>, RX_SSR_SURFACE_STRENGTH=<x>;
 // RX_SSR_LIGHT_FS=<hex> another lighting program to follow.
@@ -65,7 +68,8 @@ struct U {
   lin: vec4<f32>,          // projection [2][2], [2][3]; depth = a * NDC z + b: a, b
   p: vec4<f32>,            // steps, debug, noise offset, water's ripple
   q: vec4<f32>,            // water's strength (0: off), water's F0, edge fade, surfaces on
-  r: vec4<f32>,            // surfaces: smoothness from which they reflect, strength, the copy's last mip, F0
+  r: vec4<f32>,            // surfaces: smoothness from which they reflect, strength, the blur's last mip, F0
+  s: vec4<f32>,            // surfaces: the blur's scale (0: sharp), 0, 0, 0
 };
 @group(0) @binding(0) var scene: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
@@ -129,31 +133,27 @@ fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0
   }
   let p = view_at(fp.xy, d);
   let v = normalize(p);
-  let gn = gbuf_normal(nt);
-  var n = gn;
-  var ng = gn;
-  if (water) {
-    // the surface's normal: from the depth (the nearer neighbour each way), with the G-buffer's ripples
-    let pl = view_at(fp.xy - vec2<f32>(1.0, 0.0), depth_at(q - vec2<i32>(1, 0)));
-    let pr = view_at(fp.xy + vec2<f32>(1.0, 0.0), depth_at(q + vec2<i32>(1, 0)));
-    let pu = view_at(fp.xy - vec2<f32>(0.0, 1.0), depth_at(q - vec2<i32>(0, 1)));
-    let pd = view_at(fp.xy + vec2<f32>(0.0, 1.0), depth_at(q + vec2<i32>(0, 1)));
-    let dx = select(p - pl, pr - p, abs(pr.z - p.z) < abs(p.z - pl.z));
-    let dy = select(p - pu, pd - p, abs(pd.z - p.z) < abs(p.z - pu.z));
-    let c = cross(dy, dx);
-    let cl = length(c);
-    if (cl > 1e-12) { ng = c / cl; }
-    if (dot(ng, -p) < 0.0) { ng = -ng; }
-    n = normalize(mix(ng, gn, u.p.w));
-  } else if (dot(n, -v) < 0.0) {
-    n = -n;
-    ng = n;
-  }
+  // the surface's normal: from the depth (the nearer neighbour each way); on water with the G-buffer's ripples
+  let pl = view_at(fp.xy - vec2<f32>(1.0, 0.0), depth_at(q - vec2<i32>(1, 0)));
+  let pr = view_at(fp.xy + vec2<f32>(1.0, 0.0), depth_at(q + vec2<i32>(1, 0)));
+  let pu = view_at(fp.xy - vec2<f32>(0.0, 1.0), depth_at(q - vec2<i32>(0, 1)));
+  let pd = view_at(fp.xy + vec2<f32>(0.0, 1.0), depth_at(q + vec2<i32>(0, 1)));
+  let dx = select(p - pl, pr - p, abs(pr.z - p.z) < abs(p.z - pl.z));
+  let dy = select(p - pu, pd - p, abs(pd.z - p.z) < abs(p.z - pu.z));
+  let c = cross(dy, dx);
+  let cl = length(c);
+  var ng = -v;
+  if (cl > 1e-12) { ng = c / cl; }
+  if (dot(ng, -p) < 0.0) { ng = -ng; }
+  var n = ng;
+  if (water) { n = normalize(mix(ng, gbuf_normal(nt), u.p.w)); }
   let r = reflect(v, n);
   let cosv = clamp(dot(-v, ng), 0.0, 1.0);
   var fres = u.q.y + (1.0 - u.q.y) * pow(1.0 - cosv, 5.0);
   let rough = 1.0 - clamp(gloss, 0.0, 1.0);
-  if (!water) { fres = u.r.w + (max(gloss, u.r.w) - u.r.w) * pow(1.0 - cosv, 5.0); }
+  // (Soft: Fresnel's rise at a glancing angle damped by roughness; Sharp: as polished)
+  if (!water && u.s.x > 0.0) { fres = u.r.w + (max(gloss, u.r.w) - u.r.w) * pow(1.0 - cosv, 5.0); }
+  if (!water && u.s.x <= 0.0) { fres = u.r.w + (1.0 - u.r.w) * pow(1.0 - cosv, 5.0); }
   // the ray in screen space: cut before the near plane, then where it leaves the scene
   var len = u.tex.w;
   if (r.z > 0.0) { len = min(len, (-u.tex.z * 1.5 - p.z) / r.z); }
@@ -201,7 +201,7 @@ fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0
   let edge = clamp(min(min(hu.x, 1.0 - hu.x), min(hu.y, 1.0 - hu.y)) * u.q.z, 0.0, 1.0);
   // the colour: sharp on water, from the blurred copy on the rougher surfaces (the cone's footprint at the hit)
   var lod = 0.0;
-  if (!water) { lod = clamp(log2(max(length(h.xy - s0.xy) * rough * rough, 1.0)), 0.0, u.r.z); }
+  if (!water) { lod = clamp(log2(1.0 + length(h.xy - s0.xy) * rough * rough * u.s.x), 0.0, u.r.z); }
   let col = textureSampleLevel(scene, smp, h.xy * u.tex.xy, lod).rgb;
   let facing = clamp(1.0 - r.z * 2.0, 0.0, 1.0);
   var w = fres * edge * facing;
@@ -227,9 +227,9 @@ const char* kDownWgsl = R"(
 )";
 
 struct Uniforms {
-    float proj[16], inv_proj[16], size[4], tex[4], lin[4], p[4], q[4], r[4];
+    float proj[16], inv_proj[16], size[4], tex[4], lin[4], p[4], q[4], r[4], s[4];
 };
-static_assert(sizeof(Uniforms) == 224, "the WGSL struct U");
+static_assert(sizeof(Uniforms) == 240, "the WGSL struct U");
 
 constexpr int kRing = 8;   // (uniform buffers and bind groups in flight: recordings are replayed later)
 
@@ -263,10 +263,10 @@ int water_mode() {
     if (env && *env) return std::clamp(atoi(env), 0, 2);
     return std::clamp((int)hos_water_reflections, 0, 2);
 }
-int surface_mode() {
+int surface_mode() {   // (0 off, 1 soft, 2 sharp)
     static const char* env = getenv("RX_SSR_SURFACES");
-    if (env && *env) return std::clamp(atoi(env), 0, 1);
-    return std::clamp((int)hos_surface_reflections, 0, 1);
+    if (env && *env) return std::clamp(atoi(env), 0, 2);
+    return std::clamp((int)hos_surface_reflections, 0, 2);
 }
 
 bool invert(const double m[16], double out[16]) {   // (row-major; Gauss-Jordan with partial pivoting)
@@ -442,7 +442,7 @@ void run(Image* target, int water, int surf) {
         log_limited("ssr_skip", 20, "rx: reflections skipped a frame: %s", why);
     };
     if (cur.frame != frame_number) return skip("no scene camera this frame");
-    if (!scene_depth || !scene_mask || !scene_normal || !scene_color) return skip("the G-buffer is not known yet");
+    if (!scene_depth || !scene_mask || !scene_normal || !scene_color) return;   // (the G-buffer not seen yet: menus)
     if (!target || target->tex != scene_color) return skip("the lighting drew into another target than the scene's");
     const uint32_t rw = (uint32_t)cur.width, rh = (uint32_t)cur.height;
     const uint32_t tw = target->width, th = target->height;
@@ -489,7 +489,10 @@ void run(Image* target, int water, int surf) {
         static const float sstr =
             getenv("RX_SSR_SURFACE_STRENGTH") ? std::clamp((float)atof(getenv("RX_SSR_SURFACE_STRENGTH")), 0.0f, 4.0f)
                                               : 1.0f;
-        u.r[0] = smin, u.r[1] = sstr, u.r[2] = (float)(st.mips - 1), u.r[3] = 0.04f;
+        // (the blur: Soft, a cone's footprint at the hit (ray length in pixels x roughness^2 x 0.15) up to 1/8 size;
+        // Sharp, none: a mirror's reflection on every smooth surface)
+        u.r[0] = smin, u.r[1] = sstr, u.r[2] = surf == 2 ? 0.0f : std::min(3.0f, (float)(st.mips - 1)), u.r[3] = 0.04f;
+        u.s[0] = surf == 2 ? 0.0f : 0.15f;
     }
     const int slot = (int)(st.runs % kRing);
     wgpuQueueWriteBuffer(dev.queue, st.ub[slot], 0, &u, sizeof u);
@@ -573,13 +576,13 @@ void run(Image* target, int water, int surf) {
                 (int)u.p[0], st.mips);
     }
     if (water != st.last_water || surf != st.last_surf) {
-        static const char* const wn[3] = {"off", "Natural", "Clear"};
-        log_limited("ssr_mode", 50, "rx: reflections: water %s, surfaces %s", wn[water], surf ? "on" : "off");
+        static const char* const wn[3] = {"off", "Natural", "Clear"}, *const sn[3] = {"off", "Soft", "Sharp"};
+        log_limited("ssr_mode", 50, "rx: reflections: water %s, surfaces %s", wn[water], sn[surf]);
         st.last_water = water, st.last_surf = surf;
     }
     flush_clears_now();   // (a clear still waiting would be folded into the pass after ours)
     end_render_pass("ssr");
-    encode(encoder(), false, surf ? st.mips : 1);   // (the blurred mips for the surfaces: water reads the sharp copy)
+    encode(encoder(), false, surf == 1 ? std::min(st.mips, 4u) : 1);   // (the blur's mips: Soft surfaces only)
     wgpuTextureViewRelease(tview);   // (after the recording took its references)
     bump_image_version(target);      // (copies made of it before are stale)
     st.runs++;

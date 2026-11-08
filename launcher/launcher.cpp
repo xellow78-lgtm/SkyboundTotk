@@ -297,7 +297,8 @@ std::vector<Setting> settings_list() {
                        {L"Game's own", L"x1.5", L"x2", L"x3"}};
     s[S_REFLECT] = {K_OPTION, L"Water reflections", L"The world mirrored on the water (only what is on screen).",
                     {L"Off", L"Natural", L"Clear"}};
-    s[S_SURFREFL] = {K_TOGGLE, L"Surface reflections", L"Polished stone, ice and metal mirror what is on screen."};
+    s[S_SURFREFL] = {K_OPTION, L"Surface reflections", L"Polished stone, ice and metal mirror what is on screen.",
+                     {L"Off", L"Soft", L"Sharp"}};
     s[S_REFLEX] = {K_OPTION, L"NVIDIA Reflex", L"Less input lag (NVIDIA, with the DLSS library).",
                    {L"Off", L"On", L"On + Boost"}};
     s[S_BUTTONS] = {K_OPTION, L"Button icons", L"Automatic: the device you play with.",

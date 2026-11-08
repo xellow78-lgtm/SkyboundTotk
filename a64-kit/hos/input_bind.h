@@ -49,7 +49,7 @@ typedef struct {
     int water_reflections;                 /* screen-space reflections on the water (rx_ssr.cpp, live): 0 off,
                                               1 natural (with the ripples), 2 clear */
     int surface_reflections;               /* ...and on smooth surfaces: polished stone, ice, metal (rx_ssr.cpp,
-                                              live): 0 off, 1 on */
+                                              live): 0 off, 1 soft (blurrier on rougher surfaces), 2 sharp */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */

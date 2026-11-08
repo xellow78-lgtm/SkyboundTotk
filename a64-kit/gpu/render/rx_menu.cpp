@@ -68,7 +68,7 @@ const char* const kAnisoNames[5] = {"Game's own", "2x", "4x", "8x", "16x"};
 const char* const kShadowResNames[4] = {"Game's own", "1024", "1536", "2048"};   // (input.ini shadow_resolution)
 const char* const kShadowDistNames[4] = {"Game's own", "x1.5", "x2", "x3"};     // (input.ini shadow_distance)
 const char* const kWaterNames[3] = {"Off", "Natural", "Clear"};                  // (input.ini water_reflections)
-const char* const kOnOffNames[2] = {"Off", "On"};                                // (input.ini surface_reflections)
+const char* const kSurfaceNames[3] = {"Off", "Soft", "Sharp"};                  // (input.ini surface_reflections)
 const char* const kReflexNames[3] = {"Off", "On", "On + Boost"};
 const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 200, 0};   // (200 at most: nn_vi.c FPS_MAX)
 const char* const kFpsNames[8] = {"30", "60", "90", "120", "144", "165", "200", "Display's rate"};
@@ -145,8 +145,8 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
         add(kOption, kReflections, "Water reflections", kWaterNames[std::clamp(b.water_reflections, 0, 2)],
             b.water_reflections ? "The world mirrored on the water: only what is on screen. Clear: fewer ripples."
                                 : "Mirrors what is on screen in the water (screen-space reflections).");
-        add(kOption, kSurfaceRefl, "Surface reflections", kOnOffNames[std::clamp(b.surface_reflections, 0, 1)],
-            "Polished stone, ice and metal mirror what is on screen; blurrier on rougher surfaces.");
+        add(kOption, kSurfaceRefl, "Surface reflections", kSurfaceNames[std::clamp(b.surface_reflections, 0, 2)],
+            "Polished stone, ice and metal mirror what is on screen. Soft: blurrier on rougher ones. Sharp: mirrors.");
         Row& rf = add(kOption, kReflex, "NVIDIA Reflex", kReflexNames[std::clamp(b.reflex, 0, 2)],
                       reflex_available() ? "Less input lag. Boost also keeps the GPU's clocks up."
                                          : "Needs an NVIDIA GPU on Vulkan.");
@@ -287,7 +287,7 @@ void change(State& s, const Row& r, int dir) {
     case kShadowRes: b.shadow_res = (b.shadow_res + dir + 4) % 4; break;
     case kShadowDist: b.shadow_dist = (b.shadow_dist + dir + 4) % 4; break;
     case kReflections: b.water_reflections = (b.water_reflections + dir + 3) % 3; break;
-    case kSurfaceRefl: b.surface_reflections = !b.surface_reflections; break;
+    case kSurfaceRefl: b.surface_reflections = (b.surface_reflections + dir + 3) % 3; break;
     case kReflex: b.reflex = (b.reflex + dir + 3) % 3; break;
     case kFps: b.fps_limit = kFpsValues[(fps_index(b.fps_limit) + dir + 8) % 8]; break;
     case kOutRes: b.output_res = (b.output_res + dir + 4) % 4; break;
