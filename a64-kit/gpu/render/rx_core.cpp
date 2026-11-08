@@ -2221,6 +2221,8 @@ void queue_upload(WGPUBuffer buffer, uint64_t offset, const void* data, uint64_t
     open_uploads.push_back({buffer, offset, src, size});
 }
 
+void after_this_batch(std::function<void(bool)> f) { open_afters.push_back(std::move(f)); }
+
 void writeback_after_batch(uint64_t rw_offset, uint64_t size, uint64_t gpu_va) {
     open_writebacks.push_back({rw_offset, size, gpu_va});
 }

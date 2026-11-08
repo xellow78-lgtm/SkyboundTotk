@@ -3770,6 +3770,70 @@ uint32_t watch_draws;        // (draws this frame, any program)
 
 void watch_fs_render_off() { watch_render_off++; }
 
+/* RX_WATCH_FLAGS=<pixel program hex>:<GPU VA hex>:<size hex> (debugging, light): at each draw of that program, the
+   range as the GPU holds it for the draw (the buffer cache's copy, copied in command order and read back after the
+   batch, no wait), logged as how many of its 16-byte entries hold a nonzero word (up to 3000 lines). For the Depths'
+   gloom: its tile composite (fs ce51f5ea116fe892) draws only the tiles whose flag (9376f1c0 + 16 * tile) the half-size
+   gloom pass set; a dispatch at the frame's start clears them all. */
+void watch_flags_draw(uint64_t fs_key) {
+    static uint64_t want = 0, va = 0, size = 0;
+    static const bool parsed = [] {
+        if (const char* e = getenv("RX_WATCH_FLAGS")) {
+            unsigned long long a = 0, b = 0, c = 0;
+            if (std::sscanf(e, "%llx:%llx:%llx", &a, &b, &c) == 3) want = a, va = b, size = (c + 15) & ~15ull;
+        }
+        return true;
+    }();
+    (void)parsed;
+    static int lines = 0;
+    if (!want || fs_key != want || !size || size > (1u << 20) || lines >= 3000) return;
+    const BufferRef ref = guest_buffer(va, size);
+    if (!ref.buffer || ref.offset % 4) return;
+    lines++;
+    end_render_pass("pe_watch_flags");
+    WGPUBufferDescriptor bd{};
+    bd.label = sv("rx watch flags");
+    bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+    bd.size = size;
+    WGPUBuffer staging = wgpuDeviceCreateBuffer(dev.device, &bd);
+    if (!staging) return;
+    ce_copy_buffer_to_buffer(encoder(), ref.buffer, ref.offset, staging, 0, size);
+    struct Pending {
+        WGPUBuffer buffer;
+        uint64_t size;
+        int64_t frame;
+        bool gpu_written;
+    };
+    auto* p = new Pending{staging, size, frame_number, gpu_written(va, size)};
+    after_this_batch([p](bool submitted) {
+        if (!submitted) {
+            wgpuBufferRelease(p->buffer);
+            delete p;
+            return;
+        }
+        WGPUBufferMapCallbackInfo mc{};
+        mc.mode = WGPUCallbackMode_AllowSpontaneous;
+        mc.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+            auto* p = static_cast<Pending*>(u1);
+            if (status == WGPUMapAsyncStatus_Success) {
+                const auto* w = static_cast<const uint32_t*>(wgpuBufferGetConstMappedRange(p->buffer, 0, p->size));
+                uint32_t entries = 0, nonzero = 0;
+                for (uint64_t i = 0; w && i + 4 <= p->size / 4; i += 4) {
+                    entries++;
+                    nonzero += (w[i] | w[i + 1] | w[i + 2] | w[i + 3]) != 0;
+                }
+                hos_log("rx-flags: frame %lld: %u of %u entries nonzero (gpu-written %d)", (long long)p->frame, nonzero,
+                        entries, (int)p->gpu_written);
+                wgpuBufferUnmap(p->buffer);
+            }
+            wgpuBufferRelease(p->buffer);
+            delete p;
+        };
+        mc.userdata1 = p;
+        wgpuBufferMapAsync(p->buffer, WGPUMapMode_Read, 0, p->size, mc);
+    });
+}
+
 void watch_fs_present() {
     std::vector<WatchFs>& w = watch_fs();
     if (w.empty()) return;
@@ -3871,6 +3935,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     if (!watch_fs().empty() && prog->has_fs)
         for (WatchFs& x : watch_fs())
             if (x.key == prog->fs.key) watch_outcome.w = &x, watch_outcome.instances = d.instances;
+    if (prog->has_fs) watch_flags_draw(prog->fs.key);   // (RX_WATCH_FLAGS)
     if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) {   // (rx_fsr2.cpp)
         watch_outcome.skipped = "replaced by the upscaler";
         return;

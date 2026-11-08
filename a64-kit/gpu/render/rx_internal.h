@@ -5,6 +5,7 @@
 #include <bitset>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <atomic>
@@ -770,6 +771,7 @@ struct NvnDraw {
 };
 void nvn_draw(NvnState& s, const NvnDraw& d);                              // rx_draw.cpp
 void watch_fs_present();     // (RX_WATCH_FS: the frame's counts, at its present; rx_draw.cpp)
+void after_this_batch(std::function<void(bool)> f);   // (runs after the open batch's submit: true if submitted; rx_core.cpp)
 void watch_fs_render_off();  // (RX_WATCH_FS: a draw the render condition skipped)
 void nvn_dispatch(NvnState& s, uint32_t x, uint32_t y, uint32_t z);        // rx_compute.cpp
 void nvn_clear_color(Image* im, const float rgba[4], uint32_t mask, const int32_t* scissor);           // rx_core.cpp
