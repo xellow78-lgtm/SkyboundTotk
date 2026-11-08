@@ -3776,17 +3776,27 @@ void watch_fs_render_off() { watch_render_off++; }
    gloom: its tile composite (fs ce51f5ea116fe892) draws only the tiles whose flag (9376f1c0 + 16 * tile) the half-size
    gloom pass set; a dispatch at the frame's start clears them all. */
 void watch_flags_draw(uint64_t fs_key) {
-    static uint64_t want = 0, va = 0, size = 0;
-    static const bool parsed = [] {
-        if (const char* e = getenv("RX_WATCH_FLAGS")) {
-            unsigned long long a = 0, b = 0, c = 0;
-            if (std::sscanf(e, "%llx:%llx:%llx", &a, &b, &c) == 3) want = a, va = b, size = (c + 15) & ~15ull;
-        }
-        return true;
+    struct Spec { uint64_t fs, va, size; };
+    static const std::vector<Spec> specs = [] {   // (several: <fs>:<va>:<size>[;...])
+        std::vector<Spec> v;
+        if (const char* e = getenv("RX_WATCH_FLAGS"))
+            for (const char* p = e; *p;) {
+                unsigned long long a = 0, b = 0, c = 0;
+                int used = 0;
+                if (std::sscanf(p, "%llx:%llx:%llx%n", &a, &b, &c, &used) != 3 || !used) break;
+                v.push_back({a, b, (c + 15) & ~15ull});
+                p += used;
+                if (*p == ';' || *p == ',') p++;
+            }
+        return v;
     }();
-    (void)parsed;
     static int lines = 0;
-    if (!want || fs_key != want || !size || size > (1u << 20) || lines >= 3000) return;
+    const Spec* sp = nullptr;
+    for (const Spec& s : specs)
+        if (s.fs == fs_key) sp = &s;
+    if (!sp || lines >= 6000) return;
+    const uint64_t va = sp->va, size = sp->size;
+    if (!size || size > (1u << 20)) return;
     const BufferRef ref = guest_buffer(va, size);
     if (!ref.buffer || ref.offset % 4) return;
     lines++;
@@ -3803,8 +3813,9 @@ void watch_flags_draw(uint64_t fs_key) {
         uint64_t size;
         int64_t frame;
         bool gpu_written;
+        uint32_t fs;
     };
-    auto* p = new Pending{staging, size, frame_number, gpu_written(va, size)};
+    auto* p = new Pending{staging, size, frame_number, gpu_written(va, size), (uint32_t)(fs_key >> 32)};
     after_this_batch([p](bool submitted) {
         if (!submitted) {
             wgpuBufferRelease(p->buffer);
@@ -3817,13 +3828,16 @@ void watch_flags_draw(uint64_t fs_key) {
             auto* p = static_cast<Pending*>(u1);
             if (status == WGPUMapAsyncStatus_Success) {
                 const auto* w = static_cast<const uint32_t*>(wgpuBufferGetConstMappedRange(p->buffer, 0, p->size));
-                uint32_t entries = 0, nonzero = 0;
+                // (per word of the 16-byte entries: how many are nonzero; TOTK's gloom entries hold two flags, one a
+                // G-buffer pass sets on every tile and the one the composite reads)
+                uint32_t entries = 0, nonzero[4] = {};
                 for (uint64_t i = 0; w && i + 4 <= p->size / 4; i += 4) {
                     entries++;
-                    nonzero += (w[i] | w[i + 1] | w[i + 2] | w[i + 3]) != 0;
+                    for (int k = 0; k < 4; k++) nonzero[k] += w[i + k] != 0;
                 }
-                hos_log("rx-flags: frame %lld: %u of %u entries nonzero (gpu-written %d)", (long long)p->frame, nonzero,
-                        entries, (int)p->gpu_written);
+                hos_log("rx-flags: frame %lld fs %08x: of %u entries, nonzero words +0 %u +4 %u +8 %u +12 %u "
+                        "(gpu-written %d)", (long long)p->frame, p->fs, entries, nonzero[0], nonzero[1], nonzero[2],
+                        nonzero[3], (int)p->gpu_written);
                 wgpuBufferUnmap(p->buffer);
             }
             wgpuBufferRelease(p->buffer);
