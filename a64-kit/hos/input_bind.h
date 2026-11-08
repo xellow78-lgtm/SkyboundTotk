@@ -48,6 +48,8 @@ typedef struct {
                                               0 the game's own (20 / 40 / 80 / 160 m), 1 x1.5, 2 x2, 3 x3 */
     int water_reflections;                 /* screen-space reflections on the water (rx_ssr.cpp, live): 0 off,
                                               1 natural (with the ripples), 2 clear */
+    int surface_reflections;               /* ...and on smooth surfaces: polished stone, ice, metal (rx_ssr.cpp,
+                                              live): 0 off, 1 on */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */
@@ -59,6 +61,7 @@ extern volatile int hos_fps_counter;            /* Bindings.fps_counter */
 extern volatile int hos_frame_timing;           /* Bindings.frame_timing */
 extern volatile int hos_dlss_preset;            /* Bindings.dlss_preset */
 extern volatile int hos_water_reflections;      /* Bindings.water_reflections */
+extern volatile int hos_surface_reflections;    /* Bindings.surface_reflections */
 
 /* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
 int hos_render_mode_count(void);

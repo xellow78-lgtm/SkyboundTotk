@@ -259,7 +259,7 @@ struct Setting {
 };
 
 enum SettingId {
-    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_VSYNC, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_DLSSMODEL, S_FPS, S_FRAMETIMING, S_FPSCOUNTER, S_ANISO, S_SHADOWRES, S_SHADOWDIST, S_REFLECT, S_REFLEX, S_BUTTONS, S_MOUSECAM,
+    S_SEC_START, S_UPSCALER, S_SHARP, S_DISPLAY, S_WINDOW, S_VSYNC, S_SEC_GAME, S_OUTRES, S_ASPECT, S_RES, S_DLSSMODEL, S_FPS, S_FRAMETIMING, S_FPSCOUNTER, S_ANISO, S_SHADOWRES, S_SHADOWDIST, S_REFLECT, S_SURFREFL, S_REFLEX, S_BUTTONS, S_MOUSECAM,
     S_SENS, S_SEC_FILES, S_MODS, S_MODS_ON, S_SAVES, S_LOG, S_COUNT
 };
 std::vector<Setting> settings_list() {
@@ -297,6 +297,7 @@ std::vector<Setting> settings_list() {
                        {L"Game's own", L"x1.5", L"x2", L"x3"}};
     s[S_REFLECT] = {K_OPTION, L"Water reflections", L"The world mirrored on the water (only what is on screen).",
                     {L"Off", L"Natural", L"Clear"}};
+    s[S_SURFREFL] = {K_TOGGLE, L"Surface reflections", L"Polished stone, ice and metal mirror what is on screen."};
     s[S_REFLEX] = {K_OPTION, L"NVIDIA Reflex", L"Less input lag (NVIDIA, with the DLSS library).",
                    {L"Off", L"On", L"On + Boost"}};
     s[S_BUTTONS] = {K_OPTION, L"Button icons", L"Automatic: the device you play with.",
@@ -437,6 +438,7 @@ double setting_value(int id) {
     case S_SHADOWRES: return g.geti("shadow_resolution", 0);
     case S_SHADOWDIST: return g.geti("shadow_distance", 0);
     case S_REFLECT: return g.geti("water_reflections", 0);
+    case S_SURFREFL: return g.geti("surface_reflections", 0);
     case S_REFLEX: return g.geti("nvidia_reflex", 0);
     case S_BUTTONS: return g.geti("button_icons", 0);
     case S_MOUSECAM: return g.geti("mouse_camera", 1);
@@ -472,6 +474,7 @@ void set_setting(int id, double v) {
     case S_SHADOWRES: g.set("shadow_resolution", std::to_string((int)v)); return;
     case S_SHADOWDIST: g.set("shadow_distance", std::to_string((int)v)); return;
     case S_REFLECT: g.set("water_reflections", std::to_string((int)v)); return;
+    case S_SURFREFL: g.set("surface_reflections", std::to_string((int)v)); return;
     case S_REFLEX: g.set("nvidia_reflex", std::to_string((int)v)); return;
     case S_BUTTONS: g.set("button_icons", std::to_string((int)v)); return;
     case S_MOUSECAM: g.set("mouse_camera", std::to_string((int)v)); return;
