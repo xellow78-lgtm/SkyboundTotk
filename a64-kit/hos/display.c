@@ -441,5 +441,6 @@ void hos_display_start(void) {
         return;
     }
     frame = (uint32_t *)calloc((size_t)FRAME_W * FRAME_H, 4);
+    rx_expect_start();   /* (the game's GPU work waits for the renderer the window's thread starts: rx_wait_start) */
     CreateThread(NULL, 0, display_main, NULL, 0, NULL);
 }

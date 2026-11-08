@@ -15,6 +15,12 @@ extern "C" {
    renderer draws offscreen). Returns 1 when the renderer runs, 0 when the window should show frames itself. */
 int rx_start(void *hwnd);
 int rx_active(void);
+/* The renderer starts on the window's thread while the game boots (hos_display_start calls rx_expect_start first).
+   rx_wait_start: until rx_start has finished (up to 60 s), 1 if the renderer then runs; at once when no start is
+   expected or it already finished. The game's GPU work that comes before the renderer runs waits here instead of
+   being dropped (rx_nvn_submit). */
+void rx_expect_start(void);
+int rx_wait_start(void);
 /* The window's client area changed size. */
 void rx_resize(int width, int height);
 

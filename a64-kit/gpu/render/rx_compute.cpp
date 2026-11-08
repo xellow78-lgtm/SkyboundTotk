@@ -554,7 +554,7 @@ using namespace rx;
 
 extern "C" void rx_compute_launch(void* channel, const uint32_t* regs) {
     (void)channel;
-    if (!rx_active()) return;
+    if (!rx_active() && !rx_wait_start()) return;
     static const bool off = getenv("RX_NO_COMPUTE") != nullptr;   // (debugging)
     if (off) return;
     std::lock_guard lk(mu);

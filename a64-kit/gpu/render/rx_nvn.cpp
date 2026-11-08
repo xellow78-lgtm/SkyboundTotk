@@ -1421,7 +1421,7 @@ extern "C" {
 
 void rx_nvn_submit(const uint64_t* handles, int n) {
     if (RX_WEB) rx::start_replay();
-    if (!rx_active() || n <= 0) return;
+    if (n <= 0 || (!rx_active() && !rx_wait_start())) return;   // (before the renderer runs: waits, rx_wait_start)
     if (replay_sync()) {
         run_submit(handles, (size_t)n);
         std::lock_guard lk(job_mu);
@@ -1519,7 +1519,7 @@ void rx_nvn_finish(void) {
 void rx_nvn_present(const nvn_tex* t, const int crop[4]) {
     (void)crop;
     if (RX_WEB) rx::start_replay();
-    if (!t || !rx_active()) return;
+    if (!t || (!rx_active() && !rx_wait_start())) return;
     const uint64_t guest = nvn_gpu_guest(t->gpu);
     if (replay_sync()) {
         run_present(guest, t->d.width, t->d.height);

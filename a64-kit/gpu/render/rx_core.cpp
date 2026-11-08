@@ -3847,7 +3847,51 @@ using namespace rx;
 
 extern "C" {
 
+/* The renderer starts on the window's thread (hos/display.c) while the game boots on its own threads. Until
+   2026-11-08 the game's GPU work that came before rx_start had finished was dropped (rx_nvn_submit: !rx_active()).
+   With DLSS that window is about a second longer (NGX's extension queries and its start come before and after the
+   device), and TOTK's first submits fell in it: the work it does once at boot was lost, among it the Depths' gloom
+   noise volumes (64x64x64 BC4, drawn slice by slice through RGBA16UI views and written back to guest memory; the
+   frame dump showed their memory all zeros, never drawn), so the gloom drew as a flat sheet without its noise for the
+   whole session, with DLSS and also with FSR 2 when DLSS's queries ran (RX_DLSS=1). Now game threads wait for the
+   start (rx_wait_start). */
+static std::mutex start_mu;
+static std::condition_variable start_cv;
+static bool start_expected, start_done;
+
+void rx_expect_start(void) {
+    std::lock_guard lk(start_mu);
+    start_expected = true;
+}
+
+int rx_wait_start(void) {
+    if (started) return 1;
+    if (RX_WEB) return 0;   // (the web: the replay thread starts the renderer, start_replay)
+    std::unique_lock lk(start_mu);
+    if (!start_expected || start_done) return started;
+    const int64_t t0 = hos_now_ns();
+    start_cv.wait_for(lk, std::chrono::seconds(60), [] { return start_done; });
+    if (!start_done) start_expected = false;   // (no renderer came: the rest is dropped at once, as before)
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        hos_log("rx: the game's first GPU work waited %.0f ms for the renderer to start%s", (hos_now_ns() - t0) / 1e6,
+                start_done ? "" : " (60 s: gave up, the work is dropped)");
+    return started;
+}
+
+static int start_renderer(void* hwnd);
+
 int rx_start(void* hwnd) {
+    const int r = start_renderer(hwnd);
+    {
+        std::lock_guard lk(start_mu);
+        start_done = true;
+    }
+    start_cv.notify_all();
+    return r;
+}
+
+static int start_renderer(void* hwnd) {
     stats_on = getenv("RX_STATS") && std::atoi(getenv("RX_STATS")) != 0;
     frame_dump_enabled = getenv("RX_DUMP_FRAME") || getenv("RX_DUMP_AT");
 #ifdef __EMSCRIPTEN__
