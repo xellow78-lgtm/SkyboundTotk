@@ -88,6 +88,51 @@ const char* kFlowWgsl = R"(
 }
 )";
 
+// The same search with the new frame's search area in workgroup memory: each group of 8x8 vectors loads the
+// (36 + 2 RADIUS)^2 quarter-size texels its blocks can reach once, instead of every vector reading its 64 x (2 RADIUS
+// + 1)^2 from the texture (~18,500 texture reads a vector at RADIUS 8: ~300 M a frame at 2560x1600). Same texels, same
+// order, same costs: the same vectors (checked on lavapipe against kFlowWgsl). RADIUS up to 14 (16 KB of workgroup
+// memory); above, kFlowWgsl.
+const char* kFlowSharedWgsl = R"(
+@group(0) @binding(0) var la: texture_2d<f32>;
+@group(0) @binding(1) var lb: texture_2d<f32>;
+@group(0) @binding(2) var flow: texture_storage_2d<rgba16float, write>;
+var<workgroup> tile: array<f32, TILE>;
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g: vec3<u32>,
+                                       @builtin(workgroup_id) wg: vec3<u32>,
+                                       @builtin(local_invocation_index) li: u32) {
+  let fd = textureDimensions(flow);
+  let lm = vec2<i32>(textureDimensions(la)) - vec2<i32>(1);
+  // the group's search area in the new frame, from its corner (texels clamped as the texture reads were)
+  let org = vec2<i32>(wg.xy) * 32 - vec2<i32>(2 + RADIUS);
+  for (var k = i32(li); k < SPAN * SPAN; k += 64) {
+    tile[k] = textureLoad(lb, clamp(org + vec2<i32>(k % SPAN, k / SPAN), vec2<i32>(0), lm), 0).r;
+  }
+  workgroupBarrier();
+  if (g.x >= fd.x || g.y >= fd.y) { return; }
+  let c = vec2<i32>(g.xy) * 4 + vec2<i32>(2);
+  var pa: array<f32, 64>;
+  for (var i = 0; i < 64; i++) {
+    pa[i] = textureLoad(la, clamp(c + vec2<i32>(i % 8 - 4, i / 8 - 4), vec2<i32>(0), lm), 0).r;
+  }
+  let lc = c - org;
+  var best = 1e9;
+  var bv = vec2<i32>(0);
+  for (var dy = -RADIUS; dy <= RADIUS; dy++) {
+    for (var dx = -RADIUS; dx <= RADIUS; dx++) {
+      var sad = 0.0;
+      for (var i = 0; i < 64; i++) {
+        let q = lc + vec2<i32>(i % 8 - 4 + dx, i / 8 - 4 + dy);
+        sad += abs(pa[i] - tile[q.y * SPAN + q.x]);
+      }
+      let cost = sad + 0.04 * f32(abs(dx) + abs(dy));
+      if (cost < best) { best = cost; bv = vec2<i32>(dx, dy); }
+    }
+  }
+  textureStore(flow, g.xy, vec4<f32>(vec2<f32>(bv) * 4.0, best / 64.0, 1.0));
+}
+)";
+
 const char* kMedianWgsl = R"(
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var dst: texture_storage_2d<rgba16float, write>;
@@ -262,8 +307,14 @@ void init_pipelines() {
     {   // RX_FRAMEGEN_RADIUS=<quarter-size texels> searched each way (default 8: +-32 pixels)
         const char* e = getenv("RX_FRAMEGEN_RADIUS");
         const int r = e ? std::clamp(atoi(e), 1, 16) : 8;
-        std::string src = std::string("const RADIUS: i32 = ") + std::to_string(r) + ";\n" + kFlowWgsl;
+        // (RX_FRAMEGEN_SHARED_FLOW=0: the texture-read search, as before 2026-11-08)
+        const bool shared = r <= 14 && !(getenv("RX_FRAMEGEN_SHARED_FLOW") && *getenv("RX_FRAMEGEN_SHARED_FLOW") == '0');
+        const int span = 36 + 2 * r;
+        std::string src = std::string("const RADIUS: i32 = ") + std::to_string(r) + ";\nconst SPAN: i32 = " +
+                          std::to_string(span) + ";\nconst TILE: u32 = " + std::to_string(span * span) + "u;\n" +
+                          (shared ? kFlowSharedWgsl : kFlowWgsl);
         fg.flow = make_compute(src.c_str(), "rx framegen flow");
+        hos_log("rx: frame interpolation: motion search +-%d pixels%s", 4 * r, shared ? " (workgroup memory)" : "");
     }
     fg.median = make_compute(kMedianWgsl, "rx framegen median");
     fg.synth = make_compute(kSynthWgsl, "rx framegen synth");
@@ -310,9 +361,10 @@ void ensure_size(uint32_t w, uint32_t h) {
     fg.have_prev = false;
 }
 
-/// A compute pass: `pipe` over x * y groups of 8x8 with these bindings (textures, then a sampler / buffer)
+/// A compute pass: `pipe` over x * y groups of 8x8 with these bindings (textures, then a sampler / buffer); `tw`: its
+/// timestamps (RX_GPU_TIMING)
 void dispatch(WGPUCommandEncoder e, WGPUComputePipeline pipe, std::initializer_list<WGPUBindGroupEntry> entries,
-              uint32_t w, uint32_t h) {
+              uint32_t w, uint32_t h, const WGPUPassTimestampWrites* tw = nullptr) {
     std::vector<WGPUBindGroupEntry> be(entries);
     for (size_t i = 0; i < be.size(); i++) be[i].binding = (uint32_t)i;
     WGPUBindGroupLayout layout = wgpuComputePipelineGetBindGroupLayout(pipe, 0);
@@ -321,7 +373,9 @@ void dispatch(WGPUCommandEncoder e, WGPUComputePipeline pipe, std::initializer_l
     bd.entryCount = be.size();
     bd.entries = be.data();
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.device, &bd);
-    WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(e, nullptr);
+    WGPUComputePassDescriptor cd{};
+    cd.timestampWrites = tw;
+    WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(e, tw ? &cd : nullptr);
     wgpuComputePassEncoderSetPipeline(p, pipe);
     wgpuComputePassEncoderSetBindGroup(p, 0, bg, 0, nullptr);
     wgpuComputePassEncoderDispatchWorkgroups(p, (w + 7) / 8, (h + 7) / 8, 1);
@@ -497,6 +551,89 @@ int64_t framegen_web_tick() {
 }
 #endif
 
+// RX_GPU_TIMING=1 (measuring): each stage's GPU time on the frames that make in-between frames, logged every 5 s
+// (the copy into the shown set and the presents are not in it). Four readback buffers in turn; a frame finding none
+// free is not timed.
+constexpr int kStages = 3 + kMaxMult;   // copy, luma, motion search, median, then each made frame
+struct FgTimer {
+    bool init = false;
+    WGPUQuerySet qs = nullptr;
+    WGPUBuffer resolve = nullptr;
+    struct Slot {
+        WGPUBuffer read = nullptr;
+        std::atomic<int> state{0};   // 0 free, 1 mapping, 2 mapped, 3 failed
+        int stages = 0;
+    } slots[4];
+    double ns[kStages] = {};
+    int64_t frames = 0, since = 0;
+    WGPUPassTimestampWrites tw[kStages] = {};
+} fgt;
+void fg_timer_collect() {
+#if RX_WEB
+    static const double period = 1.0;   // (the browser's timestamps are nanoseconds already)
+#else
+    static const double period = wgpuQueueGetTimestampPeriod(dev.queue);
+#endif
+    for (FgTimer::Slot& s : fgt.slots) {
+        const int st = s.state.load();
+        if (st == 3) s.state = 0;
+        if (st != 2) continue;
+        const auto* ts = static_cast<const uint64_t*>(wgpuBufferGetConstMappedRange(s.read, 0, (size_t)s.stages * 16));
+        bool sane = ts != nullptr;
+        double add[kStages] = {};
+        for (int k = 0; sane && k < s.stages; k++) {
+            const double d = ts[2 * k + 1] > ts[2 * k] ? (double)(ts[2 * k + 1] - ts[2 * k]) * period : 0;
+            if (d > 1e9) sane = false;   // (a pass the queue split oddly: not a real time)
+            add[k] = d;
+        }
+        wgpuBufferUnmap(s.read);
+        s.state = 0;
+        if (!sane) continue;
+        for (int k = 0; k < kStages; k++) fgt.ns[k] += add[k];
+        fgt.frames++;
+    }
+    const int64_t now = hos_now_ns();
+    if (!fgt.since) fgt.since = now;
+    if (now - fgt.since < 5000000000LL || !fgt.frames) return;
+    const double f = (double)fgt.frames;
+    double made = 0, total = 0;
+    for (int k = 0; k < kStages; k++) total += fgt.ns[k] / f / 1e6;
+    for (int k = 4; k < kStages; k++) made += fgt.ns[k] / f / 1e6;
+    hos_log("rx: frame interpolation gpu time: %.2f ms a game frame (copy %.2f, luma %.2f, motion search %.2f, median "
+            "%.2f, made frames %.2f) over %lld frames", total, fgt.ns[0] / f / 1e6, fgt.ns[1] / f / 1e6, fgt.ns[2] / f / 1e6,
+            fgt.ns[3] / f / 1e6, made, (long long)fgt.frames);
+    std::fill(std::begin(fgt.ns), std::end(fgt.ns), 0.0);
+    fgt.frames = 0, fgt.since = now;
+}
+/// A free readback slot for this frame's timestamps (-1: not timed)
+int fg_timer_slot() {
+    if (!dev.timestamps) return -1;
+    if (!fgt.init) {
+        fgt.init = true;
+        WGPUQuerySetDescriptor qd{};
+        qd.type = WGPUQueryType_Timestamp;
+        qd.count = 2 * kStages;
+        fgt.qs = wgpuDeviceCreateQuerySet(dev.device, &qd);
+        WGPUBufferDescriptor bd{};
+        bd.size = 16 * kStages;
+        bd.usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc;
+        fgt.resolve = wgpuDeviceCreateBuffer(dev.device, &bd);
+        bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+        for (FgTimer::Slot& s : fgt.slots) s.read = wgpuDeviceCreateBuffer(dev.device, &bd);
+        for (int k = 0; k < kStages; k++) {
+            fgt.tw[k].querySet = fgt.qs;
+            fgt.tw[k].beginningOfPassWriteIndex = (uint32_t)(2 * k);
+            fgt.tw[k].endOfPassWriteIndex = (uint32_t)(2 * k + 1);
+        }
+        hos_log("rx: frame interpolation: timing its stages (RX_GPU_TIMING)");
+    }
+    if (!fgt.qs || !fgt.resolve) return -1;
+    fg_timer_collect();
+    for (int i = 0; i < 4; i++)
+        if (fgt.slots[i].state.load() == 0) return i;
+    return -1;
+}
+
 bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh) {
 #if RX_WEB && !RX_WEB_MT
     (void)view, (void)sw, (void)sh, (void)ww, (void)wh;
@@ -504,6 +641,7 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     return false;
 #else
     if (!sw || !sh) return false;
+    counter_game_frame();   // (the FPS counter's base: the game's own frames)
 #if RX_WEB
     web_flush();   // (the set still being shown: done now; this thread is the one that would free it)
 #endif
@@ -556,13 +694,16 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     }
     WGPUCommandEncoder e = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
     const uint32_t qw = (sw + 3) / 4, qh = (sh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
-    dispatch(e, fg.copy, {tex_entry(view), tex_entry(fg.frames[cur].view)}, sw, sh);
-    dispatch(e, fg.luma, {tex_entry(fg.frames[cur].view), tex_entry(fg.lumas[cur].view)}, qw, qh);
+    // (timed: only frames that make in-between frames, every stage written)
+    const int tslot = blend ? fg_timer_slot() : -1;
+    auto tw = [&](int k) -> const WGPUPassTimestampWrites* { return tslot >= 0 ? &fgt.tw[k] : nullptr; };
+    dispatch(e, fg.copy, {tex_entry(view), tex_entry(fg.frames[cur].view)}, sw, sh, tw(0));
+    dispatch(e, fg.luma, {tex_entry(fg.frames[cur].view), tex_entry(fg.lumas[cur].view)}, qw, qh, tw(1));
     set->made = 0;
     if (blend) {
         dispatch(e, fg.flow, {tex_entry(fg.lumas[prev].view), tex_entry(fg.lumas[cur].view), tex_entry(fg.flows[0].view)},
-                 cw, ch);
-        dispatch(e, fg.median, {tex_entry(fg.flows[0].view), tex_entry(fg.flows[1].view)}, cw, ch);
+                 cw, ch, tw(2));
+        dispatch(e, fg.median, {tex_entry(fg.flows[0].view), tex_entry(fg.flows[1].view)}, cw, ch, tw(3));
         for (int k = 1; k < m; k++) {
             WGPUBindGroupEntry s{}, b{};
             s.sampler = fg.sampler;
@@ -572,7 +713,7 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
                      {tex_entry(fg.frames[prev].view), tex_entry(fg.frames[cur].view), tex_entry(fg.flows[1].view), s,
                       tex_entry(set->frame[k - 1].view), b, tex_entry(camera ? sm.mv : fg.none.view),
                       tex_entry(camera ? sm.mask : fg.none.view)},
-                     sw, sh);
+                     sw, sh, tw(3 + k));
         }
         set->made = m - 1;
     }
@@ -581,10 +722,27 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     dst.texture = set->frame[set->made].tex;
     const WGPUExtent3D extent{sw, sh, 1};
     wgpuCommandEncoderCopyTextureToTexture(e, &src, &dst, &extent);
+    const int tstages = 3 + m;   // (copy, luma, search, median, m - 1 made frames)
+    if (tslot >= 0) {
+        wgpuCommandEncoderResolveQuerySet(e, fgt.qs, 0, (uint32_t)(2 * tstages), fgt.resolve, 0);
+        wgpuCommandEncoderCopyBufferToBuffer(e, fgt.resolve, 0, fgt.slots[tslot].read, 0, (uint64_t)16 * tstages);
+    }
     WGPUCommandBuffer cb = wgpuCommandEncoderFinish(e, nullptr);
     wgpuQueueSubmit(dev.queue, 1, &cb);
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(e);
+    if (tslot >= 0) {
+        FgTimer::Slot& s = fgt.slots[tslot];
+        s.stages = tstages;
+        s.state = 1;
+        WGPUBufferMapCallbackInfo mc{};
+        mc.mode = WGPUCallbackMode_AllowSpontaneous;
+        mc.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+            static_cast<FgTimer::Slot*>(u1)->state = status == WGPUMapAsyncStatus_Success ? 2 : 3;
+        };
+        mc.userdata1 = &s;
+        wgpuBufferMapAsync(s.read, WGPUMapMode_Read, 0, (uint64_t)16 * tstages, mc);
+    }
     wgpuTextureViewRelease(view);
     if (sm.mv) wgpuTextureViewRelease(sm.mv);
     if (sm.mask) wgpuTextureViewRelease(sm.mask);

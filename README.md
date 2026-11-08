@@ -119,8 +119,10 @@ No game files are included. You need your own dump of the game (see [Game files]
   block matching on the images, the camera's motion vectors (with FSR 2 or DLSS on) or no motion (the HUD). With
   VSync on, made frames are paced to the display; with VSync off, the frames shown can go above the display's
   refresh rate. It does not lower input lag. It adds about one game frame of delay, which is noticeable when the
-  base frame rate is low.
-- **FPS counter:** FPS, or FPS + frame time and the longest gap.
+  base frame rate is low. It costs GPU time, so the game's own frame rate drops a little when it is on (the motion
+  search keeps its search area in workgroup memory since 2026-11-08: the same result for far fewer texture reads).
+- **FPS counter:** FPS, or FPS + frame time and the longest gap. With frame generation: the frames shown and the
+  game's own, e.g. "82 FPS (41 base)".
 
 ### Shader stutter
 
@@ -197,7 +199,7 @@ are less tested.
 | Weapon and shield wheel background | **Reported** | Can be black instead of blurred. |
 | Zonai Portable Pot particles | **Workaround** | Disappearing-effect spikes greatly reduced; short stray lines remain. |
 | Fused-weapon inventory icons | **Workaround** | Icons rendered transparent; a cache workaround redraws them. |
-| Crashes | **Rare, open** | One crash on a loading screen (no log). One GPU device loss after ~16 minutes with frame generation 3x and VSync off (cause unknown). |
+| Crashes | **Rare, open** | One crash on a loading screen (no log). Two GPU device losses, both with frame generation on and VSync off: after ~16 minutes at 3x, and on a loading screen at 2x while the window's surface kept going out of date (2026-11-08). Cause unknown; frame generation with VSync on has not crashed so far. |
 | Above ~63 fps | **Beta** | As in other ports: the camera can turn faster and Link may fail to climb steps. |
 | Above 200 fps | **Capped** | The game's own audio mix fades to silence at 230+ fps; the cause in the game isn't found yet, so 200 is the limit. |
 | Frame generation latency | **By design** | Adds about one game frame of delay. On slower GPUs (low base fps) it feels laggy. |
@@ -279,6 +281,7 @@ environment variables (in `launcher.ini` as `env.NAME = value`):
 | `HOS_ASPECT=<w>:<h>` | Override the aspect ratio |
 | `HOS_HUD=center` | Keep the HUD in the middle 16:9 on wide screens |
 | `RX_FRAMEGEN_NO_CAMERA=1` | Frame generation with block matching only |
+| `RX_GPU_TIMING=1` | GPU time of the game's passes and of each frame generation stage, in the log every 5 s |
 | `RX_DUMP_DIR=<folder>` | Where F12 frame dumps go (default `rx_frame`) |
 
 ---

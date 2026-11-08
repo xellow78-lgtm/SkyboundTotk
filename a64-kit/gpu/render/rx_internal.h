@@ -285,6 +285,7 @@ struct PresentRect {
 };
 PresentRect present_rect(uint32_t sw, uint32_t sh, uint32_t tw, uint32_t th);
 bool present_framegen();   // (the player's frame interpolation setting, F7)
+void counter_game_frame();   // (rx_menu.cpp: one of the game's frames went to frame interpolation: the counter's base)
 int present_framegen_mult();            // (frames shown per game frame with it on: 2..4)
 void present_set_framegen(int mult);    // (F1: 0 off, else 2..4)
 void present_window_size(int32_t w, int32_t h);   // (rx_resize: ultrawide's aspect)

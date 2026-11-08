@@ -923,17 +923,21 @@ void paint(Painter& p, State& s, int w, int h) {
 
 // The FPS counter (fps_counter in input.ini): frames shown a second over the last half second, and with 2 their
 // average time and the longest gap in that time, in a small box in the top left corner. Counted here, at each present
-// (with frame interpolation: the frames shown, interpolated ones included).
+// (with frame interpolation: the frames shown, interpolated ones included), and with frame interpolation the game's
+// own frames a second beside them ("82 FPS (41 base)": counter_game_frame, rx_framegen.cpp).
+std::atomic<int64_t> game_frames{0};
 struct Counter {
-    int64_t window_start = 0, last = 0, longest = 0;
+    int64_t window_start = 0, last = 0, longest = 0, game_at_start = 0;
     int frames = 0;
-    float fps = 0, ms = 0, worst = 0;
+    float fps = 0, ms = 0, worst = 0, base = 0;
+    int64_t base_at = 0;   // (when base was last counted: shown only while frame interpolation is counting)
 } counter;
 void count_present() {
     Counter& c = counter;
     const int64_t now = hos_now_ns();
     if (c.last) c.longest = std::max(c.longest, now - c.last);
-    if (!c.window_start || now - c.last > 1000000000LL) c.window_start = now, c.frames = 0, c.longest = 0;
+    if (!c.window_start || now - c.last > 1000000000LL)
+        c.window_start = now, c.frames = 0, c.longest = 0, c.game_at_start = game_frames.load(std::memory_order_relaxed);
     c.last = now;
     c.frames++;
     const int64_t span = now - c.window_start;
@@ -941,13 +945,18 @@ void count_present() {
         c.fps = (float)((c.frames - 1) * 1e9 / (double)span);
         c.ms = (float)(span / 1e6 / (c.frames - 1));
         c.worst = (float)(c.longest / 1e6);
-        c.window_start = now, c.frames = 1, c.longest = 0;
+        const int64_t g = game_frames.load(std::memory_order_relaxed);
+        if (g != c.game_at_start) c.base = (float)((g - c.game_at_start) * 1e9 / (double)span), c.base_at = now;
+        c.window_start = now, c.frames = 1, c.longest = 0, c.game_at_start = g;
     }
 }
 void paint_counter(Painter& p, int w, int h, int mode) {
     const float sc = std::min(w / 1920.0f, h / 1080.0f);
-    char a[32], b[64];
-    std::snprintf(a, sizeof a, "%.0f FPS", counter.fps);
+    char a[48], b[64];
+    if (present_framegen() && counter.base_at && hos_now_ns() - counter.base_at < 1500000000LL)
+        std::snprintf(a, sizeof a, "%.0f FPS (%.0f base)", counter.fps, counter.base);
+    else
+        std::snprintf(a, sizeof a, "%.0f FPS", counter.fps);
     std::snprintf(b, sizeof b, "%.1f ms  (longest %.1f)", counter.ms, counter.worst);
     const float pad = 10 * sc, line = G().fonts[kStrong].height;
     float bw = p.measure(kStrong, a) + 2 * pad, bh = line + 2 * pad * 0.6f;
@@ -1016,6 +1025,7 @@ bool reserved_key(int vk) { return vk == VK_ESCAPE || vk == VK_F1 || vk == VK_F4
 
 // ---- the renderer's side ----
 bool menu_open() { return S().open || hos_fps_counter; }
+void counter_game_frame() { game_frames.fetch_add(1, std::memory_order_relaxed); }
 
 void menu_draw(WGPUCommandEncoder e, WGPUTextureView target, WGPUTextureFormat format, uint32_t w, uint32_t h) {
     State& s = S();
@@ -1295,6 +1305,7 @@ void rx_menu_tick(void) {
 namespace rx {
 bool menu_open() { return false; }
 void menu_draw(WGPUCommandEncoder, WGPUTextureView, WGPUTextureFormat, uint32_t, uint32_t) {}
+void counter_game_frame() {}
 }  // namespace rx
 
 #endif
