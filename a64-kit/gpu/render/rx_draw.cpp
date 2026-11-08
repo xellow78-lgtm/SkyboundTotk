@@ -3482,6 +3482,81 @@ void watch_tiles_after_composite(const Image* gloom, uint64_t flags_va) {
    =1: the Depths' gloom - its pass's target before and after the pass, that output as the composite reads it (the
    volume draws add to it), and a strip of the scene before and after the composite. Needs RX_WATCH_FS to name the
    programs. */
+/* ...and how much of the scene the composite changed (RX_WATCH_TILES): 8 rows of its color target 0, at 10-80% of
+   the height, copied before and after it and compared (rx-comp). A frame the composite drew nothing in shows 0. */
+struct CompRows {
+    WGPUBuffer buffer = nullptr;
+    uint32_t w = 0, stride = 0;
+    WGPUTextureFormat format{};
+    int64_t frame = -1;
+};
+CompRows comp_rows;
+void watch_comp_rows(const Image* im, bool after) {
+    static int lines;
+    if (!im || !im->tex || im->dimension != WGPUTextureDimension_2D || is_depth_format(im->format) || lines >= 20000) return;
+    const uint32_t bpp = 4;   // (RG11B10 / RGBA8: the scene targets; others are compared as their first 4 bytes)
+    if (!after) {
+        if (comp_rows.buffer) wgpuBufferRelease(comp_rows.buffer);
+        comp_rows = {};
+        comp_rows.w = im->width, comp_rows.stride = (im->width * bpp + 255) & ~255u, comp_rows.format = im->format;
+        comp_rows.frame = frame_number;
+        WGPUBufferDescriptor bd{};
+        bd.label = sv("rx watch composite rows");
+        bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+        bd.size = (uint64_t)comp_rows.stride * 16;
+        comp_rows.buffer = wgpuDeviceCreateBuffer(dev.device, &bd);
+        if (!comp_rows.buffer) return;
+    } else if (!comp_rows.buffer || comp_rows.frame != frame_number || comp_rows.w != im->width) {
+        return;
+    }
+    end_render_pass("pe_watch_comp");
+    for (uint32_t k = 0; k < 8; k++) {
+        WGPUTexelCopyTextureInfo src{};
+        src.texture = im->tex;
+        src.aspect = WGPUTextureAspect_All;
+        src.origin = {0, std::min(im->height - 1, im->height * (k + 1) / 10), 0};
+        WGPUTexelCopyBufferInfo dst{};
+        dst.buffer = comp_rows.buffer;
+        dst.layout.offset = (uint64_t)comp_rows.stride * (k + (after ? 8 : 0));
+        dst.layout.bytesPerRow = comp_rows.stride;
+        dst.layout.rowsPerImage = 1;
+        const WGPUExtent3D extent{im->width, 1, 1};
+        ce_copy_texture_to_buffer(encoder(), &src, &dst, &extent);
+    }
+    if (!after) return;
+    lines++;
+    auto* p = new CompRows(comp_rows);
+    comp_rows = {};
+    after_this_batch([p](bool submitted) {
+        if (!submitted) {
+            wgpuBufferRelease(p->buffer);
+            delete p;
+            return;
+        }
+        WGPUBufferMapCallbackInfo mc{};
+        mc.mode = WGPUCallbackMode_AllowSpontaneous;
+        mc.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+            auto* p = static_cast<CompRows*>(u1);
+            if (status == WGPUMapAsyncStatus_Success) {
+                const uint64_t size = (uint64_t)p->stride * 16;
+                const auto* b = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(p->buffer, 0, size));
+                uint32_t changed[8] = {}, total = 0;
+                for (uint32_t k = 0; b && k < 8; k++)
+                    for (uint32_t x = 0; x < p->w; x++)
+                        if (std::memcmp(b + (size_t)p->stride * k + x * 4, b + (size_t)p->stride * (k + 8) + x * 4, 4))
+                            changed[k]++, total++;
+                hos_log("rx-comp: frame %lld: the composite changed %u of %u sampled scene texels (rows at 10..80%%: %u %u "
+                        "%u %u %u %u %u %u)", (long long)p->frame, total, p->w * 8, changed[0], changed[1], changed[2],
+                        changed[3], changed[4], changed[5], changed[6], changed[7]);
+                wgpuBufferUnmap(p->buffer);
+            }
+            wgpuBufferRelease(p->buffer);
+            delete p;
+        };
+        mc.userdata1 = p;
+        wgpuBufferMapAsync(p->buffer, WGPUMapMode_Read, 0, (uint64_t)p->stride * 16, mc);
+    });
+}
 struct CoverSpec {
     uint64_t fs;
     bool after, texture, strip;
@@ -4393,6 +4468,8 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         std::fill(std::begin(nvn_watched_tex), std::end(nvn_watched_tex), nullptr);
         nvn_watched_vs_ssbo = 0;
         if (!cover_specs().empty()) watch_cover_draw(false, at);   // (RX_WATCH_COVER: before it)
+        if (static const bool tiles = env_flag("RX_WATCH_TILES"); tiles && prog->fs.key == 0xce51f5ea116fe892ull)
+            watch_comp_rows(at.color[0], false);   // (RX_WATCH_TILES: the scene before the composite)
     }
     if (prog->has_fs) watch_flags_draw(prog->fs.key);   // (RX_WATCH_FLAGS)
     if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) {   // (rx_fsr2.cpp)
@@ -5263,7 +5340,8 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     count("draws");
     if (nvn_watched_draw && !cover_specs().empty()) watch_cover_draw(true, at);   // (RX_WATCH_COVER: after it)
     if (static const bool tiles = env_flag("RX_WATCH_TILES"); tiles && nvn_watched_draw && prog->fs.key == 0xce51f5ea116fe892ull)
-        watch_tiles_after_composite(nvn_watched_tex[2], nvn_watched_vs_ssbo ? nvn_watched_vs_ssbo + 448 : 0);
+        watch_tiles_after_composite(nvn_watched_tex[2], nvn_watched_vs_ssbo ? nvn_watched_vs_ssbo + 448 : 0),
+            watch_comp_rows(at.color[0], true);
 }
 
 } // namespace rx
