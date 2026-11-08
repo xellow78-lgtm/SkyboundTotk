@@ -3376,6 +3376,54 @@ void nvn_dump_draw_storage(const NvnState& s, const ProgramPair* prog) {
    the buffer cache on the GPU, in command order, so the draw reads what the GPU holds. True when it was. */
 bool nvn_watched_draw;
 uint64_t nvn_watched_fs;
+const Image* nvn_watched_tex[32];   // (a watched draw's pixel-stage textures that are render targets: RX_WATCH_COVER)
+/* RX_WATCH_COVER=<pixel program hex>:<b|a>:<c|t><slot>[s][;...] (debugging): at each draw of that program, before
+   (b) or after (a) it, the coverage of its color target <slot> (c) or of the render target its pixel texture <slot>
+   samples (t; measured after the draw, which does not change it), all of it or a strip (s): watch_cover, rx_debug.cpp.
+   =1: the Depths' gloom - its pass's target before and after the pass, that output as the composite reads it (the
+   volume draws add to it), and a strip of the scene before and after the composite. Needs RX_WATCH_FS to name the
+   programs. */
+struct CoverSpec {
+    uint64_t fs;
+    bool after, texture, strip;
+    uint32_t slot;
+};
+const std::vector<CoverSpec>& cover_specs() {
+    static const std::vector<CoverSpec> v = [] {
+        std::vector<CoverSpec> out;
+        const char* e = getenv("RX_WATCH_COVER");
+        if (!e || !*e) return out;
+        std::string spec = e;
+        if (spec == "1")
+            spec = "18454ee069e36783:b:c0;18454ee069e36783:a:c0;ce51f5ea116fe892:a:t2;ce51f5ea116fe892:b:c0s;"
+                   "ce51f5ea116fe892:a:c0s";
+        for (size_t at = 0; at < spec.size();) {
+            size_t end = spec.find(';', at);
+            if (end == std::string::npos) end = spec.size();
+            const std::string one = spec.substr(at, end - at);
+            at = end + 1;
+            unsigned long long fs = 0;
+            char when = 0, kind = 0;
+            unsigned slot = 0;
+            int used = 0;
+            if (std::sscanf(one.c_str(), "%llx:%c:%c%u%n", &fs, &when, &kind, &slot, &used) != 4) continue;
+            out.push_back({fs, when == 'a', kind == 't', used < (int)one.size() && one[used] == 's', slot});
+        }
+        return out;
+    }();
+    return v;
+}
+void watch_cover_draw(bool after, const Attachments& at) {
+    for (const CoverSpec& c : cover_specs()) {
+        if (c.fs != nvn_watched_fs || (c.after != after && !c.texture) || (c.texture && !after)) continue;
+        const Image* im = c.texture ? (c.slot < 32 ? nvn_watched_tex[c.slot] : nullptr)
+                                    : (c.slot < 8 ? at.color[c.slot] : nullptr);
+        char label[96];
+        std::snprintf(label, sizeof label, "fs %08x %s %s %u%s", (unsigned)(c.fs >> 32), c.after ? "after" : "before",
+                      c.texture ? "its texture" : "its target", c.slot, c.strip ? " (strip)" : "");
+        watch_cover(im, c.strip, label);
+    }
+}
 /* ...and what they draw into and sample, logged when it differs from that program's last draw (rx-tex: up to 4000
    lines): a texture's source (r a render target, t decoded from memory, d the placeholder a binding gets while its
    texture cannot be used or is being decoded), its view, size, format and memory; a target's image. A frame whose gloom
@@ -3687,6 +3735,7 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
         }
         if (nvn_gloom_watch_draw && stage == 1) gloom_watch_texture(t_index, t);   // (RX_WATCH_GLOOM)
         if (nvn_watched_draw) watch_binding(stage, t_index, nullptr, &t);         // (RX_WATCH_FS)
+        if (nvn_watched_draw && stage == 1 && t_index < 32) nvn_watched_tex[t_index] = t.image;
         std::memcpy(slot_bytes.data() + (size_t)t_index++ * 32, t.slots, sizeof t.slots);
         watch_tex_size(at, t);
         if (frame_dump_active()) {
@@ -4234,6 +4283,8 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         nvn_watched_fs = prog->fs.key;
         for (int i = 0; i < 8; i++) watch_binding(-1, (uint32_t)i, at.color[i], nullptr);   // (its targets)
         watch_binding(-1, 8, at.depth, nullptr);
+        std::fill(std::begin(nvn_watched_tex), std::end(nvn_watched_tex), nullptr);
+        if (!cover_specs().empty()) watch_cover_draw(false, at);   // (RX_WATCH_COVER: before it)
     }
     if (prog->has_fs) watch_flags_draw(prog->fs.key);   // (RX_WATCH_FLAGS)
     if (fsr2_replace_draw(at, prog->has_fs ? prog->fs.key : 0, d.count)) {   // (rx_fsr2.cpp)
@@ -5102,6 +5153,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     dump_draw(nullptr);
     st_draws++;
     count("draws");
+    if (nvn_watched_draw && !cover_specs().empty()) watch_cover_draw(true, at);   // (RX_WATCH_COVER: after it)
 }
 
 } // namespace rx

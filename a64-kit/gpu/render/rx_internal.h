@@ -776,6 +776,7 @@ struct NvnDraw {
 };
 void nvn_draw(NvnState& s, const NvnDraw& d);                              // rx_draw.cpp
 void watch_fs_present();     // (RX_WATCH_FS: the frame's counts, at its present; rx_draw.cpp)
+void watch_cover(const Image* im, bool strip, const char* label);   // (RX_WATCH_COVER: rx_debug.cpp)
 void after_this_batch(std::function<void(bool)> f);   // (runs after the open batch's submit: true if submitted; rx_core.cpp)
 void watch_fs_render_off();  // (RX_WATCH_FS: a draw the render condition skipped)
 void nvn_dispatch(NvnState& s, uint32_t x, uint32_t y, uint32_t z);        // rx_compute.cpp

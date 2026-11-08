@@ -634,6 +634,87 @@ void dump_sampled(const Image* im) {   // RX_DUMP_SAMPLED=1: render targets read
     if (on && frame_dump_active()) touch(im);
 }
 
+/* RX_WATCH_COVER (debugging the Depths' gloom flickering off for whole frames, light: no frame dump, which waits for
+   the GPU and never showed it): a target's texels, or a strip of them (the middle half of the width, 60-70% of the
+   height), copied in command order and read back after the batch without waiting, logged as how many are nonzero, how
+   many have green above 0.05 (the gloom composite's threshold for the gloom pass's output) and their RGB sum (rx-cover,
+   up to 24000 lines). A frame the gloom is missing from shows as a drop, at the first step that lost it. */
+void watch_cover(const Image* im, bool strip, const char* label) {
+    static int lines;
+    if (!im || !im->tex || im->dimension != WGPUTextureDimension_2D || is_depth_format(im->format) || lines >= 24000) return;
+    uint32_t x = 0, y = 0, w = im->width, h = im->height;
+    if (strip) x = w / 4, w = std::max(1u, w / 2), y = h * 6 / 10, h = std::max(1u, h / 10);
+    const uint32_t bpp = texel_bytes(im->format);
+    const uint32_t stride = (w * bpp + 255) & ~255u;
+    WGPUBufferDescriptor bd{};
+    bd.label = sv("rx watch cover");
+    bd.size = (uint64_t)stride * h;
+    bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+    WGPUBuffer buffer = wgpuDeviceCreateBuffer(dev.device, &bd);
+    if (!buffer) return;
+    lines++;
+    end_render_pass("pe_watch_cover");
+    WGPUTexelCopyTextureInfo src{};
+    src.texture = im->tex;
+    src.origin = {x, y, 0};
+    src.aspect = WGPUTextureAspect_All;
+    WGPUTexelCopyBufferInfo dst{};
+    dst.buffer = buffer;
+    dst.layout.bytesPerRow = stride;
+    dst.layout.rowsPerImage = h;
+    const WGPUExtent3D extent{w, h, 1};
+    ce_copy_texture_to_buffer(encoder(), &src, &dst, &extent);
+    struct Pending {
+        WGPUBuffer buffer;
+        uint64_t size;
+        uint32_t stride, w, h, bpp;
+        WGPUTextureFormat format;
+        int64_t frame;
+        std::string label;
+    };
+    auto* pd = new Pending{buffer, bd.size, stride, w, h, bpp, im->format, frame_number, label};
+    after_this_batch([pd](bool submitted) {
+        if (!submitted) {
+            wgpuBufferRelease(pd->buffer);
+            delete pd;
+            return;
+        }
+        WGPUBufferMapCallbackInfo mc{};
+        mc.mode = WGPUCallbackMode_AllowSpontaneous;
+        mc.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+            auto* pd = static_cast<Pending*>(u1);
+            if (status == WGPUMapAsyncStatus_Success) {
+                const auto* px = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(pd->buffer, 0, pd->size));
+                uint64_t nonzero = 0, green = 0, sum = 0;
+                bool shown = true;
+                for (uint32_t yy = 0; px && yy < pd->h; yy++)
+                    for (uint32_t xx = 0; xx < pd->w; xx++) {
+                        const uint8_t* t = px + (size_t)yy * pd->stride + (size_t)xx * pd->bpp;
+                        uint8_t c[4] = {};
+                        if (shown && texel(pd->format, t, c)) {
+                            nonzero += (c[0] | c[1] | c[2]) != 0;
+                            green += c[1] > 13;
+                            sum += (uint64_t)c[0] + c[1] + c[2];
+                        } else {   // (a format texel() does not show: any nonzero byte)
+                            shown = false;
+                            bool any = false;
+                            for (uint32_t k = 0; k < pd->bpp; k++) any |= t[k] != 0;
+                            nonzero += any;
+                        }
+                    }
+                hos_log("rx-cover: frame %lld %s: %ux%u fmt %#x: %llu nonzero, %llu green over 0.05, RGB sum %llu",
+                        (long long)pd->frame, pd->label.c_str(), pd->w, pd->h, (unsigned)pd->format,
+                        (unsigned long long)nonzero, (unsigned long long)green, (unsigned long long)sum);
+                wgpuBufferUnmap(pd->buffer);
+            }
+            wgpuBufferRelease(pd->buffer);
+            delete pd;
+        };
+        mc.userdata1 = pd;
+        wgpuBufferMapAsync(pd->buffer, WGPUMapMode_Read, 0, pd->size, mc);
+    });
+}
+
 void dump_draw(const char* what) {
     if (!frame_dump_active()) return;
     if (what) hos_log("rx-frame:   %s", what);
