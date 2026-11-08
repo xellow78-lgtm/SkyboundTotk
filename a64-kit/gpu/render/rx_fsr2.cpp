@@ -137,6 +137,7 @@ struct State {
     uint32_t cw = 0, ch = 0;             // the scene's targets' size last frame (draws into them get the jitter)
     Tex prepared, dil_mv[2], dil_depth, lock[2], lock_luma, new_locks, up[2], lum, luma_hist[2], dil_reactive, mv, out,
         reactive, depth_copy;   // (depth_copy: the scene's depth as a colour image, for DLSS)
+    Tex color_copy;             // (DLSS's colour input: a copy of the game's scene colour, rx_fsr2 below)
     WGPUTextureView lum_mip4 = nullptr, lum_mip5 = nullptr;
     Tex lanczos, bias, def_reactive, def_exposure, auto_exposure, dummy;
     WGPUBuffer rec_depth = nullptr, spd_atomic = nullptr;
@@ -401,7 +402,7 @@ void free_sized() {
     }
     for (Tex* t : {&st.prepared, &st.dil_mv[0], &st.dil_mv[1], &st.dil_depth, &st.lock[0], &st.lock[1], &st.lock_luma,
                    &st.new_locks, &st.up[0], &st.up[1], &st.lum, &st.luma_hist[0], &st.luma_hist[1], &st.dil_reactive,
-                   &st.mv, &st.out, &st.reactive, &st.depth_copy})
+                   &st.mv, &st.out, &st.reactive, &st.depth_copy, &st.color_copy})
         free_tex(*t);
     if (st.lum_mip4) wgpuTextureViewRelease(st.lum_mip4), st.lum_mip4 = nullptr;
     if (st.lum_mip5) wgpuTextureViewRelease(st.lum_mip5), st.lum_mip5 = nullptr;
@@ -619,7 +620,9 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
 
     // DLSS in FSR 2's place (rx_dlss.cpp: the motion vectors, then DLSS), unless it is not there or turned itself
     // off: then FSR 2, from a fresh history (its own was not kept while DLSS ran)
-    const bool use_dlss = dlss_ready();
+    // (RX_DLSS_SKIP_EVAL=1, checking: DLSS made ready but never evaluated, FSR 2 scales instead)
+    static const bool skip_eval = env_flag("RX_DLSS_SKIP_EVAL");
+    const bool use_dlss = dlss_ready() && !skip_eval;
     if (use_dlss != st.last_dlss) st.reset = true;
     st.last_dlss = use_dlss;
     // ---- constants ----
@@ -849,6 +852,29 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         const float rs = hos_render_scale;
         DlssInputs in{};
         in.color = scene_color, in.color_v = color_v;
+        // DLSS reads a copy of the scene's colour, not the game's target. Given the target itself, the Depths' gloom
+        // was drawn wrong with DLSS (a flat red sheet that flickered; with FSR 2, which samples the same target through
+        // WebGPU, and without an upscaler it was right; 2026-11-07): NGX works on the raw Vulkan image, and the game
+        // draws the gloom's glow into that target next frame. Taken for what NGX leaves on that image, not confirmed.
+        // RX_DLSS_COLOR_COPY=0: the target itself, as before.
+        static const bool color_copy = !getenv("RX_DLSS_COLOR_COPY") || *getenv("RX_DLSS_COLOR_COPY") != '0';
+        if (color_copy) {
+            const WGPUTextureFormat cf = wgpuTextureGetFormat(scene_color);
+            if (!st.color_copy.t || st.color_copy.f != cf || st.color_copy.w != st.mw || st.color_copy.h != st.mh) {
+                free_tex(st.color_copy);
+                st.color_copy = make_tex("DLSS colour copy", cf, st.mw, st.mh, 1, false);
+            }
+            const uint32_t cw = std::min({rw, wgpuTextureGetWidth(scene_color), st.color_copy.w});
+            const uint32_t ch = std::min({rh, wgpuTextureGetHeight(scene_color), st.color_copy.h});
+            if (st.color_copy.t && cw && ch) {
+                WGPUTexelCopyTextureInfo src{}, dst{};
+                src.texture = scene_color, src.aspect = WGPUTextureAspect_All;
+                dst.texture = st.color_copy.t, dst.aspect = WGPUTextureAspect_All;
+                const WGPUExtent3D ext{cw, ch, 1};
+                ce_copy_texture_to_texture(e, &src, &dst, &ext);
+                in.color = st.color_copy.t, in.color_v = st.color_copy.v;
+            }
+        }
         in.depth = st.depth_copy.t, in.depth_v = st.depth_copy.v;
         in.mv = st.mv.t, in.mv_v = st.mv.v;
         in.mask = scene_mask ? st.reactive.t : nullptr, in.mask_v = scene_mask ? st.reactive.v : nullptr;
