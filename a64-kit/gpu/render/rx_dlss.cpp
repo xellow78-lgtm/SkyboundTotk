@@ -164,7 +164,13 @@ NVSDK_NGX_FeatureDiscoveryInfo discovery() {
 void add_extensions(uint32_t n, const VkExtensionProperties* props, bool device) {
     std::vector<const char*> names;
     std::string list;
+    // (RX_DLSS_DROP_EXT=<name>[,...], checking: those device extensions are not asked for)
+    const char* drop = device ? getenv("RX_DLSS_DROP_EXT") : nullptr;
     for (uint32_t i = 0; i < n && props; i++) {
+        if (drop && std::strstr(drop, props[i].extensionName)) {
+            hos_log("rx: DLSS: device extension %s left out (RX_DLSS_DROP_EXT)", props[i].extensionName);
+            continue;
+        }
         names.push_back(props[i].extensionName);
         list += " ";
         list += props[i].extensionName;
@@ -469,6 +475,10 @@ void dlss_before_device(WGPUAdapter adapter) {
 void dlss_after_device() {
     State& s = S();
     if (!s.wanted || !s.extensions_asked) return;
+    if (env_flag("RX_DLSS_NO_NGX")) {   // (checking: the device as DLSS has it, NGX not started: FSR 2)
+        hos_log("rx: DLSS: NGX not started (RX_DLSS_NO_NGX): FSR 2");
+        return;
+    }
     if (!wgpuTotkDeviceVulkanHandles(dev.device, &s.vk)) {
         hos_log("rx: DLSS: no Vulkan device: DLSS off");
         return;
