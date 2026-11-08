@@ -622,6 +622,28 @@ struct StorageBinding {
     uint64_t offset = 0, size = 0;
     bool in_stream = false, ok = false;
 };
+/* The writable storage copies a draw's resources made (stream_rw): they are given to the pass when the draw is
+   recorded in it (commit_pass_writes, after render_pass), not while its resources are built. Building them can end the
+   open pass (a feedback snapshot, a buffer copy, the pass switching to the draw's targets): a copy registered before
+   that went to the buffer cache at that pass's end, before the draw had written it, and the draw's pass then had
+   nothing to copy back. The Depths' gloom pass (one draw, which samples its own depth target: a snapshot) lost its
+   tile flags that way on most frames, and the gloom composite, which draws only the flagged tiles, drew nothing:
+   the gloom flickered off for whole frames (on the frames a later draw of the same pass bound the copy again, it came
+   back). RX_EARLY_PASS_WRITES=1: registered while building, as before. */
+struct PendingPassWrite {
+    uint64_t rw_offset, size, gpu_va;
+    int64_t batch;   // (a copy of an earlier batch's stream_rw: dropped)
+};
+std::vector<PendingPassWrite> pending_pass_writes;
+void begin_pass_writes() {
+    pending_pass_writes.clear();
+}
+void commit_pass_writes() {
+    for (const PendingPassWrite& w : pending_pass_writes)
+        if (w.batch == batch_number()) storage_written_in_pass(w.rw_offset, w.size, w.gpu_va);
+    pending_pass_writes.clear();
+}
+
 StorageBinding draw_storage(uint64_t va, uint64_t size, bool writable) {
     StorageBinding out;
     static std::unordered_map<uint64_t, uint64_t> rw_copies;
@@ -749,7 +771,11 @@ StorageBinding draw_storage(uint64_t va, uint64_t size, bool writable) {
             rw_copies.emplace(rw_key, off);
         }
     }
-    if (writable && va) storage_written_in_pass(off, size, va);
+    if (writable && va) {
+        static const bool early = env_flag("RX_EARLY_PASS_WRITES");
+        if (early) storage_written_in_pass(off, size, va);
+        else pending_pass_writes.push_back({off, size, va, batch_number()});
+    }
     out.buffer = s.buffer, out.offset = off, out.size = size, out.in_stream = true, out.ok = true;
     return out;
 }
@@ -2248,6 +2274,7 @@ void draw(Channel& ch, const Regs& r, const DrawParams& p) {
     }
     uint32_t dynamic_storage = dev.limits.maxDynamicStorageBuffersPerPipelineLayout;
     dump_fs_program = r.program_region.Address() + r.pipelines[5].offset;
+    begin_pass_writes();
     stage_resources(vs_res, ch, r, prog->vs.info, 0, WGPUShaderStage_Vertex, rescale, at, dynamic_storage);
     if (!vs_res.ok) return skip("vertex resources");
     if (!pulled_streams(vs_res, r, plan, p, cached)) return skip("pulled vertices");
@@ -2486,6 +2513,7 @@ void draw(Channel& ch, const Regs& r, const DrawParams& p) {
     for (Image* c : at.color)
         if (c && (draw_must_run || (uint64_t)c->width * c->height <= wb_small)) queue_target_writeback(c);
     WGPURenderPassEncoder pass = render_pass(at);
+    commit_pass_writes();   // (this pass's: its end copies them to the buffer cache)
     // state the pass already has is not set again (every command costs at the encoder's finish)
     static struct PassState {
         uint64_t pass = ~0ull, trims = 0;
@@ -4702,6 +4730,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     if (nvn_dump_vs_ub) hos_log("rx-frame:   (uniforms of the next draw, vs %016llx)", (unsigned long long)prog->vs.key);
     // (the program pair, for snapshot_for_feedback: a snapshot is kept across a run of draws of one program only)
     feedback_program = prog->vs.key * 0x9E3779B97F4A7C15ull ^ (prog->has_fs ? prog->fs.key : 0) ^ 1;
+    begin_pass_writes();
     nvn_stage_resources(vs_res, s, 0, prog->vs.info, WGPUShaderStage_Vertex, rescale, at, dynamic_storage);
     nvn_dump_vs_ub = false;
     if (!vs_res.ok) return skip("vertex resources");
@@ -4920,6 +4949,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     }
     split_long_pass();
     WGPURenderPassEncoder pass = render_pass(at);
+    commit_pass_writes();   // (this pass's: its end copies them to the buffer cache)
     static struct PassState {
         uint64_t pass = ~0ull, trims = 0;
         WGPURenderPipeline pipeline;
