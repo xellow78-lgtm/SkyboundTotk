@@ -1099,6 +1099,7 @@ public:
         }
         is_proprietary_driver = true;
     }
+    uint64_t key() const { return nvn.key; }
     u64 ReadInstruction(u32 address) override {
         if (address / 8 < nvn.code.size()) return nvn.code[address / 8];
         return gpu_get<uint64_t>(nvn.data + address);
@@ -1174,6 +1175,13 @@ std::unique_ptr<Translated> nvn_translate(NvnEnvironment& env, bool graphics) {
     host.support_int64 = false;
     host.min_ssbo_alignment = dev.limits.minStorageBufferOffsetAlignment;
     t->program = Shader::Maxwell::TranslateProgram(t->insts, t->blocks, env, cfg, host);
+    // RX_WARP_LOG=1: programs using the warp's lane id, shuffles, votes or lane masks (the WGSL backend has no warps)
+    static const bool warp_log = env_flag("RX_WARP_LOG");
+    if (const auto& i = t->program.info; warp_log && (i.uses_subgroup_invocation_id || i.uses_subgroup_shuffles ||
+                                                       i.uses_subgroup_vote || i.uses_subgroup_mask))
+        hos_log("rx: %s program %016llx uses the warp: lane id %d shuffles %d vote %d masks %d",
+                graphics ? "graphics" : "compute", (unsigned long long)env.key(), i.uses_subgroup_invocation_id,
+                i.uses_subgroup_shuffles, i.uses_subgroup_vote, i.uses_subgroup_mask);
     return t;
 }
 
@@ -1488,6 +1496,37 @@ ProgramPair* nvn_programs_uncached(const NvnState& s, const uint8_t out_types[8]
         Shader::Backend::Bindings vb{};
         pair->vs.wgsl = Shader::Backend::WGSL::EmitWGSL(profile, vs_rt, vs->program, vb, options);
         pair->vs.info = vs->program.info;
+        // a vertex program that stores to memory: also as a compute program (nvn_vs_compute), translated again (the
+        // emission changes the IR). TOTK's Ultrahand reads the object under the reticle in a one-point draw whose
+        // vertex program stores it; the vertex stage's stores were dropped and Ultrahand never locked on (orange
+        // outline, A missed: SkyboundTotk issue 9). RX_NO_VS_COMPUTE=1: off. Only where the device cannot keep the
+        // vertex stage's stores itself (wgpu's VERTEX_WRITABLE_STORAGE, set_vertex_storage_writes): with it the draw
+        // makes them, and a compute copy would make them twice.
+        bool vs_stores = false;
+        for (const auto& sd : vs->program.info.storage_buffers_descriptors) vs_stores |= sd.is_written;
+        if (static const bool no_vs_compute = env_flag("RX_NO_VS_COMPUTE");
+            vs_stores && !no_vs_compute && !Shader::Backend::WGSL::VertexStorageWrites()) {
+            bool pulled = true;
+            for (uint32_t i = 0; i < 32; i++) pulled &= !var->loads[i] || plan.attr[i].enabled;
+            try {
+                if (!pulled) throw std::runtime_error("vertex attributes not all pulled");
+                NvnEnvironment cenv{s, codes->vs, Shader::Stage::VertexB};
+                auto vc = nvn_translate(cenv, true);
+                Shader::Backend::Bindings cb{};
+                Shader::Backend::WGSL::vs_as_compute_next = true;
+                pair->vs_compute_wgsl = Shader::Backend::WGSL::EmitWGSL(profile, vs_rt, vc->program, cb, options);
+                count("nvn_vs_compute_programs");
+                if (const char* dir = getenv("RX_DUMP_WGSL")) {
+                    char path[512];
+                    std::snprintf(path, sizeof path, "%s/nvn_vscs_%016llx.wgsl", dir, (unsigned long long)vkey);
+                    std::ofstream(path, std::ios::binary) << pair->vs_compute_wgsl;
+                }
+            } catch (const std::exception& e) {
+                Shader::Backend::WGSL::vs_as_compute_next = false;
+                log_limited("nvn_vs_compute", 20, "rx: NVN vertex program %016llx stores to memory but cannot run as compute: %s",
+                            (unsigned long long)vkey, e.what());
+            }
+        }
         if (fs) {
             Shader::RuntimeInfo fs_rt{};
             fs_rt.previous_stage_stores = vs->program.info.stores;

@@ -22,9 +22,12 @@ int hos_mods_romfs(const char *rel, char *out, size_t cap);
 int hos_run_tool(const char *cwd, const char *args, const char *log_name);   /* buttons.c */
 static char prepared[MAX_PATH];   /* the tool's copy for this session's shape */
 
-/* (each build names its layout archive after itself: v1.4.3's is Common.Product.140.Nin_NX_NVN.blarc.zs) */
+/* (each build names its layout archive after itself: v1.4.3's is Common.Product.140.Nin_NX_NVN.blarc.zs, v1.2.1's
+   .110, v1.0.0's .100) */
 #if GAME_VERSION == 143
 static const char *const kArchive = "content:/UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs";
+#elif GAME_VERSION == 121
+static const char *const kArchive = "content:/UI/LayoutArchive/Common.Product.110.Nin_NX_NVN.blarc.zs";
 #else
 static const char *const kArchive = "content:/UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs";
 #endif

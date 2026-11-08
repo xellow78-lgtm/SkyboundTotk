@@ -28,7 +28,7 @@
 /* SPLICE_AFTER_EACH(0x0xxxxxxx, "text") { ... }: the same after every line of that function with the text */
 #define SPLICE_AFTER_EACH(addr, anchor) void splice_##addr(Ctx *c)
 /* GAME_VERSION: which build of the game was lifted (build.py passes -DGAME_VERSION=<n> from the port's versions.txt,
-   by the main module's build ID; TOTK: 100 = v1.0.0, 143 = v1.4.3). Addresses are one build's, so every
+   by the main module's build ID; TOTK: 100 = v1.0.0, 121 = v1.2.1, 143 = v1.4.3). Addresses are one build's, so every
    ENTRY_HOOK / SPLICE_AFTER with an address, and every call or data access at a fixed guest address, goes inside
    `#if GAME_VERSION == <n>`: build.py reads those conditions as the compiler does, applies only the active build's
    hooks, and stops on an address hook outside every such condition. 0: a port without a versions table. */

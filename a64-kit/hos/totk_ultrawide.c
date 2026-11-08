@@ -105,7 +105,7 @@ double hos_aspect_wanted(void) {
     }
     const double game = 16.0 / 9.0;
     if (a > 0 && a / game > 0.99 && a / game < 1.01) a = 0;   /* (within 1% of 16:9: the game's own) */
-#if GAME_VERSION != 143 && GAME_VERSION != 100
+#if GAME_VERSION != 143 && GAME_VERSION != 100   /* (v1.2.1: upstream's window-stretch ultrawide hooks are not in this design yet: 16:9) */
     a = 0;
 #endif
     asked = a;

@@ -1,4 +1,4 @@
-"""Build SkyboundTOTK from an already-extracted TOTK dump (1.0.0; 1.4.3 experimentally, see GAME_BUILDS)."""
+"""Build SkyboundTOTK from an already-extracted TOTK dump (1.0.0; 1.2.1 and 1.4.3 experimentally, see GAME_BUILDS)."""
 import hashlib
 import json
 import os
@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import logging
 
 ROOT = Path(__file__).resolve().parent
 GAME = ROOT / "game"
@@ -25,10 +26,36 @@ GAME_BUILDS = {
     # the update applied (a64-kit/tools/nx.py romfs <base.nsp> <out> --update <update.nsp>)
     "1.4.3": {"main": "277178b7dba1b6d4949a84778d4abc58b31b34f5", "sdk": "574284b40c06cf1821a44857939083bee5716820",
               "experimental": True},
+    # 1.2.1: upstream's (NotRexed/SkyboundTotk PR #19) hooks; only the first 8 hex digits of its main ID are known
+    # here and not its sdk's, so those are not checked
+    "1.2.1": {"main": "9b4e4365", "sdk": None, "experimental": True},
 }
 
 
+def same_id(known, found):
+    """A known module ID (possibly only its first digits) against a module's full one."""
+    return bool(known) and found.lower().startswith(known.lower())
+
+
+def setup_logging():
+    log_file = ROOT / "build.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8")
+        ]
+    )
+    logging.info("=== build started ===")
+
+
+def log_and_print(message):
+    print(message, flush=True)
+    logging.info(message)
+
+
 def fail(message):
+    logging.error(message)
     raise SystemExit("ERROR: " + message)
 
 
@@ -47,25 +74,23 @@ def check_game():
         if not (exefs / name).is_file():
             fail(f"Missing {exefs / name}. Put your extracted TOTK ExeFS and RomFS in game/. See README.md.")
     ids = {name: module_id(exefs / name) for name in ("main", "sdk")}
-    version = next((v for v, b in GAME_BUILDS.items() if b["main"] == ids["main"]), None)
+    version = next((v for v, b in GAME_BUILDS.items() if same_id(b["main"], ids["main"])), None)
     if version is None:
         fail(f"{exefs / 'main'} is not a TOTK build this port knows (main {ids['main']}). Known: "
              + ", ".join(GAME_BUILDS) + ".")
-    if ids["sdk"] != GAME_BUILDS[version]["sdk"]:
+    if GAME_BUILDS[version]["sdk"] and not same_id(GAME_BUILDS[version]["sdk"], ids["sdk"]):
         fail(f"{exefs / 'sdk'} is not TOTK {version}'s sdk module: main and sdk are from different dumps.")
     if GAME_BUILDS[version]["experimental"]:
         if os.environ.get("SKYBOUND_EXPERIMENTAL") != "1":
             fail(f"TOTK {version} support is experimental (not every hook is ported). Set SKYBOUND_EXPERIMENTAL=1 "
                  "to build it anyway.")
-        print(f"WARNING: building TOTK {version}, which is experimental: see GAME_BUILDS in build_game.py.", flush=True)
+        log_and_print(f"WARNING: building TOTK {version}, which is experimental: see GAME_BUILDS in build_game.py.")
     if not (romfs / "Event").is_dir() or not (romfs / "ActorSystem").is_dir():
         fail(f"{romfs} does not look like an extracted TOTK RomFS. See README.md.")
     return exefs, romfs, GAME_BUILDS[version]
 
 
 def check_tools():
-    if os.name != "nt":
-        fail("This launcher builds the Windows x64 version; run it on Windows.")
     if sys.version_info < (3, 10):
         fail("Python 3.10 or newer is required.")
     try:
@@ -76,17 +101,41 @@ def check_tools():
     import toolchain
     for tool in ("clang", "clang++", "lld"):
         toolchain.need(toolchain.find(tool))
-    for path in (WGPU / "include/webgpu/webgpu.h", WGPU / "lib/wgpu_native.dll", WGPU / "lib/wgpu_native.dll.lib",
-                 ROOT / "third_party/sdl2/SDL2.dll"):
+    if os.name == "nt":
+        needed = (WGPU / "include/webgpu/webgpu.h", WGPU / "lib/wgpu_native.dll", WGPU / "lib/wgpu_native.dll.lib",
+                  ROOT / "third_party/sdl2/SDL2.dll")
+    else:
+        needed = (WGPU / "include/webgpu/webgpu.h", WGPU / "lib/libwgpu_native.so")
+        if subprocess.run(["pkg-config", "--exists", "sdl3", "libavformat", "libavcodec", "libavutil", "libswscale"]).returncode:
+            fail("sdl3 and ffmpeg (libavformat, libavcodec, libavutil, libswscale) are required.")
+    for path in needed:
         if not path.is_file():
-            fail(f"Missing bundled wgpu-native file: {path}")
-    # Fail before the lengthy lift if the compiler cannot build a native Windows program.
+            fail(f"Missing bundled runtime file: {path}")
     run(sys.executable, KIT / "lift/build_emit.py")
 
 
 def run(*args):
-    print("\n==", " ".join(str(x) for x in args), flush=True)
-    subprocess.run([str(x) for x in args], check=True, cwd=ROOT)
+    cmd_str = " ".join(str(x) for x in args)
+    log_and_print(f"\n== {cmd_str}")
+
+    process = subprocess.Popen(
+        [str(x) for x in args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=ROOT,
+        bufsize=1,
+        universal_newlines=True
+    )
+
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        logging.info(line.rstrip("\n"))
+
+    process.wait()
+    if process.returncode != 0:
+        logging.error(f"Command failed with exit code {process.returncode}")
+        raise subprocess.CalledProcessError(process.returncode, process.args)
 
 
 def lift_identity(exefs):
@@ -117,11 +166,18 @@ def package(romfs):
     # Refuse to silently replace a previous installation, including saves or mods.
     if any(DIST.iterdir()):
         fail(f"Standalone output {DIST} is not empty. Move it aside before rebuilding; keep its user folder.")
-    for src, name in ((native / "totk.exe", "SkyboundTOTK.exe"),
-                      (native / "wgpu_native.dll", "wgpu_native.dll"),
-                      (ROOT / "third_party/sdl2/SDL2.dll", "SDL2.dll"),
-                      (image / "image.bin", "image.bin"),
-                      (image / "image.json", "image.json")):
+    if os.name == "nt":
+        outputs = ((native / "totk.exe", "SkyboundTOTK.exe"),
+                   (native / "wgpu_native.dll", "wgpu_native.dll"),
+                   (ROOT / "third_party/sdl2/SDL2.dll", "SDL2.dll"),
+                   (image / "image.bin", "image.bin"),
+                   (image / "image.json", "image.json"))
+    else:
+        outputs = ((native / "totk", "SkyboundTOTK"),
+                   (native / "libwgpu_native.so", "libwgpu_native.so"),
+                   (image / "image.bin", "image.bin"),
+                   (image / "image.json", "image.json"))
+    for src, name in outputs:
         if not src.is_file():
             fail(f"Required build output is missing: {src}")
         shutil.copy2(src, DIST / name)
@@ -131,12 +187,14 @@ def package(romfs):
             shutil.copy2(native / name, DIST / name)
     if (ROOT / "launcher/pipeline.py").is_file():   # (the launcher's build: launcher/launcher.cpp runs it)
         shutil.copy2(ROOT / "launcher/pipeline.py", DIST / "pipeline.py")
-    print(f"Copying RomFS to {DIST / 'romfs'}; this may take several minutes.", flush=True)
+    log_and_print(f"Copying RomFS to {DIST / 'romfs'}; this may take several minutes.")
     shutil.copytree(romfs, DIST / "romfs", symlinks=False)
-    print(f"\nBuild complete. Open {DIST / 'SkyboundTOTK.exe'} to play.")
+    launch = DIST / ("SkyboundTOTK.exe" if os.name == "nt" else "SkyboundTOTK")
+    log_and_print(f"\nBuild complete. Open {launch} to play.")
 
 
 def main():
+    setup_logging()
     exefs, romfs, game = check_game()
     check_tools()
     # A matching completed lift is reusable; changed inputs or an interrupted lift need a fresh directory.
@@ -145,12 +203,13 @@ def main():
     image = BUILD / "totk/image/image.json"
     generated = BUILD / "totk/gen"
     complete = image.is_file() and (generated / "a64_suyu.h").is_file() and any(generated.glob("code_*.c"))
+
     if complete and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == identity:
         with image.open(encoding="utf-8") as f:
             modules = {m["name"]: m["build_id"] for m in json.load(f)["modules"]}
-        if any(modules.get(name) != game[name] for name in ("main", "sdk")):
+        if any(game[name] and not same_id(game[name], modules.get(name) or "") for name in ("main", "sdk")):
             fail("Existing build contains a different game version. Move the build folder aside before retrying.")
-        print("Reusing the existing lifted game code.", flush=True)
+        log_and_print("Reusing the existing lifted game code.")
     else:
         if BUILD.exists() and any(BUILD.iterdir()):
             fail("Build inputs changed or the lift is incomplete. Move the build folder aside before rebuilding.")
@@ -171,5 +230,6 @@ if __name__ == "__main__":
     try:
         main()
     except subprocess.CalledProcessError as error:
+        logging.error(f"ERROR: command failed with exit code {error.returncode}")
         print(f"ERROR: command failed with exit code {error.returncode}", file=sys.stderr)
         sys.exit(error.returncode or 1)

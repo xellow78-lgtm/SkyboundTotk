@@ -174,7 +174,8 @@ are less tested.
 | Issue | Status | Details |
 | --- | --- | --- |
 | Orange sky / giant orange triangles over the screen | **Fixed (Nov 5); needs testing** | A mesh drawn with a base vertex that puts every vertex past its vertex data. The Switch reads zeros there and draws nothing; we read the memory after it (the mesh's normals and texture coordinates as positions). Draws like that are now copied with zeros past the end. Confirmed by replaying the captured draw. The "randomly stretched terrain" reports may be the same bug; retest. |
-| Depths gloom displacement | **Open (next up)** | The gloom on the ground in the Depths can look displaced or wrong. An earlier fix covered one case; needs an F12 capture where it happens. |
+| Depths gloom | **Flat sheet fixed; flicker open** | The gloom on the ground in the Depths was a flat sheet: the game draws its noise volumes once at boot, before the renderer had started, and that work was dropped. The game's first GPU work now waits for the renderer. The gloom still flickers off for whole frames from some angles (being investigated). |
+| Fuse mode streaks | **Fix not ported yet** | Upstream (1.0.0) saw long green lines from Link's hand in Fuse mode and fixed them in its wgpu build (the shaders declare that they need infinity and NaN preserved). Its published wgpu patch uses a naga flag (`WriterFlags::PRESERVE_INF_NAN`) that naga 29 does not have, so this branch's DLSS wgpu build cannot take it as is; the plain `wgpu_native.dll` from upstream has it. Not checked on 1.4.3. |
 | Sky flicker | **Open** | Reported, not investigated yet. |
 | Dark ground patch (Hateno) | **Open** | Captured with F12, not investigated yet. |
 | Incorrect terrain textures | **Reported** | Some areas show wrong terrain textures. |

@@ -2187,7 +2187,7 @@ void draw(Channel& ch, const Regs& r, const DrawParams& p) {
         for (int i = 0; i < 8; i++) {
             const Image* c = at.color[i];
             if (!c || (c->format != WGPUTextureFormat_R16Float && c->format != WGPUTextureFormat_RG16Float &&
-                       c->format != WGPUTextureFormat_RGBA16Float))
+                       c->format != WGPUTextureFormat_RGBA16Float && c->format != WGPUTextureFormat_RGBA32Float))
                 continue;
             switch (c->pixel_format) {
             case PixelFormat::R16_UNORM: case PixelFormat::R16G16_UNORM: case PixelFormat::R16G16B16A16_UNORM:
@@ -2640,21 +2640,38 @@ void trim_pipelines() {
         const char* e = getenv("RX_PIPELINE_CAP");
         return (size_t)(e && atoi(e) > 0 ? atoi(e) : 6000);
     }();
+    // (a hard ceiling: past it, pipelines unused for a minute go too. Pipelines used within the TTL were never
+    // released, and each holds ~390 KB of host memory: a long session reached ~14,300 pipelines, 17 GB private and
+    // "Not enough memory left" in wgpuDeviceCreateBuffer, SkyboundTotk issue 10. A pipeline needed again is
+    // compiled again, its draws skipped meanwhile. RX_PIPELINE_HARD_CAP=<n> (1.5x the cap), RX_PIPELINE_HARD_TTL_S)
+    static const size_t hard = [] {
+        const char* e = getenv("RX_PIPELINE_HARD_CAP");
+        return e && atoi(e) > 0 ? (size_t)atoi(e) : cap + cap / 2;
+    }();
+    static const int64_t hard_ttl = [] {
+        const char* e = getenv("RX_PIPELINE_HARD_TTL_S");
+        return (int64_t)(e ? atoi(e) : 60) * 60;
+    }();
     if (ttl <= 0 || pipelines.size() <= cap) return;
-    std::vector<std::pair<int64_t, uint64_t>> old;
-    for (const auto& [key, p] : pipelines)
-        if (p->state.load() == 1 && p->last_used < frame_number - ttl) old.emplace_back(p->last_used, key);
-    std::sort(old.begin(), old.end());
-    size_t dropped = 0;
-    for (const auto& [used, key] : old) {
-        if (pipelines.size() <= cap - cap / 8) break;
-        auto it = pipelines.find(key);
-        if (it == pipelines.end()) continue;
-        release_pipeline_later(it->second->pipeline);
-        pipelines.erase(it);
-        dropped++;
-    }
-    if (dropped) hos_log("rx: %zu pipelines unused for %lld s released (%zu kept)", dropped, (long long)(ttl / 60), pipelines.size());
+    const auto release = [](int64_t unused_frames, size_t down_to) {
+        std::vector<std::pair<int64_t, uint64_t>> old;
+        for (const auto& [key, p] : pipelines)
+            if (p->state.load() == 1 && p->last_used < frame_number - unused_frames) old.emplace_back(p->last_used, key);
+        std::sort(old.begin(), old.end());
+        size_t dropped = 0;
+        for (const auto& [used, key] : old) {
+            if (pipelines.size() <= down_to) break;
+            auto it = pipelines.find(key);
+            if (it == pipelines.end()) continue;
+            release_pipeline_later(it->second->pipeline);
+            pipelines.erase(it);
+            dropped++;
+        }
+        if (dropped) hos_log("rx: %zu pipelines unused for %lld s released (%zu kept)", dropped,
+                             (long long)(unused_frames / 60), pipelines.size());
+    };
+    release(ttl, cap - cap / 8);
+    if (pipelines.size() > hard && hard_ttl > 0 && hard_ttl < ttl) release(hard_ttl, hard - std::min(hard, cap / 8));
 }
 
 // ---- the native NVN layer: draws, from NVN state (rx_nvn.cpp's replay) ----
@@ -3351,6 +3368,7 @@ void nvn_dump_draw_storage(const NvnState& s, const ProgramPair* prog) {
 
 /// One stage's uniform block, constant / storage buffers and textures for an NVN draw (stage_resources' twin; the
 /// layout is the WGSL backend's)
+bool nvn_vs_storage_writable;   // (nvn_vs_compute: the vertex stage's stores are made, by a compute program)
 void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, const Shader::Info& info,
                          WGPUShaderStage vis, const float rescale[16], const Attachments& at, uint32_t& dynamic_storage) {
     NvnBanks banks;
@@ -3470,7 +3488,9 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
             log_limited("ssbo_big_bind", 100, "rx: NVN %s program binds storage %llx+%x (c%u@%x)", stage ? "pixel" : "vertex",
                         (unsigned long long)raw_va, raw_size, d.cbuf_index, d.cbuf_offset);
         size = std::clamp<uint64_t>((size + 3) & ~3ull, 16, 16ull << 20);
-        const bool writable = d.is_written && (stage == 1 || dev.vertex_storage_writes);
+        // (the vertex stage's stores: kept natively (VERTEX_WRITABLE_STORAGE), or made by the program run as compute
+        // (nvn_vs_compute) where the device lacks it)
+        const bool writable = d.is_written && (stage == 1 || dev.vertex_storage_writes || nvn_vs_storage_writable);
         if (writable && stage == 0) {
             log_limited("vs_store", 8, "rx: a vertex program stores to %llx+%x (frame %lld)", (unsigned long long)raw_va,
                         raw_size, (long long)frame_number);
@@ -3875,6 +3895,123 @@ void watch_fs_present() {
     watch_render_off = watch_draws = 0;
 }
 
+/* A draw whose vertex program stores to memory: WebGPU's vertex stage cannot, so the program also runs as a compute
+   program (ProgramPair::vs_compute_wgsl), one invocation per vertex and instance, with the vertex stage's resources
+   and its storage writable (copies written back to guest memory after the batch, as pixel programs' are), before the
+   draw. TOTK's Ultrahand picks the object under the reticle that way (a one-point draw reading the object-id target).
+   Non-indexed draws from vertex 0 and instance 0 only (the compute program counts from 0); others are logged. */
+void nvn_vs_compute(NvnState& s, const NvnDraw& d, ProgramPair& prog, const float rescale[16], const PullPlan& plan,
+                    bool cached) {
+    if (prog.vs_compute_failed) return;
+    const uint32_t max = dev.limits.maxComputeWorkgroupsPerDimension;
+    if (d.indexed || d.first || d.base_instance || !d.count || d.count > max || d.instances > max) {
+        log_limited("nvn_vs_compute_draw", 8, "rx: a storing vertex program %016llx in a draw it cannot run as "
+                    "compute (indexed %d, first %u, count %u, instance %u x%u)", (unsigned long long)prog.vs.key,
+                    (int)d.indexed, d.first, d.count, d.base_instance, d.instances);
+        return count("nvn_vs_compute_unsupported");
+    }
+    if (!prog.vs_compute_module) {
+        WGPUShaderSourceWGSL src{};
+        src.chain.sType = WGPUSType_ShaderSourceWGSL;
+        src.code = WGPUStringView{prog.vs_compute_wgsl.data(), prog.vs_compute_wgsl.size()};
+        WGPUShaderModuleDescriptor md{};
+        md.nextInChain = &src.chain;
+        scope_push();
+        prog.vs_compute_module = program_module(&md);
+        const std::string error = scope_pop();
+        if (!error.empty() || !prog.vs_compute_module) {
+            log_limited("nvn_vs_compute_module", 20, "rx: vertex program %016llx as compute: %s",
+                        (unsigned long long)prog.vs.key, error.c_str());
+            prog.vs_compute_failed = true;
+            return;
+        }
+    }
+    end_render_pass("pe_vs_compute");
+    static StageResources cs;
+    cs.layout.clear();
+    cs.entries.clear();
+    cs.dynamic_offsets.clear();
+    cs.next_binding = 0;
+    cs.ok = true;
+    uint32_t dynamic_storage = dev.limits.maxDynamicStorageBuffersPerPipelineLayout;
+    nvn_vs_storage_writable = true;
+    nvn_stage_resources(cs, s, 0, prog.vs.info, WGPUShaderStage_Compute, rescale, Attachments{}, dynamic_storage);
+    nvn_vs_storage_writable = false;
+    if (!cs.ok || !nvn_pulled_streams(cs, s, plan, d, cached)) return count("nvn_vs_compute_skipped");
+    std::vector<WGPUBindGroupLayoutEntry> layout;
+    for (uint32_t v : cs.layout) {
+        WGPUBindGroupLayoutEntry e = unpack_layout(v);
+        e.visibility = WGPUShaderStage_Compute;
+        layout.push_back(e);
+    }
+    struct Pipe { WGPUBindGroupLayout layout = nullptr; WGPUComputePipeline pipeline = nullptr; };
+    static std::unordered_map<uint64_t, Pipe> pipes;
+    const uint64_t h = hash_bytes(layout.data(), layout.size() * sizeof(WGPUBindGroupLayoutEntry)) ^
+                       (uint64_t)(uintptr_t)prog.vs_compute_module * 0x9E3779B97F4A7C15ull;
+    Pipe& p = pipes[h];
+    if (!p.pipeline) {
+        WGPUBindGroupLayoutDescriptor ld{};
+        ld.entryCount = layout.size();
+        ld.entries = layout.data();
+        scope_push();
+        p.layout = wgpuDeviceCreateBindGroupLayout(dev.device, &ld);
+        WGPUPipelineLayoutDescriptor pld{};
+        pld.bindGroupLayoutCount = 1;
+        pld.bindGroupLayouts = &p.layout;
+        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(dev.device, &pld);
+        WGPUComputePipelineDescriptor cd{};
+        cd.layout = pl;
+        cd.compute.module = prog.vs_compute_module;
+        cd.compute.entryPoint = sv("main");
+        p.pipeline = wgpuDeviceCreateComputePipeline(dev.device, &cd);
+        wgpuPipelineLayoutRelease(pl);
+        const std::string error = scope_pop();
+        if (!error.empty()) {
+            log_limited("nvn_vs_compute_pipeline", 20, "rx: vertex program %016llx as compute, pipeline: %s",
+                        (unsigned long long)prog.vs.key, error.c_str());
+            prog.vs_compute_failed = true;
+            return;
+        }
+    }
+    WGPUBindGroupDescriptor bd{};
+    bd.layout = p.layout;
+    bd.entryCount = cs.entries.size();
+    bd.entries = cs.entries.data();
+    WGPUBindGroup group = RX_WEB_MT ? nullptr : wgpuDeviceCreateBindGroup(dev.device, &bd);
+    WGPUComputePassEncoder pass = ce_begin_compute_pass(encoder());
+    cp_set_pipeline(pass, p.pipeline);
+    if (group) cp_set_bind_group(pass, 0, group, cs.dynamic_offsets.size(), cs.dynamic_offsets.data());
+    else cp_set_bind_group_desc(pass, 0, bd.layout, cs.entries.data(), cs.entries.size());
+    cp_dispatch(pass, d.count, d.instances, 1);
+    cp_end(pass);
+    if (group) wgpuBindGroupRelease(group);
+    count("nvn_vs_compute");
+    // RX_VS_COMPUTE_LOG=1 (debugging): the storage each dispatch writes, and what guest memory holds there (the
+    // result of an earlier one, once written back)
+    if (static const bool vlog = env_flag("RX_VS_COMPUTE_LOG"); vlog) {
+        static int logged;
+        NvnBanks banks;
+        banks.c1 = nvn_c1(s, 0);
+        for (const auto& sd : prog.vs.info.storage_buffers_descriptors) {
+            if (!sd.is_written || logged >= 400) continue;
+            uint64_t va = 0;
+            banks.read(s, 0, sd.cbuf_index, sd.cbuf_offset, &va, 8);
+            uint32_t w[8]{};
+            gpu_read(va, w, sizeof w);
+            logged++;
+            hos_log("rx: vs %016llx as compute (%u x %u) writes %#llx; memory there: %08x %08x %08x %08x %08x %08x %08x %08x",
+                    (unsigned long long)prog.vs.key, d.count, d.instances, (unsigned long long)va, w[0], w[1], w[2],
+                    w[3], w[4], w[5], w[6], w[7]);
+        }
+    }
+    if (frame_dump_active()) {
+        char line[160];
+        std::snprintf(line, sizeof line, "nvn vertex program %016llx as compute: %u x %u", (unsigned long long)prog.vs.key,
+                      d.count, d.instances);
+        dump_draw(line);
+    }
+}
+
 void nvn_draw(NvnState& s, const NvnDraw& d) {
     // RX_NVN_NO_DRAWS=1 (measurement only: the screen is wrong): no draw is prepared, so the frame rate is what the
     // game's own threads allow (the web: how far preparing draws faster could go)
@@ -4139,7 +4276,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         for (int i = 0; i < 8; i++) {
             const Image* c = at.color[i];
             if (!c || (c->format != WGPUTextureFormat_R16Float && c->format != WGPUTextureFormat_RG16Float &&
-                       c->format != WGPUTextureFormat_RGBA16Float))
+                       c->format != WGPUTextureFormat_RGBA16Float && c->format != WGPUTextureFormat_RGBA32Float))
                 continue;
             switch (c->pixel_format) {
             case PixelFormat::R16_UNORM: case PixelFormat::R16G16_UNORM: case PixelFormat::R16G16B16A16_UNORM:
@@ -4182,6 +4319,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         for (Image* c : at.color)
             if (c) return skip("color targets without a pixel program");
     }
+    if (!prog->vs_compute_wgsl.empty()) nvn_vs_compute(s, d, *prog, rescale, plan, cached);
 
     // RX_SKIP_FS=<pixel program key>[,...] (debugging): its draws are left out (what do they add to the picture?)
     static const std::vector<uint64_t> skip_fs = [] {
@@ -4485,9 +4623,18 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     // 2026-10-24); one to a pass they match the console. Why is open: not barriers between dispatch and draw (flushing
     // or waiting after each dispatch changed nothing), not rx's per-pass state (setting everything for every draw changed
     // nothing), not the first instance, the page merge or the dispatch's data. ~100 such draws a frame in the rainy
-    // castle cost no measurable fps. RX_GPU_PARTICLE_PASS=0: off; =2: any vertex stream a dispatch wrote (skinned meshes
-    // too, ~11% slower there)
-    static const int particle_pass_set = getenv("RX_GPU_PARTICLE_PASS") ? atoi(getenv("RX_GPU_PARTICLE_PASS")) : 1;
+    // castle cost no measurable fps. The cause was the driver assuming no infinities in our shaders (fixed 2026-10-31:
+    // shaders declare SignedZeroInfNanPreserve, CLAUDE.md "Inf/NaN in shaders"): with it the vanish draws no lines with
+    // the rule off (3 pot runs), without it lines again, so the rule is off by default. RX_GPU_PARTICLE_PASS=1: on;
+    // =2: any vertex stream a dispatch wrote (skinned meshes too). (update-1.4.3: the WebGPU library built on the PC for
+    // DLSS and Reflex, third_party/wgpu-native/totk-src, does not have that fix yet: with it the rule stays on by default)
+#if RX_DLSS || RX_REFLEX
+    constexpr int particle_pass_default = 1;
+#else
+    constexpr int particle_pass_default = 0;
+#endif
+    static const int particle_pass_set =
+        getenv("RX_GPU_PARTICLE_PASS") ? atoi(getenv("RX_GPU_PARTICLE_PASS")) : particle_pass_default;
     static const bool particle_ab = ab_named("RX_GPU_PARTICLE_PASS");   // (HOS_AB: what the rule costs)
     if (const int particle_pass = particle_ab && ab_flipped() ? !particle_pass_set : particle_pass_set; particle_pass) {
         bool gpu_fed = false;

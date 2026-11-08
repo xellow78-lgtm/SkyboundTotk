@@ -24,6 +24,9 @@
 #endif
 
 #include "rx_internal.h"
+#ifdef __linux__
+#include "rx_window.h"
+#endif
 #include "video_core/textures/decoders.h"
 /* nn_vi.c: 1 while presents wait for the display's vsync (FIFO), 0 with VSync off (RX_PRESENT=mailbox / immediate) */
 extern "C" { volatile int rx_vsync_on = 1; }
@@ -398,6 +401,31 @@ bool init_device(HWND hwnd) {
                       : !_stricmp(be, "gl")         ? WGPUInstanceBackend_GL
                                                     : WGPUInstanceBackend_Primary;
     if (getenv("RX_VALIDATION")) extras.flags = WGPUInstanceFlag_Validation | WGPUInstanceFlag_Debug;
+    // wgpu's own log (why a device was lost, driver warnings) into ours: warnings and errors, 400 different ones;
+    // RX_WGPU_LOG=info|debug|trace for more, off for none
+    {
+        const char* lv = getenv("RX_WGPU_LOG");
+        const WGPULogLevel level = !lv                        ? WGPULogLevel_Warn
+                                   : !_stricmp(lv, "off")     ? WGPULogLevel_Off
+                                   : !_stricmp(lv, "error")   ? WGPULogLevel_Error
+                                   : !_stricmp(lv, "info")    ? WGPULogLevel_Info
+                                   : !_stricmp(lv, "debug")   ? WGPULogLevel_Debug
+                                   : !_stricmp(lv, "trace")   ? WGPULogLevel_Trace
+                                                              : WGPULogLevel_Warn;
+        wgpuSetLogCallback(
+            [](WGPULogLevel l, WGPUStringView message, void*) {
+                static std::mutex m;   // (each message once: some warnings come for every pipeline)
+                static std::set<std::string> seen;
+                std::string t = str(message);
+                {
+                    std::lock_guard g(m);
+                    if (seen.size() >= 400 || !seen.insert(t).second) return;
+                }
+                hos_log("wgpu %s: %s", l <= WGPULogLevel_Error ? "error" : l == WGPULogLevel_Warn ? "warning" : "log", t.c_str());
+            },
+            nullptr);
+        wgpuSetLogLevel(level);
+    }
     WGPUInstanceDescriptor id{};
     id.nextInChain = &extras.chain;
     dev.instance = wgpuCreateInstance(&id);
@@ -406,6 +434,26 @@ bool init_device(HWND hwnd) {
         return false;
     }
     if (hwnd) {
+#ifdef __linux__
+        auto* lw = static_cast<RxLinuxWindow*>(hwnd);
+        if (lw->kind == 1) {
+            WGPUSurfaceSourceWaylandSurface src{};
+            src.chain.sType = WGPUSType_SurfaceSourceWaylandSurface;
+            src.display = lw->display;
+            src.surface = lw->wl_surface;
+            WGPUSurfaceDescriptor sd{};
+            sd.nextInChain = &src.chain;
+            surface = wgpuInstanceCreateSurface(dev.instance, &sd);
+        } else {
+            WGPUSurfaceSourceXlibWindow src{};
+            src.chain.sType = WGPUSType_SurfaceSourceXlibWindow;
+            src.display = lw->display;
+            src.window = lw->xwindow;
+            WGPUSurfaceDescriptor sd{};
+            sd.nextInChain = &src.chain;
+            surface = wgpuInstanceCreateSurface(dev.instance, &sd);
+        }
+#else
         surface_hwnd = hwnd;
         WGPUSurfaceSourceWindowsHWND src{};
         src.chain.sType = WGPUSType_SurfaceSourceWindowsHWND;
@@ -414,9 +462,34 @@ bool init_device(HWND hwnd) {
         WGPUSurfaceDescriptor sd{};
         sd.nextInChain = &src.chain;
         surface = wgpuInstanceCreateSurface(dev.instance, &sd);
+#endif
     }
 #endif
 
+#if !RX_WEB
+    // RX_ADAPTER=<part of a GPU's name> (e.g. "AMD", "Radeon"): that GPU instead of the high-performance one (a PC
+    // with two GPUs; testing on another vendor's driver). The log lists the GPUs when it is set.
+    if (const char* want = getenv("RX_ADAPTER")) {
+        WGPUInstanceEnumerateAdapterOptions eo{};
+        eo.backends = extras.backends;
+        std::vector<WGPUAdapter> all(wgpuInstanceEnumerateAdapters(dev.instance, &eo, nullptr));
+        wgpuInstanceEnumerateAdapters(dev.instance, &eo, all.data());
+        std::string w = want;
+        for (char& c : w) c = (char)tolower((unsigned char)c);
+        for (WGPUAdapter a : all) {
+            WGPUAdapterInfo ai{};
+            wgpuAdapterGetInfo(a, &ai);
+            std::string name = str(ai.device), lower = name;
+            for (char& c : lower) c = (char)tolower((unsigned char)c);
+            const bool pick = !dev.adapter && lower.find(w) != std::string::npos;
+            hos_log("rx: GPU %s (%s)%s", name.c_str(), backend_name(ai.backendType), pick ? ": chosen (RX_ADAPTER)" : "");
+            wgpuAdapterInfoFreeMembers(ai);
+            if (pick) dev.adapter = a;
+            else wgpuAdapterRelease(a);
+        }
+        if (!dev.adapter) hos_log("rx: no GPU's name contains \"%s\" (RX_ADAPTER): the default one", want);
+    }
+#endif
     WGPURequestAdapterOptions ao{};
     ao.featureLevel = WGPUFeatureLevel_Core;
     ao.powerPreference = WGPUPowerPreference_HighPerformance;
@@ -428,7 +501,7 @@ bool init_device(HWND hwnd) {
         else hos_log("rx: no adapter: %s", str(message).c_str());
     };
     acb.userdata1 = &dev.adapter;
-    wgpuInstanceRequestAdapter(dev.instance, &ao, acb);
+    if (!dev.adapter) wgpuInstanceRequestAdapter(dev.instance, &ao, acb);
     for (int i = 0; i < 5000 && !dev.adapter; i++) {
         wgpuInstanceProcessEvents(dev.instance);
         wait_step();
@@ -561,6 +634,8 @@ bool init_device(HWND hwnd) {
                       WGPUBufferUsage_Uniform | WGPUBufferUsage_Storage | WGPUBufferUsage_Vertex |
                           WGPUBufferUsage_Index);
         create_stream(stream_rw, "rx storage", (RX_WEB ? 16ull : 32ull) << 20, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
+        astc_gpu_on();
+        unswizzle_gpu_on();
         hos_log("rx: WebGPU on %s; %zu optional features; no window (offscreen)", desc, have.size());
         return true;
     }
@@ -599,6 +674,10 @@ bool init_device(HWND hwnd) {
     ::rx_vsync_on = present_mode == WGPUPresentMode_Fifo;
 #ifdef __EMSCRIPTEN__
     configure_surface(1280, 720);
+#elif defined(__linux__)
+    auto* lw = static_cast<RxLinuxWindow*>(hwnd);
+    configure_surface((uint32_t)std::max(lw->width, 1), (uint32_t)std::max(lw->height, 1));
+    present_window_size(lw->width, lw->height);
 #else
     RECT rc{};
     client_size_px(hwnd, &rc);
@@ -614,7 +693,8 @@ bool init_device(HWND hwnd) {
     create_stream(stream_rw, "rx storage", (RX_WEB ? 16ull : 32ull) << 20, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     pipecache_start();   // (the browser: the pipelines of earlier sessions, made again in the background)
     native_cache_start();   // (natively: the same, rxcache/pipelines.bin next to the exe)
-    astc_gpu_on();   // (its pipeline made here: error scopes belong to the device, not to a thread)
+    astc_gpu_on();   // (the compute passes that are on made here: error scopes belong to the device, not to a thread)
+    unswizzle_gpu_on();
     hos_log("rx: WebGPU on %s; %zu optional features; surface %ux%u format %#x present mode %d", desc, have.size(),
             surface_w, surface_h, (unsigned)surface_format, (int)present_mode);
 #if !RX_WEB && defined(_WIN32)
@@ -3952,7 +4032,8 @@ struct TargetWriteback {
     uint32_t slice = 0, depth = 1;   // a 3D texture's slice: which, of how many
     bool pitch_linear = false, block_view = false;
     int pf = 0;
-    uint8_t norm16 = 0;   // the texture is the float16 stand-in of a 16-bit unorm (1) / snorm (2) format
+    uint8_t norm16 = 0;   // the texture is the float16 stand-in of a 16-bit unorm (1) / snorm (2) format (3 / 4: float32)
+    uint32_t src_row = 0;   // bytes per row read back (the texture's texels; row: the guest's)
 };
 
 static float half_value(uint16_t h) {
@@ -3962,16 +4043,17 @@ static float half_value(uint16_t h) {
 }
 
 /// 1 / 2 when <texture> is the float16 stand-in rx draws a 16-bit unorm / snorm target into (no 16-bit norm
-/// render targets without RX_NORM16_RT): same size per texel, values to convert. 0 otherwise.
+/// render targets without RX_NORM16_RT): same size per texel, values to convert; 3 / 4 for a float32 stand-in (RGBA
+/// 16: twice the size per texel). 0 otherwise.
 static uint8_t norm16_stand_in(PixelFormat pf, WGPUTextureFormat texture) {
     using P = PixelFormat;
     switch (pf) {
     case P::R16_UNORM: return texture == WGPUTextureFormat_R16Float ? 1 : 0;
     case P::R16G16_UNORM: return texture == WGPUTextureFormat_RG16Float ? 1 : 0;
-    case P::R16G16B16A16_UNORM: return texture == WGPUTextureFormat_RGBA16Float ? 1 : 0;
+    case P::R16G16B16A16_UNORM: return texture == WGPUTextureFormat_RGBA16Float ? 1 : texture == WGPUTextureFormat_RGBA32Float ? 3 : 0;
     case P::R16_SNORM: return texture == WGPUTextureFormat_R16Float ? 2 : 0;
     case P::R16G16_SNORM: return texture == WGPUTextureFormat_RG16Float ? 2 : 0;
-    case P::R16G16B16A16_SNORM: return texture == WGPUTextureFormat_RGBA16Float ? 2 : 0;
+    case P::R16G16B16A16_SNORM: return texture == WGPUTextureFormat_RGBA16Float ? 2 : texture == WGPUTextureFormat_RGBA32Float ? 4 : 0;
     default: return 0;
     }
 }
@@ -3984,7 +4066,20 @@ void apply_target_writeback(const TargetWriteback& t, const uint8_t* q, bool cou
     if (dest) counted = false;   // (a comparison, not a writeback)
     const uint32_t w = t.w, h = t.h, bpp = t.bpp, row = t.row;
     std::vector<uint8_t> conv;
-    if (t.norm16) {   // (float16 back to the guest's 16-bit norm values)
+    if (t.norm16 >= 3) {   // (float32 back to the guest's 16-bit norm values: rows src_row apart, 16 bytes a texel)
+        conv.assign((size_t)row * h, 0);
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t i = 0; i < w * 4; i++) {
+                float f;
+                std::memcpy(&f, q + (size_t)y * t.src_row + 4 * i, 4);
+                if (f != f) f = 0;
+                const uint16_t v = t.norm16 == 3 ? (uint16_t)std::lround(std::clamp(f, 0.0f, 1.0f) * 65535.0f)
+                                                 : (uint16_t)(int16_t)std::lround(std::clamp(f, -1.0f, 1.0f) * 32767.0f);
+                std::memcpy(conv.data() + (size_t)y * row + 2 * i, &v, 2);
+            }
+        q = conv.data();
+        if (counted) count("rt_writeback_norm16");
+    } else if (t.norm16) {   // (float16 back to the guest's 16-bit norm values)
         conv.assign(q, q + (size_t)row * h);
         for (uint32_t y = 0; y < h; y++) {
             uint8_t* p = conv.data() + (size_t)y * row;
@@ -4091,17 +4186,18 @@ void writeback_targets() {
         if (im->guest >> 32) t.slice = im->slice, t.depth = std::max(1u, im->volume_depth);
         t.pf = (int)pf;
         t.norm16 = norm16;
+        t.src_row = norm16 >= 3 ? (t.w * 16 + 255) & ~255u : t.row;
         WGPUBufferDescriptor bd{};
         bd.label = sv("rx target writeback");
         bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
-        bd.size = (uint64_t)t.row * t.h;
+        bd.size = (uint64_t)t.src_row * t.h;
         WGPUBuffer staging = wgpuDeviceCreateBuffer(dev.device, &bd);
         WGPUTexelCopyTextureInfo src{};
         src.texture = im->tex;
         src.aspect = WGPUTextureAspect_All;
         WGPUTexelCopyBufferInfo dst{};
         dst.buffer = staging;
-        dst.layout.bytesPerRow = t.row;
+        dst.layout.bytesPerRow = t.src_row;
         dst.layout.rowsPerImage = t.h;
         const WGPUExtent3D extent{t.w, t.h, 1};
         if (RX_WEB_MT) {

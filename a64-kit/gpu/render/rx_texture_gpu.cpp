@@ -1132,7 +1132,8 @@ fn SwizzleOffset(pos: vec2<u32>) -> u32 {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = gid.xy * params.block_dims;
     let dims = textureDimensions(dest_image);
-    if (coord.x >= dims.x || coord.y >= dims.y || gid.z >= textureNumLayers(dest_image)) {
+    // (no textureNumLayers: AMD loses the device on it; the dispatch is exactly as deep as the layers)
+    if (coord.x >= dims.x || coord.y >= dims.y) {
         return;
     }
     let px = gid.x << 4u;
@@ -1192,10 +1193,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 struct Pass {
     WGPUComputePipeline pipeline = nullptr;
     WGPUBindGroupLayout bgl = nullptr;
+    bool tried = false;
 };
 struct Gpu {
     std::mutex mu;
-    bool tried = false;
     Pass astc, unswizzle, bc7;
 } gpu;
 
@@ -1206,7 +1207,7 @@ bool make_pass(Pass& p, const char* wgsl, bool texture_out, const char* what, bo
     WGPUShaderModuleDescriptor md{};
     md.nextInChain = &src.chain;
     scope_push();
-    WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev.device, &md);
+    WGPUShaderModule module = program_module(&md);   // (RX_SHADER_CHECKS applies)
     WGPUBindGroupLayoutEntry e[3]{};
     e[0].binding = 0;
     e[0].visibility = WGPUShaderStage_Compute;
@@ -1250,21 +1251,15 @@ bool make_pass(Pass& p, const char* wgsl, bool texture_out, const char* what, bo
     return false;
 }
 
-void init_locked() {
-    if (gpu.tried) return;
-    gpu.tried = true;
-    if (make_pass(gpu.astc, kAstcWgsl, true, "ASTC decoder")) hos_log("rx: ASTC textures are decoded on the GPU");
-    make_pass(gpu.unswizzle, kUnswizzleWgsl, false, "unswizzle");
-    if (dev.bc && gpu.astc.pipeline && make_pass(gpu.bc7, kBc7Wgsl, false, "BC7 encoder", true))
-        hos_log("rx: decoded sRGB ASTC textures are encoded to BC7 on the GPU (8 bits a texel instead of 32; "
-                "RX_ASTC_BC=0: none, 2: linear ones too)");
-}
-
-bool pass_on(const Pass& p, const char* off_switch) {
+/// Each pass made the first time it is asked for, and only if it is on (a pass that is off never reaches the driver)
+bool pass_on(Pass& p, bool allowed, const char* wgsl, bool texture_out, const char* what, bool texture_in = false) {
     if (RX_WEB) return false;   // (the browser: WebGPU calls only on the render thread; decodes run on a worker)
-    if (env_flag(off_switch)) return false;
+    if (!allowed) return false;
     std::lock_guard lk(gpu.mu);
-    init_locked();
+    if (!p.tried) {
+        p.tried = true;
+        if (make_pass(p, wgsl, texture_out, what, texture_in)) hos_log("rx: the %s runs on the GPU", what);
+    }
     return p.pipeline != nullptr;
 }
 
@@ -1364,12 +1359,15 @@ bool submit(WGPUCommandEncoder enc) {
 
 } // namespace
 
-bool astc_gpu_on() { return pass_on(gpu.astc, "RX_ASTC_CPU"); }
+bool astc_gpu_on() { return pass_on(gpu.astc, !env_flag("RX_ASTC_CPU"), kAstcWgsl, true, "ASTC decoder"); }
+/// Decoded sRGB ASTC textures encoded to BC7 on the GPU (8 bits a texel instead of 32; RX_ASTC_BC=0: none, 2: linear
+/// ones too)
 bool astc_bc_gpu_on() {
     static const bool off = getenv("RX_ASTC_BC") && *getenv("RX_ASTC_BC") == '0';
-    return !off && astc_gpu_on() && pass_on(gpu.bc7, "RX_ASTC_CPU");
+    return !off && dev.bc && astc_gpu_on() &&
+           pass_on(gpu.bc7, true, kBc7Wgsl, false, "BC7 encoder (decoded ASTC textures)", true);
 }
-bool unswizzle_gpu_on() { return pass_on(gpu.unswizzle, "RX_UNSWIZZLE_CPU"); }
+bool unswizzle_gpu_on() { return pass_on(gpu.unswizzle, !env_flag("RX_UNSWIZZLE_CPU"), kUnswizzleWgsl, false, "unswizzle"); }
 
 bool astc_gpu_decode(WGPUTexture tex, const uint8_t* src, uint64_t total, const BlockLinearLevel* levels, int nlevels,
                      uint32_t layers, uint32_t layer_stride, uint32_t block_w, uint32_t block_h) {

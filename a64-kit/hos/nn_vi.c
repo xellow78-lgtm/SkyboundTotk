@@ -109,10 +109,11 @@ static double frame_cap_hz(void) {
     }
     return hz;
 }
+static volatile int64_t step30_until;   /* (the 1/30 s step of the menus below, hos_frame_step_buttons) */
 static void frame_limit(void) {
     static int64_t next;
-    const int64_t period = (int64_t)(1e9 / frame_cap_hz());
-    int64_t now = hos_now_ns();
+    int64_t period = (int64_t)(1e9 / frame_cap_hz()), now = hos_now_ns();
+    if (now < step30_until && period < 1000000000 / 30) period = 1000000000 / 30;   /* (a 1/30 s step: 30 fps) */
     if (next && now < next) {
         hos_sleep_ns(next - now);
         now = hos_now_ns();
@@ -293,8 +294,8 @@ static int realtime_on(void) {
     if (on < 0) {
         const char *e = getenv("HOS_REALTIME");
         on = !(e && *e == '0');
-#if GAME_VERSION != 100 && GAME_VERSION != 143
-        /* (the step hooks below are v1.0.0's and v1.4.3's: on another build the game keeps its own interval step, so
+#if GAME_VERSION != 100 && GAME_VERSION != 121 && GAME_VERSION != 143
+        /* (the step hooks below are v1.0.0's, v1.2.1's and v1.4.3's: on another build the game keeps its own interval step, so
            the pacing must not assume ours) */
         if (on && e) hos_log("vi: HOS_REALTIME: not for this game build yet (no step hooks): the game's own step");
         on = 0;
@@ -311,21 +312,30 @@ static uint64_t step_bits(float seconds) {
 }
 /* The ability wheel (hold L) captures the screen for its blurred background in the frame the world stops drawing,
    unless the game steps by whole 1/30 s frames: at any faster step (its own 60 fps mode too) the world was already
-   gone and the background came out black. While L is held (at most 3 s a press) the step is 1/30 s: the wheel pauses
-   the world anyway, and a tap of L runs a few frames at a 30 fps step. HOS_WHEEL_STEP30=0: off. */
-static volatile int64_t step30_until;
-void hos_frame_step_buttons(uint64_t buttons) {
+   gone and the background came out black. While L is held (at most 3 s a press) the step is 1/30 s and frames are
+   held to 30 a second (frame_limit), so the world keeps its speed where no menu opens (L before the abilities, the
+   d-pad with nothing to show): at 60 fps and more a 1/30 s step ran it 2-4x too fast (SkyboundTotk #22).
+   HOS_WHEEL_STEP30=0: off.
+   The quick menus of the d-pad (hold left: shields, right: weapons, up with R or ZR: what to throw or fuse to arrows)
+   capture the same way and came out black too: held, they take the same step. With the step taken only from the
+   read that saw the press, the weapon menu still came out black one time in two: a new press of these buttons now
+   reaches the game two frames later (at most 80 ms: two frames at 30 fps), after frames at the 1/30 s step have
+   begun. Returns the buttons the game is given. */
+uint64_t hos_frame_step_buttons(uint64_t buttons) {
     static int on = -1;
-    static int64_t held_since;
+    static int64_t held_since, held_from;
     if (on < 0) on = !(getenv("HOS_WHEEL_STEP30") && *getenv("HOS_WHEEL_STEP30") == '0');
-    if (!on || !realtime_on()) return;
+    if (!on || !realtime_on()) return buttons;
+    const uint64_t menus = 1u << 6 | 1u << 12 | 1u << 13 | 1u << 14;   /* (NpadButton bits: L 6, left 12, up 13, right 14) */
     const int64_t now = hos_now_ns();
-    if (!(buttons >> 6 & 1)) {   /* (L: NpadButton bit 6) */
+    if (!(buttons & menus)) {
         held_since = 0;
-        return;
+        return buttons;
     }
-    if (!held_since) held_since = now;
+    if (!held_since) held_since = now, held_from = hos_present_count;
     if (now - held_since < 3000000000LL) step30_until = now + 100000000;
+    if (hos_present_count - held_from < 2 && now - held_since < 80000000) buttons &= ~menus;
+    return buttons;
 }
 static uint64_t frame_step(void) {
     if (hos_now_ns() < step30_until) return step_bits(1.0f / 30.0f);
@@ -367,6 +377,10 @@ static void frame_step_present(int64_t now) {
     static double samples[8];
     static int n, next;
     if (!realtime_on()) return;
+    if (now < step30_until) {   /* (the menus' 30 fps: the step after them starts from frames of its own) */
+        last = 0;
+        return;
+    }
     const double dt = last ? (now - last) * 1e-9 : 0;
     last = now;
     if (dt <= 0.001 || dt > 0.25) {   /* (a loading hitch: start over, the step stays) */
@@ -384,8 +398,7 @@ static void frame_step_present(int64_t now) {
     for (int i = 0; i < n; i++) sum += samples[i];
     InterlockedExchange64(&frame_step_bits, (LONG64)step_bits((float)(sum / n)));
 }
-#if GAME_VERSION == 100
-SPLICE_AFTER(0x087a83e4, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") {
+static void frame_step_into_vi(Ctx *c) {
     if (!realtime_on()) return;
     const uint64_t v = frame_step();
     G32(c->x[0] + 8) = (uint32_t)v;
@@ -393,10 +406,16 @@ SPLICE_AFTER(0x087a83e4, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") {
     c->vreg[0][0] = (uint32_t)v;
     c->vreg[1][0] = (uint32_t)(v >> 32);
 }
-SPLICE_AFTER(0x088f689c, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") {
+static void frame_step_store(Ctx *c) {
     if (!realtime_on()) return;
     G32(c->x[8]) = (uint32_t)frame_step();
 }
+#if GAME_VERSION == 100
+SPLICE_AFTER(0x087a83e4, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") { frame_step_into_vi(c); }
+SPLICE_AFTER(0x088f689c, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") { frame_step_store(c); }
+#elif GAME_VERSION == 121
+SPLICE_AFTER(0x087ede6c, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") { frame_step_into_vi(c); }
+SPLICE_AFTER(0x088f2378, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") { frame_step_store(c); }
 /* v1.4.3: the step is f_083e67f0(state, s0 = the interval as a float): it stores ratio = s0 * 0.5 at +0x10,
    1 / ratio at +0x14, s0 / 60 at +0x18 and round(30 / ratio) at +0x1c, so the real frame time goes in as the
    interval it stands for (seconds * 60) and the game derives the rest itself. The global ratio is stored in
@@ -416,17 +435,105 @@ ENTRY_HOOK(0x083e67f0) {
     c->vreg[0][1] = 0;
     return 0;   /* (the game's own step, with the real interval) */
 }
-SPLICE_AFTER(0x082daa20, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") {
-    if (!realtime_on()) return;
-    G32(c->x[8]) = (uint32_t)frame_step();
+SPLICE_AFTER(0x082daa20, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") { frame_step_store(c); }
+#endif
+
+/* (the fixes below are at v1.0.0's addresses; v1.4.3 has its own in totk_highfps.c) */
+#if GAME_VERSION == 100
+static float sreg(Ctx *c, int r) {
+    float f;
+    uint32_t u = (uint32_t)c->vreg[r][0];
+    memcpy(&f, &u, 4);
+    return f;
+}
+static void set_sreg(Ctx *c, int r, float f) {   /* (a scalar write: the rest of the register is zeroed) */
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    c->vreg[r][0] = u;
+    c->vreg[r][1] = 0;
+}
+static float gfloat(uint64_t a) {
+    float f;
+    uint32_t u = G32(a);
+    memcpy(&f, &u, 4);
+    return f;
+}
+static void set_gfloat(uint64_t a, float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    G32(a) = u;
+}
+
+/* Hair and cloth (MacNativeGames' patch_cloth_clock for v1.0.0, MIT; totk-pc-recomp's patch set "cloth"): the actor
+   animation update builds a second clock {seconds = factor / 30, ratio = factor} every rendered frame, so above 30 fps
+   hair and cloth swung too fast (2x at 60 fps, 4x at 120). The ordinary animation clock already follows the real-time
+   step. The update is inlined at three places and called once more (f_0882c224 from main+0x7b6358; its other caller
+   already passes measured time); each now takes the real-time step: seconds = step seconds * factor, ratio = step
+   ratio (seconds * 30) * factor. Needs the real-time step; HOS_CLOTH_REALTIME=0: off. */
+static int cloth_on(void) {
+    static int on = -1;
+    if (on < 0) on = realtime_on() && !(getenv("HOS_CLOTH_REALTIME") && *getenv("HOS_CLOTH_REALTIME") == '0');
+    return on;
+}
+/* HOS_HIGHFPS_LOG=1: the first calls of each patch below, with the values it computed */
+static void highfps_log(int site, const char *what, float a, float b) {
+    static int on = -1, n[4];
+    if (on < 0) on = getenv("HOS_HIGHFPS_LOG") != NULL;
+    if (on && site < 4 && n[site]++ < 3) hos_log("vi: %s %g -> %g", what, a, b);
+}
+static float step_seconds(void) {
+    float s;
+    const uint32_t u = (uint32_t)(frame_step() >> 32);
+    memcpy(&s, &u, 4);
+    return s;
+}
+/* main+0x7b598c and main+0x7b6b2c: stp s0, s8, [x29, #-0x40] stores {seconds = s0 = factor / 30, ratio = s8 = factor} */
+SPLICE_AFTER_EACH(0x087b5408, "int64_t _o=-64; { uint64_t _p0=0,_p1=0; memcpy(&_p0,&c->vreg[0][0],4); memcpy(&_p1,&c->vreg[8][0],4); recomp_stp32(") {
+    if (!cloth_on()) return;
+    const float factor = sreg(c, 8), seconds = step_seconds() * factor;
+    set_sreg(c, 0, seconds);
+    set_gfloat(c->x[29] - 0x40, seconds);
+    set_gfloat(c->x[29] - 0x3c, seconds * 30.0f);
+    highfps_log(0, "cloth clock (inline): factor, seconds", factor, seconds);
+}
+/* main+0x7f5ec4 fmul s1, s0, s1 (seconds = factor / 30), main+0x7f5ed0 str s0, [sp, #0x114] (ratio = factor) */
+SPLICE_AFTER(0x087f5a84, "recomp_store32_sp(c,(c->x[31]+276ULL),_v);") {
+    if (!cloth_on()) return;
+    const float factor = sreg(c, 0), seconds = step_seconds() * factor;
+    set_sreg(c, 1, seconds);
+    set_gfloat(c->x[31] + 0x114, seconds * 30.0f);
+    highfps_log(1, "cloth clock (inline 3): factor, seconds", factor, seconds);
+}
+/* the call at main+0x7b6358: s2 = factor / 30 (seconds), s3 = factor (ratio), each times the step ratio */
+ENTRY_HOOK(0x0882c224) {
+    if (c->x[30] != 0x087b635c || !cloth_on()) return 0;
+    const float ratio = step_seconds() * 30.0f;
+    set_sreg(c, 2, sreg(c, 2) * ratio);
+    set_sreg(c, 3, sreg(c, 3) * ratio);
+    highfps_log(2, "cloth clock (call): ratio, seconds", ratio, sreg(c, 2));
+    return 0;
+}
+
+/* Trampolines above 100 fps (MacNativeGames' patch_slowmo_bounce, their #61, MIT): main+0xce3fec compares the time
+   object's +0x28 (30 / (ratio * time scale)) with 100 and, when greater, scales the velocity Link takes over from the
+   ground body by 0.1. At the shipping 30 Hz that means "time slowed below 0.3", but above 100 fps it fires with time
+   running normally and the sky-island trampolines stop bouncing. The value compared is now +0x28 * +0x38 (the 30 Hz
+   ratio) = 30 / time scale: the same at 30 Hz, independent of the frame rate. HOS_HIGHFPS_FIX=0: off. */
+SPLICE_AFTER(0x08ce3d54, "recomp_load32(c,(c->x[8]+40ULL)); a64_vset64(c->vreg[0],_v);") {
+    static int on = -1;
+    if (on < 0) on = !(getenv("HOS_HIGHFPS_FIX") && *getenv("HOS_HIGHFPS_FIX") == '0');
+    if (!on) return;
+    highfps_log(3, "ground body check: 30 / (ratio * time scale), compared value", sreg(c, 0), sreg(c, 0) * gfloat(c->x[8] + 0x38));
+    set_sreg(c, 0, sreg(c, 0) * gfloat(c->x[8] + 0x38));
 }
 #endif
 
 /* TOTK's frame-rate controller, per build: its place in the game framework and its current interval (min and max at
    +0 / +4 in both). v1.4.3 (f_082db174, as v1.0.0's f_088f6bec: clamp(measured + 1, min, max)) moved the current
    interval to +0x40 and keeps 60 / interval at +0x50 (the frame step's global reads it, f_082daa20); it calls
-   nvnWindowSetPresentInterval with the controller in x20 and the framework in x19, as v1.0.0 does. */
-#if GAME_VERSION == 100
+   nvnWindowSetPresentInterval with the controller in x20 and the framework in x19, as v1.0.0 does. v1.2.1 keeps
+   v1.0.0's layout (upstream's 1.2.1 hooks pin it there). */
+#if GAME_VERSION == 100 || GAME_VERSION == 121
 #define CTL_IN_FW 0x248
 #define CTL_CURRENT 0x14
 #elif GAME_VERSION == 143
@@ -458,7 +565,7 @@ static void read_interval_mode(void) {
 }
 static int pin_totk_interval(Ctx *c, int requested) {
     read_interval_mode();
-    if (interval_mode == 0 || GAME_VERSION != 100) return requested;   /* (the controller's layout is v1.0.0's) */
+    if (interval_mode == 0 || (GAME_VERSION != 100 && GAME_VERSION != 121)) return requested;   /* (the controller's layout is v1.0.0's, kept in v1.2.1) */
     const uint64_t sp = c->x[31];
     const uint64_t ctl = G64(sp + 0x20), fw = G64(sp + 0x28);
     if (!ctl || ctl != fw + 0x248 || (int)G32(ctl + 0x14) != requested) {
@@ -692,7 +799,7 @@ static int native_controller_interval(Ctx *c, int requested) {
         if (ctl < 0x8000000 || ctl + CTL_CURRENT + 4 >= hos_guest_size() || !VirtualQuery(GP(ctl), &mi, sizeof mi) ||
             mi.State != MEM_COMMIT || (int)G32(ctl + CTL_CURRENT) != requested || G32(ctl) > G32(ctl + 4) ||
             G32(ctl + 4) > 4
-#if GAME_VERSION != 100
+#if GAME_VERSION != 100 && GAME_VERSION != 121
             || c->x[19] + CTL_IN_FW != ctl   /* (and the framework beside it, in x19) */
 #endif
         ) {

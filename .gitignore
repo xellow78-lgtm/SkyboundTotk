@@ -38,3 +38,5 @@ __pycache__/
 third_party/dlss/
 third_party/vulkan-headers/
 third_party/wgpu-native/lib/*.orig
+# Built locally for Linux. See README.md. Do not commit it.
+third_party/wgpu-native/lib/libwgpu_native.so
