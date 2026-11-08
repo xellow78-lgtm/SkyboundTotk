@@ -15,6 +15,7 @@
 
 extern "C" volatile float hos_render_scale;   // (hos/totk_drs.c: the 3D resolution setting; 0 the game's own)
 extern "C" unsigned hos_out_w, hos_out_h;      // (hos/totk_res.c: the game's output size)
+extern "C" volatile int hos_motion_blur;       // (hos/input_bind.c: Bindings.motion_blur)
 #include "rx_fsr2_shaders.h"
 
 #include <cmath>
@@ -29,6 +30,12 @@ namespace {
 using namespace fsr2gen;
 
 bool env_on(const char* n) { const char* v = getenv(n); return v && *v && *v != '0'; }
+/// motion blur: 0 off, 1 low, 2 medium, 3 high (RX_MOTION_BLUR overrides the setting)
+int motion_blur_mode() {
+    static const char* env = getenv("RX_MOTION_BLUR");
+    if (env && *env) return std::clamp(atoi(env), 0, 3);
+    return std::clamp((int)hos_motion_blur, 0, 3);
+}
 bool fsr2_on() { static const bool on = env_on("RX_FSR2"); return on; }
 
 struct Tex {
@@ -152,6 +159,13 @@ struct State {
     float jx = 0, jy = 0;
     int64_t last_fsr_frame = -10;   // the frame FSR last ran (jitter only while it runs)
     int64_t last_ns = 0;
+    // motion blur (rx below: the blit with the camera's motion)
+    WGPURenderPipeline blur = nullptr;
+    WGPUTextureFormat blur_format = WGPUTextureFormat_Undefined;
+    WGPUBindGroupLayout blur_layout = nullptr;
+    WGPUSampler blur_sampler = nullptr;
+    WGPUBuffer cb_blur[kRing] = {};
+    int blur_logged = -1;
 } st;
 
 const char* kMvWgsl = R"(
@@ -195,6 +209,57 @@ const char* kBlitWgsl = R"(
   return vec4<f32>(textureLoad(src, vec2<i32>(p.xy), 0).rgb, 1.0);
 }
 )";
+
+// Motion blur (F1 > Graphics, the launcher, input.ini motion_blur; live): the blit of the upscaled scene into the game's
+// target, each pixel averaged along the camera's motion there (the motion vectors made above, per scene pixel: the
+// camera's, exact for the world). Before the HUD, which the game draws over that target afterwards. Link and what he
+// holds (the reactive mask: the camera's motion is not theirs) are left sharp, and their pixels are not smeared into
+// what is behind them. The length: the motion in one frame x the shutter (Low 0.25, Medium 0.5, High 1.0), at most
+// max_px; more than a quarter of the picture in one frame (a cut, a teleport): none.
+const char* kBlurWgsl = R"(
+struct B { scale: vec4<f32>, p: vec4<f32> };   // the motion vectors' UV scale, the output's size; shutter, max, taps, noise
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@group(0) @binding(2) var mvt: texture_2d<f32>;
+@group(0) @binding(3) var react: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> b: B;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+fn scene_px(px: vec2<f32>) -> vec2<i32> {   // (the motion vectors' texel under an output pixel)
+  let d = vec2<f32>(textureDimensions(mvt));
+  return clamp(vec2<i32>(px / b.scale.zw * b.scale.xy * d), vec2<i32>(0), vec2<i32>(d) - 1);
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let center = textureLoad(src, vec2<i32>(p.xy), 0).rgb;
+  let q = scene_px(p.xy);
+  if (textureLoad(react, q, 0).r > 0.0) { return vec4<f32>(center, 1.0); }
+  // (now - last, in output pixels, times the shutter)
+  var v = -textureLoad(mvt, q, 0).xy * b.scale.zw;
+  let full = length(v);
+  if (full > 0.25 * max(b.scale.z, b.scale.w)) { return vec4<f32>(center, 1.0); }
+  v = v * b.p.x;
+  let len = length(v);
+  if (len < 0.75) { return vec4<f32>(center, 1.0); }
+  if (len > b.p.y) { v = v * (b.p.y / len); }
+  let n = i32(b.p.z);
+  let jit = fract(52.9829189 * fract(dot(p.xy, vec2<f32>(0.06711056, 0.00583715))) + b.p.w);
+  var sum = center;
+  var w = 1.0;
+  for (var i = 0; i < n; i++) {
+    let s = p.xy + v * ((f32(i) + jit) / f32(n) - 0.5);
+    if (s.x < 0.0 || s.y < 0.0 || s.x >= b.scale.z || s.y >= b.scale.w) { continue; }
+    if (textureLoad(react, scene_px(s), 0).r > 0.0) { continue; }
+    sum += textureSampleLevel(src, smp, s / b.scale.zw, 0.0).rgb;
+    w += 1.0;
+  }
+  return vec4<f32>(sum / w, 1.0);
+}
+)";
+struct BlurConstants {
+    float scale[4], p[4];
+};
 
 WGPUShaderModule module(const std::string& code, const char* label) {
     WGPUShaderSourceWGSL src{};
@@ -352,6 +417,31 @@ bool init_pipelines() {
         bd.entryCount = 1;
         bd.entries = &e;
         st.blit_layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
+    }
+    {   // (motion blur: the output, a sampler, the motion vectors, the reactive mask, its constants)
+        WGPUBindGroupLayoutEntry e[5]{};
+        for (int i = 0; i < 5; i++) e[i].binding = (uint32_t)i, e[i].visibility = WGPUShaderStage_Fragment;
+        e[0].texture.sampleType = WGPUTextureSampleType_Float;
+        e[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+        e[1].sampler.type = WGPUSamplerBindingType_Filtering;
+        e[2].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+        e[2].texture.viewDimension = WGPUTextureViewDimension_2D;
+        e[3].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+        e[3].texture.viewDimension = WGPUTextureViewDimension_2D;
+        e[4].buffer.type = WGPUBufferBindingType_Uniform;
+        e[4].buffer.minBindingSize = sizeof(BlurConstants);
+        WGPUBindGroupLayoutDescriptor bd{};
+        bd.entryCount = 5;
+        bd.entries = e;
+        st.blur_layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
+        WGPUSamplerDescriptor sd{};
+        sd.addressModeU = sd.addressModeV = sd.addressModeW = WGPUAddressMode_ClampToEdge;
+        sd.magFilter = sd.minFilter = WGPUFilterMode_Linear;
+        sd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+        sd.lodMaxClamp = 1;
+        sd.maxAnisotropy = 1;
+        st.blur_sampler = wgpuDeviceCreateSampler(dev.device, &sd);
+        for (WGPUBuffer& b : st.cb_blur) b = make_buffer(sizeof(BlurConstants), WGPUBufferUsage_Uniform);
     }
     for (int i = 0; i < kRing; i++) {
         st.cb[i] = make_buffer(sizeof(Constants), WGPUBufferUsage_Uniform);
@@ -609,6 +699,45 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         wgpuPipelineLayoutRelease(pl);
         wgpuShaderModuleRelease(mod);
         st.blit_format = at.color[0]->format;
+    }
+    const int blur_mode = motion_blur_mode();
+    if (blur_mode && st.blur_layout && st.blur_format != at.color[0]->format) {   // (the blit with motion blur)
+        if (st.blur) wgpuRenderPipelineRelease(st.blur);
+        scope_push();
+        WGPUShaderModule mod = module(kBlurWgsl, "rx motion blur");
+        WGPUColorTargetState target{};
+        target.format = at.color[0]->format;
+        target.writeMask = WGPUColorWriteMask_All;
+        WGPUFragmentState f{};
+        f.module = mod;
+        f.entryPoint = sv("fs");
+        f.targetCount = 1;
+        f.targets = &target;
+        WGPUPipelineLayoutDescriptor pd{};
+        pd.bindGroupLayoutCount = 1;
+        pd.bindGroupLayouts = &st.blur_layout;
+        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(dev.device, &pd);
+        WGPURenderPipelineDescriptor rd{};
+        rd.label = sv("rx motion blur");
+        rd.layout = pl;
+        rd.vertex.module = mod;
+        rd.vertex.entryPoint = sv("vs");
+        rd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+        rd.multisample.count = 1;
+        rd.multisample.mask = 0xFFFFFFFF;
+        rd.fragment = &f;
+        st.blur = wgpuDeviceCreateRenderPipeline(dev.device, &rd);
+        wgpuPipelineLayoutRelease(pl);
+        wgpuShaderModuleRelease(mod);
+        const std::string err = scope_pop();
+        if (!err.empty() || !st.blur) {
+            hos_log("rx: motion blur: the pass did not build: off. %s", err.c_str());
+            if (st.blur) wgpuRenderPipelineRelease(st.blur);
+            st.blur = nullptr;
+            wgpuBindGroupLayoutRelease(st.blur_layout);
+            st.blur_layout = nullptr;   // (not tried again)
+        }
+        st.blur_format = at.color[0]->format;
     }
 
     const bool odd = st.dispatches & 1;
@@ -896,13 +1025,42 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     if (mask_v) wgpuTextureViewRelease(mask_v);
     // the result into the game's target, where its scale-up would have drawn
     {
+        // (with motion blur: the blit averages each pixel along the camera's motion; not on a history reset)
+        const bool blur = blur_mode && st.blur && st.blur_format == at.color[0]->format && !st.reset;
         if (st.blit_groups[slot]) wgpuBindGroupRelease(st.blit_groups[slot]);
-        WGPUBindGroupEntry be = tex_entry(0, st.out.v);
-        WGPUBindGroupDescriptor bd{};
-        bd.layout = st.blit_layout;
-        bd.entryCount = 1;
-        bd.entries = &be;
-        st.blit_groups[slot] = wgpuDeviceCreateBindGroup(dev.device, &bd);
+        if (blur) {
+            static const float kShutter[4] = {0, 0.25f, 0.5f, 1.0f};
+            BlurConstants bc{};
+            bc.scale[0] = (float)rw / (float)st.mw, bc.scale[1] = (float)rh / (float)st.mh;
+            bc.scale[2] = (float)dw, bc.scale[3] = (float)dh;
+            bc.p[0] = kShutter[blur_mode];
+            bc.p[1] = 48.0f * (float)dh / 1080.0f;   // (the longest blur: 48 pixels at 1080p)
+            bc.p[2] = blur_mode == 3 ? 16.0f : 12.0f;
+            bc.p[3] = (float)((st.dispatches * 7) % 16) / 16.0f;   // (the taps' offset moves each frame)
+            wgpuQueueWriteBuffer(dev.queue, st.cb_blur[slot], 0, &bc, sizeof bc);
+            WGPUBindGroupEntry be[5] = {tex_entry(0, st.out.v), {}, tex_entry(2, st.mv.v), tex_entry(3, st.reactive.v),
+                                        buf_entry(4, st.cb_blur[slot], sizeof(BlurConstants))};
+            be[1].binding = 1;
+            be[1].sampler = st.blur_sampler;
+            WGPUBindGroupDescriptor bd{};
+            bd.layout = st.blur_layout;
+            bd.entryCount = 5;
+            bd.entries = be;
+            st.blit_groups[slot] = wgpuDeviceCreateBindGroup(dev.device, &bd);
+        } else {
+            WGPUBindGroupEntry be = tex_entry(0, st.out.v);
+            WGPUBindGroupDescriptor bd{};
+            bd.layout = st.blit_layout;
+            bd.entryCount = 1;
+            bd.entries = &be;
+            st.blit_groups[slot] = wgpuDeviceCreateBindGroup(dev.device, &bd);
+        }
+        if ((int)blur != st.blur_logged) {
+            static const char* const kNames[4] = {"off", "Low", "Medium", "High"};
+            if (blur || st.blur_logged > 0)
+                log_limited("motion_blur", 20, "rx: motion blur %s", blur ? kNames[blur_mode] : "off");
+            st.blur_logged = blur;
+        }
         WGPUTextureViewDescriptor tv{};
         tv.format = at.color[0]->format;
         tv.dimension = WGPUTextureViewDimension_2D;
@@ -920,7 +1078,7 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         pd.colorAttachments = &ca;
         WGPURenderPassEncoder rp = ce_begin_render_pass(e, &pd);
         rp_set_viewport(rp, 0, 0, (float)dw, (float)dh, 0, 1);
-        rp_set_pipeline(rp, st.blit);
+        rp_set_pipeline(rp, blur ? st.blur : st.blit);
         rp_set_bind_group(rp, 0, st.blit_groups[slot], 0, nullptr);
         rp_draw(rp, 3, 1, 0, 0);
         rp_end(rp);

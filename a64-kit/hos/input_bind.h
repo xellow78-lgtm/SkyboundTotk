@@ -50,6 +50,8 @@ typedef struct {
                                               1 natural (with the ripples), 2 clear */
     int surface_reflections;               /* ...and on smooth surfaces: polished stone, ice, metal (rx_ssr.cpp,
                                               live): 0 off, 1 soft (blurrier on rougher surfaces), 2 sharp */
+    int motion_blur;                       /* the camera's motion blur (rx_fsr2.cpp, live; with FSR 2 or DLSS): 0 off,
+                                              1 low, 2 medium, 3 high */
 } Bindings;
 
 /* The graphics settings as the renderer reads them (set from the bindings when loaded and saved) */
@@ -62,6 +64,7 @@ extern volatile int hos_frame_timing;           /* Bindings.frame_timing */
 extern volatile int hos_dlss_preset;            /* Bindings.dlss_preset */
 extern volatile int hos_water_reflections;      /* Bindings.water_reflections */
 extern volatile int hos_surface_reflections;    /* Bindings.surface_reflections */
+extern volatile int hos_motion_blur;            /* Bindings.motion_blur */
 
 /* totk_drs.c: the 3D resolution modes (their number, a mode's name) and making one current */
 int hos_render_mode_count(void);

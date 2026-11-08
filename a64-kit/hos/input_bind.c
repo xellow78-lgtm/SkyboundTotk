@@ -154,10 +154,11 @@ void hos_bind_defaults(Bindings *b) {
     b->shadow_dist = 0;
     b->water_reflections = 0;
     b->surface_reflections = 0;
+    b->motion_blur = 0;
 }
 
 volatile int hos_aniso_level, hos_reflex_mode, hos_button_icons_setting, hos_fps_limit = 60, hos_fps_counter, hos_frame_timing,
-             hos_dlss_preset, hos_water_reflections, hos_surface_reflections;
+             hos_dlss_preset, hos_water_reflections, hos_surface_reflections, hos_motion_blur;
 static void apply_graphics(const Bindings *b) {
     hos_aniso_level = b->aniso;
     hos_reflex_mode = b->reflex;
@@ -168,6 +169,7 @@ static void apply_graphics(const Bindings *b) {
     hos_dlss_preset = b->dlss_preset;
     hos_water_reflections = b->water_reflections;
     hos_surface_reflections = b->surface_reflections;
+    hos_motion_blur = b->motion_blur;
 }
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -226,6 +228,7 @@ static void load(Bindings *b) {
         if (!_stricmp(k, "shadow_distance")) { b->shadow_dist = atoi(v); continue; }
         if (!_stricmp(k, "water_reflections")) { b->water_reflections = atoi(v); continue; }
         if (!_stricmp(k, "surface_reflections")) { b->surface_reflections = atoi(v); continue; }
+        if (!_stricmp(k, "motion_blur")) { b->motion_blur = atoi(v); continue; }
         if (!_stricmp(k, "reflection_quality")) continue;   /* (an earlier setting: it changed nothing in the field) */
         int act = -1;
         for (int a = 0; a < ACT_COUNT && act < 0; a++)
@@ -261,6 +264,7 @@ static void load(Bindings *b) {
     if (b->shadow_dist < 0 || b->shadow_dist > 3) b->shadow_dist = 0;
     if (b->water_reflections < 0 || b->water_reflections > 2) b->water_reflections = 0;
     if (b->surface_reflections < 0 || b->surface_reflections > 2) b->surface_reflections = 0;
+    if (b->motion_blur < 0 || b->motion_blur > 3) b->motion_blur = 0;
     hos_log("input: bindings from %s (%d actions set)", path, n);
 }
 
@@ -302,10 +306,11 @@ static void save(const Bindings *b) {
                "# reflections of the world on the water (screen space: only what is on screen): 0 off, 1 natural (with the\n"
                "# ripples), 2 clear\nwater_reflections = %d\n"
                "# ...and on smooth surfaces (polished stone, ice, metal): 0 off, 1 soft (blurrier on rougher surfaces),\n"
-               "# 2 sharp (as polished)\nsurface_reflections = %d\n\n",
+               "# 2 sharp (as polished)\nsurface_reflections = %d\n"
+               "# the camera's motion blur (with FSR 2 or DLSS): 0 off, 1 low, 2 medium, 3 high\nmotion_blur = %d\n\n",
                b->aniso, b->reflex, b->button_icons, b->output_res, b->fps_limit, b->fps_counter, b->aspect,
                b->frame_timing, b->dlss_preset, b->shadow_res, b->shadow_dist, b->water_reflections,
-               b->surface_reflections);
+               b->surface_reflections, b->motion_blur);
     for (int a = 0; a < ACT_COUNT; a++) {
         fprintf(f, "%s = ", actions[a].ini);
         for (int s = 0, first = 1; s < BIND_SLOTS; s++)

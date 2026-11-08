@@ -7,6 +7,7 @@
 #include "input_bind.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "../gpu/render/rx.h"
@@ -102,7 +103,8 @@ static double frame_cap_hz(void) {
         const double display_hz = p ? 1e9 / (double)p : 0;
         if (display_hz >= 50 && hz > display_hz / per + 0.5) hz = display_hz / per, why = "frame interpolation";
     }
-    if (hz != shown) {
+    if (fabs(hz - shown) >= 1.0) {   /* (the display's measured rate wobbles: 82 / 83 at 165 Hz / 2, logged ~80 times a
+                                        minute, run_launcher.log 2026-11-08 18:44) */
         hos_log("vi: frames at most %.0f a second (%s)%s", hz, why,
                 hz > 63 ? ": above ~63 the camera may turn faster and Link may not climb steps (beta)" : "");
         shown = hz;

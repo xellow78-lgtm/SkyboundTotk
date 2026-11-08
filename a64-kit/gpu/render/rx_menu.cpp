@@ -51,7 +51,7 @@ const char* const kPageNames[kPages] = {"Graphics", "Mouse", "Controls"};
 
 enum Kind { kOption, kSlider, kToggle, kBinding, kButton, kInfo, kSection };
 enum Id {
-    kOutRes, kAspect, kRes, kFps, kFrameTiming, kFrameGen, kFpsCounter, kAniso, kShadowRes, kShadowDist, kReflections, kSurfaceRefl, kReflex, kButtons, kUpscaler, kDlssModel, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
+    kOutRes, kAspect, kRes, kFps, kFrameTiming, kFrameGen, kFpsCounter, kAniso, kShadowRes, kShadowDist, kReflections, kSurfaceRefl, kMotionBlur, kReflex, kButtons, kUpscaler, kDlssModel, kMouseCam, kInvert, kSens, kPitch, kHold, kWalk, kResetControls, kBind
 };
 
 struct Row {
@@ -69,6 +69,7 @@ const char* const kShadowResNames[4] = {"Game's own", "1024", "1536", "2048"};  
 const char* const kShadowDistNames[4] = {"Game's own", "x1.5", "x2", "x3"};     // (input.ini shadow_distance)
 const char* const kWaterNames[3] = {"Off", "Natural", "Clear"};                  // (input.ini water_reflections)
 const char* const kSurfaceNames[3] = {"Off", "Soft", "Sharp"};                  // (input.ini surface_reflections)
+const char* const kBlurNames[4] = {"Off", "Low", "Medium", "High"};             // (input.ini motion_blur)
 const char* const kReflexNames[3] = {"Off", "On", "On + Boost"};
 const int kFpsValues[8] = {30, 60, 90, 120, 144, 165, 200, 0};   // (200 at most: nn_vi.c FPS_MAX)
 const char* const kFpsNames[8] = {"30", "60", "90", "120", "144", "165", "200", "Display's rate"};
@@ -147,6 +148,10 @@ std::vector<Row> rows_of(int page, const Bindings& b) {
                                 : "Mirrors what is on screen in the water (screen-space reflections).");
         add(kOption, kSurfaceRefl, "Surface reflections", kSurfaceNames[std::clamp(b.surface_reflections, 0, 2)],
             "Polished stone, ice and metal mirror what is on screen. Soft: blurrier on rougher ones. Sharp: mirrors.");
+        Row& mb = add(kOption, kMotionBlur, "Motion blur", kBlurNames[std::clamp(b.motion_blur, 0, 3)],
+                      scaler ? "Blur as the camera turns and moves; Link stays sharp. Not on the HUD."
+                             : "Needs FSR 2 or DLSS (set at launch).");
+        mb.enabled = scaler;
         Row& rf = add(kOption, kReflex, "NVIDIA Reflex", kReflexNames[std::clamp(b.reflex, 0, 2)],
                       reflex_available() ? "Less input lag. Boost also keeps the GPU's clocks up."
                                          : "Needs an NVIDIA GPU on Vulkan.");
@@ -288,6 +293,7 @@ void change(State& s, const Row& r, int dir) {
     case kShadowDist: b.shadow_dist = (b.shadow_dist + dir + 4) % 4; break;
     case kReflections: b.water_reflections = (b.water_reflections + dir + 3) % 3; break;
     case kSurfaceRefl: b.surface_reflections = (b.surface_reflections + dir + 3) % 3; break;
+    case kMotionBlur: b.motion_blur = (b.motion_blur + dir + 4) % 4; break;
     case kReflex: b.reflex = (b.reflex + dir + 3) % 3; break;
     case kFps: b.fps_limit = kFpsValues[(fps_index(b.fps_limit) + dir + 8) % 8]; break;
     case kOutRes: b.output_res = (b.output_res + dir + 4) % 4; break;
@@ -335,7 +341,7 @@ void reset_controls(State& s) {
     d.button_icons = b.button_icons, d.output_res = b.output_res, d.fps_limit = b.fps_limit;
     d.fps_counter = b.fps_counter, d.aspect = b.aspect, d.frame_timing = b.frame_timing, d.dlss_preset = b.dlss_preset;
     d.shadow_res = b.shadow_res, d.shadow_dist = b.shadow_dist, d.water_reflections = b.water_reflections;
-    d.surface_reflections = b.surface_reflections;
+    d.surface_reflections = b.surface_reflections, d.motion_blur = b.motion_blur;
     hos_bind_set(&d);
     set_status(s, "Controls and mouse settings are back to the defaults.");
 }
