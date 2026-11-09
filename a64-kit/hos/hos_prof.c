@@ -295,6 +295,25 @@ static void rust_short(const char *m, char *out, size_t cap) {
     out[o < cap ? o : cap - 1] = 0;
 }
 
+static DWORD64 exe_lo, exe_hi;   /* (the exe's address range, set by prof_main) */
+/* A frame outside the exe: its module's file name, for the name (" @nvoglv64.dll"). The modules without symbols
+   (NVIDIA's driver, overlays' Vulkan layers) show the nearest export's name, so vkGetInstanceProcAddr was the driver's
+   command recording or a layer's, undecided; wgpu_native.dll has its symbols (the launcher installs its PDB) and goes
+   without. */
+static void module_suffix(DWORD64 pc, char *out, size_t cap, DWORD64 *base_out) {
+    out[0] = 0;
+    *base_out = 0;
+    if (!exe_hi || (pc >= exe_lo && pc < exe_hi)) return;
+    MEMORY_BASIC_INFORMATION mbi;
+    char path[MAX_PATH];
+    if (!VirtualQuery((void *)(uintptr_t)pc, &mbi, sizeof mbi) || !mbi.AllocationBase ||
+        !GetModuleFileNameA((HMODULE)mbi.AllocationBase, path, sizeof path))
+        return;
+    const char *f = strrchr(path, '\\');
+    f = f ? f + 1 : path;
+    *base_out = (DWORD64)(uintptr_t)mbi.AllocationBase;
+    if (_stricmp(f, "wgpu_native.dll")) snprintf(out, cap, " @%s", f);
+}
 static int hit_index(HANDLE proc, DWORD64 pc, const char *thread) {
     PcCache *e = &pc_cache[(pc ^ pc >> 16) & 0xFFFF];
     if (e->pc == pc) return e->hit;
@@ -305,10 +324,19 @@ static int hit_index(HANDLE proc, DWORD64 pc, const char *thread) {
     sym->MaxNameLen = 255;
     DWORD64 disp = 0, start = pc;
     char name[96] = "?";
+    char mod[64];
+    DWORD64 mod_base;
+    module_suffix(pc, mod, sizeof mod, &mod_base);
     if (SymFromAddr(proc, pc, &disp, sym)) {
         start = sym->Address;
         if (!strncmp(sym->Name, "ZN", 2) || !strncmp(sym->Name, "_ZN", 3)) rust_short(sym->Name, name, sizeof name);
         else snprintf(name, sizeof name, "%s", sym->Name);
+    } else if (mod_base) {
+        start = mod_base;   /* (no symbol: one entry per module, "? @x.dll", not one per address) */
+    }
+    if (mod[0]) {
+        const size_t len = strlen(name);
+        snprintf(name + len, sizeof name - len, "%s", mod);
     }
     unsigned h = (unsigned)((start >> 4) * 0x9E3779B1u) >> 15;
     while (hit_slot[h] && hits[hit_slot[h] - 1].addr != start) h = (h + 1) & ((1u << 17) - 1);
@@ -378,7 +406,6 @@ static int waiting_name(const char *nm) {
 static Caller waits[256];
 static int nwaits;
 static unsigned one_busy, one_wait;
-static DWORD64 exe_lo, exe_hi;
 static int library_frame(const char *nm) {
     return !strncmp(nm, "std::", 5) || !strncmp(nm, "_Cnd", 4) || !strncmp(nm, "_Mtx", 4) || !strncmp(nm, "_Thrd", 5) ||
            !strncmp(nm, "Concurrency::", 13) || !strncmp(nm, "__crt", 5);
@@ -400,7 +427,7 @@ static void note_wait(HANDLE proc, const DWORD64 *stack, int depth, const char *
     if (!got) snprintf(chain, sizeof chain, "(no frame of the game or the runtime above it)");
     int c;
     for (c = 0; c < nwaits && strcmp(waits[c].chain, chain); c++) {}
-    if (c == nwaits && nwaits < 256) { snprintf(waits[c].chain, sizeof waits[c].chain, "%s", chain); nwaits++; }
+    if (c == nwaits && nwaits < 256) { snprintf(waits[c].chain, sizeof waits[c].chain, "%s", chain); waits[c].n = 0; nwaits++; }
     if (c < nwaits) waits[c].n++;
 }
 static const char *volatile prof_only;   /* (hos_profile_start's second run: one thread, whole stacks) */
@@ -410,7 +437,7 @@ static DWORD WINAPI prof_main(void *p) {
     const char *delay = getenv("HOS_PROFILE_DELAY"), *only = prof_only ? prof_only : getenv("HOS_PROFILE_THREAD");
     nhits = 0;
     nloads = 0;
-    nwaits = 0;
+    nwaits = ncallers = nlines = 0;   /* (an F5 run after another: its own tables) */
     one_busy = one_wait = 0;
     {   /* (the exe's address range: note_wait's frames of the game and the runtime) */
         const uint8_t *base = (const uint8_t *)GetModuleHandleW(NULL);
@@ -513,7 +540,7 @@ static DWORD WINAPI prof_main(void *p) {
                     }
                     int c;
                     for (c = 0; c < ncallers && strcmp(callers[c].chain, chain); c++) {}
-                    if (c == ncallers && ncallers < 256) { snprintf(callers[c].chain, sizeof callers[c].chain, "%s", chain); ncallers++; }
+                    if (c == ncallers && ncallers < 256) { snprintf(callers[c].chain, sizeof callers[c].chain, "%s", chain); callers[c].n = 0; ncallers++; }
                     if (c < ncallers) callers[c].n++;
                     break;
                 }
@@ -534,7 +561,7 @@ static DWORD WINAPI prof_main(void *p) {
                     }
                     int k;
                     for (k = 0; k < nlines && strcmp(lines[k].where, where); k++) {}
-                    if (k == nlines && nlines < 512) { snprintf(lines[k].where, sizeof lines[k].where, "%s", where); nlines++; }
+                    if (k == nlines && nlines < 512) { snprintf(lines[k].where, sizeof lines[k].where, "%s", where); lines[k].n = 0; nlines++; }
                     if (k < nlines) lines[k].n++;
                 }
             }
