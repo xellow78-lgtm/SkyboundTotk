@@ -17,9 +17,12 @@
 #include <windows.h>
 #include <mmsystem.h>
 #endif
+#include <string.h>
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
+#include <cpuid.h>
+#endif
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <errno.h>
-#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #define _ftelli64 ftello
@@ -186,6 +189,34 @@ static void call_guest(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
     call_guest_args(c, addr, sp, what);
 }
 
+/* The PC in the log (its CPU, processors and RAM): the frame rate is the CPU's in the open world, so logs from
+   different PCs are compared by it. (The GPU is the renderer's "rx: WebGPU on ..." line.) */
+static void log_machine(void) {
+    char brand[49] = "";
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
+    unsigned r[12] = {0}, a = 0, b = 0, c = 0, d = 0;
+    if (__get_cpuid(0x80000000u, &a, &b, &c, &d) && a >= 0x80000004u) {
+        for (unsigned i = 0; i < 3; i++) __get_cpuid(0x80000002u + i, &r[i * 4], &r[i * 4 + 1], &r[i * 4 + 2], &r[i * 4 + 3]);
+        memcpy(brand, r, 48);
+    }
+#endif
+    const char *name = brand;
+    while (*name == ' ') name++;
+    unsigned logical = 0;
+    unsigned long long ram_mb = 0;
+#ifdef _WIN32
+    logical = (unsigned)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) ram_mb = ms.ullTotalPhys >> 20;
+#elif defined(__linux__)
+    const long cpus = sysconf(_SC_NPROCESSORS_ONLN), pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    logical = cpus > 0 ? (unsigned)cpus : 0;
+    if (pages > 0 && page > 0) ram_mb = (unsigned long long)pages * (unsigned long long)page >> 20;
+#endif
+    hos_log("machine: %s, %u logical processors, %llu MB of RAM", *name ? name : "(CPU unknown)", logical, ram_mb);
+}
+
 int main(int argc, char **argv) {
     const char *image = NULL;
     for (int i = 1; i < argc; i++) {
@@ -252,6 +283,7 @@ int main(int argc, char **argv) {
     hos_mem_init(hos_image_end);
     hos_log("boot: image %zu MB at %#llx, %llu MB of memory for the game", n >> 20, IMAGE_BASE,
             (unsigned long long)(hos_total_memory >> 20));
+    log_machine();
     void hos_mods_init(const char *image_path);
     hos_mods_init(image);   /* mods.c: <exe folder>\mods (RomFS files, exefs data patches) */
     void hos_res_init(void);
