@@ -42,6 +42,7 @@ std::atomic<int> applied{-1};   // the mode set on the driver (-1: none yet)
 uint64_t sim_frame = 1, submit_frame = 1;      // (the game's frame thread; the NVN replay thread)
 std::atomic<uint64_t> present_frame{1};        // (the submit thread)
 bool submit_in_frame = false;
+std::atomic<int64_t> sleep_ns{0};              // (RX_STATS: the game's present thread in vkLatencySleepNV)
 
 int mode() {
     const int m = hos_reflex_mode;
@@ -66,6 +67,7 @@ void reflex_after_device() {
 }
 
 bool reflex_available() { return available; }
+int64_t reflex_take_sleep_ns() { return sleep_ns.exchange(0); }
 
 // The game's frame thread, at its present: the frame's simulation ends; then the next one's starts, after the sleep.
 void reflex_game_present_begin() {
@@ -86,8 +88,10 @@ void reflex_game_present_end() {
     // (the driver signals when this frame should start; 100 ms at most: a swapchain made again meanwhile, a window
     // that is not shown)
     static int timeouts;
+    const int64_t t0 = hos_now_ns();
     if (!wgpuTotkReflexSleep(dev.device, 100000000ull) && timeouts++ < 5)
         hos_log("rx: NVIDIA Reflex: no sleep this frame (no swapchain yet, or the wait timed out)");
+    sleep_ns += hos_now_ns() - t0;
     wgpuTotkReflexMarker(kSimulationStart, sim_frame);
 }
 
@@ -129,6 +133,7 @@ namespace rx {
 void reflex_before_device() {}
 void reflex_after_device() {}
 bool reflex_available() { return false; }
+int64_t reflex_take_sleep_ns() { return 0; }
 void reflex_game_present_begin() {}
 void reflex_game_present_end() {}
 void reflex_replay_job(bool) {}

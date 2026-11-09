@@ -489,6 +489,8 @@ void reflex_after_device();
 bool reflex_available();
 void reflex_game_present_begin();
 void reflex_game_present_end();
+/// (RX_STATS) The ns the game's present thread slept in Reflex's sleep since the last call.
+int64_t reflex_take_sleep_ns();
 void reflex_replay_job(bool present);
 uint64_t reflex_present_begin();
 void reflex_present_end(uint64_t present_id);

@@ -371,6 +371,38 @@ static int cmp_loads(const void *a, const void *b) {
 static int waiting_name(const char *nm) {
     return !strncmp(nm, "Zw", 2) || !strncmp(nm, "Nt", 2) || strstr(nm, "Wait") || strstr(nm, "Sleep");
 }
+/* One thread's profile (HOS_PROFILE_THREAD, F5 again): where it waits. A waiting sample (its leaf a wait or sleep
+   function) is counted under the first three frames above it in the exe (lifted game code f_XXXXXXXX, the HLE layer,
+   the renderer), the system's and the C++ library's frames skipped: "rx_nvn_wait < n_nvnSyncWait < f_082db998" says
+   the game waited for the renderer there, an nn::os wait under game code that it waited for its own threads. */
+static Caller waits[256];
+static int nwaits;
+static unsigned one_busy, one_wait;
+static DWORD64 exe_lo, exe_hi;
+static int library_frame(const char *nm) {
+    return !strncmp(nm, "std::", 5) || !strncmp(nm, "_Cnd", 4) || !strncmp(nm, "_Mtx", 4) || !strncmp(nm, "_Thrd", 5) ||
+           !strncmp(nm, "Concurrency::", 13) || !strncmp(nm, "__crt", 5);
+}
+static void note_wait(HANDLE proc, const DWORD64 *stack, int depth, const char *thread) {
+    char chain[300];
+    chain[0] = 0;
+    int got = 0;
+    for (int d = 1; d < depth && got < 3; d++) {
+        if (stack[d] < exe_lo || stack[d] >= exe_hi) continue;
+        const int k = hit_index(proc, stack[d], thread);
+        if (k < 0 || library_frame(hits[k].name)) continue;
+        const char *nm = hits[k].name, *br = strstr(nm, " [");
+        const int len = br ? (int)(br - nm) : (int)strlen(nm);
+        const size_t at = strlen(chain);
+        snprintf(chain + at, sizeof chain - at, "%s%.*s", at ? " < " : "", len > 90 ? 90 : len, nm);
+        got++;
+    }
+    if (!got) snprintf(chain, sizeof chain, "(no frame of the game or the runtime above it)");
+    int c;
+    for (c = 0; c < nwaits && strcmp(waits[c].chain, chain); c++) {}
+    if (c == nwaits && nwaits < 256) { snprintf(waits[c].chain, sizeof waits[c].chain, "%s", chain); nwaits++; }
+    if (c < nwaits) waits[c].n++;
+}
 static const char *volatile prof_only;   /* (hos_profile_start's second run: one thread, whole stacks) */
 static volatile int prof_from_f5;        /* (an F5 run: no HOS_PROFILE_DELAY, which is the startup run's) */
 static DWORD WINAPI prof_main(void *p) {
@@ -378,6 +410,13 @@ static DWORD WINAPI prof_main(void *p) {
     const char *delay = getenv("HOS_PROFILE_DELAY"), *only = prof_only ? prof_only : getenv("HOS_PROFILE_THREAD");
     nhits = 0;
     nloads = 0;
+    nwaits = 0;
+    one_busy = one_wait = 0;
+    {   /* (the exe's address range: note_wait's frames of the game and the runtime) */
+        const uint8_t *base = (const uint8_t *)GetModuleHandleW(NULL);
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+        exe_lo = (DWORD64)(uintptr_t)base, exe_hi = exe_lo + nt->OptionalHeader.SizeOfImage;
+    }
     memset(hit_slot, 0, sizeof hit_slot);
     memset(pc_cache, 0, sizeof pc_cache);
     const char *callers_of = only ? getenv("HOS_PROFILE_CALLERS") : NULL;   /* (with HOS_PROFILE_THREAD) */
@@ -514,6 +553,11 @@ static DWORD WINAPI prof_main(void *p) {
                 seen[nseen++] = j;
                 hits[j].hits++;
             }
+            if (only && depth) {   /* (one thread: busy or waiting, and where it waits) */
+                const int j = hit_index(proc, stack[0], names[i]);
+                if (j >= 0 && waiting_name(hits[j].name)) one_wait++, note_wait(proc, stack, depth, names[i]);
+                else one_busy++;
+            }
             if (!only && depth) {   /* (the thread's load: busy unless its leaf waits) */
                 const int j = hit_index(proc, stack[0], names[i]);
                 const int w = j >= 0 && waiting_name(hits[j].name);
@@ -541,6 +585,12 @@ static DWORD WINAPI prof_main(void *p) {
         fprintf(stderr, "[hos profile] inclusive:\n");
         for (int i = 0; i < nhits && i < 70; i++)
             fprintf(stderr, "  %6u  %5.1f%%  %s\n", hits[i].hits, 100.0 * hits[i].hits / (total ? total : 1), hits[i].name);
+        /* (a name can match several threads: then the percentages are of all their samples together) */
+        fprintf(stderr, "[hos profile] %s: %.1f%% busy, %.1f%% waiting; where it waits (%% of its samples):\n", only,
+                100.0 * one_busy / (total ? total : 1), 100.0 * one_wait / (total ? total : 1));
+        qsort(waits, nwaits, sizeof *waits, cmp_callers);
+        for (int i = 0; i < nwaits && i < 30; i++)
+            fprintf(stderr, "  %6u  %5.1f%%  %s\n", waits[i].n, 100.0 * waits[i].n / (total ? total : 1), waits[i].chain);
     }
     if (lines_of) {
         qsort(lines, nlines, sizeof *lines, cmp_lines);
@@ -614,31 +664,42 @@ static DWORD WINAPI prof_main(void *p) {
     return 0;
 }
 
-static volatile LONG *f5_running;
-static DWORD WINAPI prof_f5_main(void *p) {   /* (an F5 run; another may start once it is done) */
-    prof_main(p);
-    prof_only = NULL;
-    if (f5_running) InterlockedExchange(f5_running, 0);
+static volatile LONG f5_running, f5_runs, f5_pending;
+void hos_profile_start(int seconds);
+static void f5_setup(int seconds) {
+    /* (the first F5 every thread, the next ones one thread with whole call stacks and where it waits:
+       HOS_PROFILE_F5_THREAD, the game's main thread by default: at ~50 fps on 2026-11-08 it was 42 % busy and the
+       rest waiting, and the frame rate was 68.7 without draws, so what it waits on is the question) */
+    const char *t = getenv("HOS_PROFILE_F5_THREAD");
+    prof_only = InterlockedIncrement(&f5_runs) > 1 ? (t && *t ? t : "MainThread") : NULL;
+    prof_from_f5 = 1;
+    hos_log("profile: sampling %s for %d s (F5)", prof_only ? prof_only : "every thread", seconds);
+}
+static DWORD WINAPI prof_f5_main(void *p) {   /* (an F5 run, then the one pressed for while it ran) */
+    for (;;) {
+        prof_main(p);
+        prof_only = NULL;
+        if (!InterlockedExchange(&f5_pending, 0)) break;
+        f5_setup((int)(intptr_t)p);
+    }
+    InterlockedExchange(&f5_running, 0);
+    if (InterlockedExchange(&f5_pending, 0)) hos_profile_start((int)(intptr_t)p);   /* (pressed just then) */
     return 0;
 }
 
 /* F5 in the game (display.c): the sampling profiler for that many seconds from now, once at a time (what HOS_PROFILE
-   does from the start, aimed at a place: a slow shrine). The report goes to the log as HOS_PROFILE's does. */
+   does from the start, aimed at a place: a slow shrine). The report goes to the log as HOS_PROFILE's does. F5 while
+   one runs: the next starts when it ends (it used to be dropped: a second press at ~15 s was lost on 2026-11-08). */
 void hos_profile_start(int seconds) {
-    static volatile LONG running, runs;
-    f5_running = &running;
-    if (InterlockedCompareExchange(&running, 1, 0)) {
-        hos_log("profile: one is already running");
+    if (InterlockedCompareExchange(&f5_running, 1, 0)) {
+        InterlockedExchange(&f5_pending, 1);
+        hos_log("profile: one is running: the next starts when it ends");
         return;
     }
-    /* (the first F5 every thread, the next ones one thread with whole call stacks: HOS_PROFILE_F5_THREAD, the
-       renderer's replay thread by default, where the frame's time went in the 2026-11-08 profile) */
-    const char *t = getenv("HOS_PROFILE_F5_THREAD");
-    prof_only = InterlockedIncrement(&runs) > 1 ? (t && *t ? t : "NVN replay") : NULL;
-    prof_from_f5 = 1;
-    hos_log("profile: sampling %s for %d s (F5)", prof_only ? prof_only : "every thread", seconds);
+    f5_setup(seconds);
     HANDLE h = CreateThread(NULL, 0, prof_f5_main, (void *)(intptr_t)seconds, 0, NULL);
     if (h) CloseHandle(h);
+    else InterlockedExchange(&f5_running, 0);
 }
 
 /* The guest call stack, from the host one: lifted code makes one C call per guest call, so every f_XXXXXXXX frame on

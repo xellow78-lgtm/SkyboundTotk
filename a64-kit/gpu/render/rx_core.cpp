@@ -1562,6 +1562,10 @@ void report_period() {
                 st_wait_ns.exchange(0) / 1e6 / frames);
         if (const int64_t w = st_writeback_words.exchange(0))
             hos_log("rx:   shader writes copied back to guest memory: %.0f words per frame", w / frames);
+        // (Reflex on: the game's present thread sleeps at the start of each frame; whether the frame waits for that
+        // sleep is what turning it off in F1 shows)
+        if (const int64_t r = reflex_take_sleep_ns())
+            hos_log("rx:   NVIDIA Reflex: the game's present thread slept %.2f ms per frame", r / 1e6 / frames);
     }
     counters.clear();
     counters_generation++;
