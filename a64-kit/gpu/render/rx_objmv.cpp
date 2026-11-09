@@ -27,6 +27,7 @@
 #include "rx_internal.h"
 
 #include <algorithm>
+#include <bitset>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -230,9 +231,29 @@ struct VelDraw {
     uint32_t w = 0, h = 0;
 };
 
+/// A followed draw: this frame's and last frame's inputs, alternating by the frame's parity (kept from frame to frame:
+/// nothing allocated per draw once its vectors have grown)
+struct Entry {
+    Snap s[2];
+    int64_t f[2] = {-9, -9};
+};
+
+/// Per vertex program: how many of its draws changed each uniform block row (and each constant buffer bound as
+/// storage) this frame, and the rows that changed in most of them last frame. Those change for the whole scene (the
+/// camera's or the time's constants: in the first test 85 % of the scene's draws "moved" by their bytes, 512 drawn
+/// again each frame, 15-30 fps); a draw moved when it changes something else (bones, its own transform).
+constexpr uint32_t kRows = 256, kSlots = kRows + 16;
+struct VsRows {
+    int64_t frame = -1;
+    uint32_t draws = 0, last_draws = 0;
+    uint16_t changed[kSlots]{};
+    std::bitset<kSlots> global;
+};
+
 struct State {
     int64_t frame = -1;
-    std::unordered_map<uint64_t, Snap> cur, last;
+    std::unordered_map<uint64_t, Entry> draws;
+    std::unordered_map<uint64_t, VsRows> rows;
     std::unordered_map<uint64_t, uint32_t> turns;   // (equal draws this frame: their turn)
     std::unordered_map<uint64_t, Bytes> ranges;     // (guest ranges read this frame)
     std::vector<VelDraw> queue;
@@ -250,8 +271,8 @@ struct State {
     bool failed = false;
     // (RX_OBJ_MV_STATS)
     int64_t n_draws = 0, n_new = 0, n_moved = 0, n_queued = 0, n_no_pipe = 0, n_no_room = 0, n_mismatch = 0, n_passes = 0,
-            n_capped = 0;
-    int frame_queued = 0;   // (this frame's velocity draws: at most RX_OBJ_MV_MAX, 512)
+            n_capped = 0, n_bones = 0, n_scene = 0;
+    int frame_queued = 0;   // (this frame's velocity draws: at most RX_OBJ_MV_MAX, 256)
     int64_t groups_made = 0;
     int64_t stats_t0 = 0;
 } st;
@@ -263,12 +284,11 @@ int env_mode() {
 
 void new_frame() {
     if (st.frame == frame_number) return;
-    const bool next = st.frame + 1 == frame_number;   // (after a gap (a menu, a load), no last frame: not 2 frames' motion)
     st.frame = frame_number;
-    st.last.swap(st.cur);
-    st.cur.clear();
-    if (!next) st.last.clear();
     st.turns.clear();
+    if (frame_number % 600 == 0)   // (draws not seen for 2 s let go)
+        for (auto it = st.draws.begin(); it != st.draws.end();)
+            it = std::max(it->second.f[0], it->second.f[1]) < frame_number - 120 ? st.draws.erase(it) : std::next(it);
     st.ranges.clear();
     st.uploaded.clear();   // (last frame's bytes are gone: an address could come back)
     st.uploaded_batch = -1;
@@ -285,19 +305,23 @@ void stats() {
     if (on || st.n_queued)
         log_limited("objmv_stats", on ? 100000 : 30,
                     "rx: object motion in the last %.1f s: %lld scene draws followed, %lld without a last frame, %lld "
-                    "moved, %lld redrawn in %lld passes (%lld waiting for a pipeline, %lld no room, %lld changed shape, "
-                    "%lld over the frame's limit)",
+                    "moved (%lld by their bones; %lld changed only what the whole scene changes, not drawn), %lld redrawn "
+                    "in %lld passes (%lld waiting for a pipeline, %lld no room, %lld changed shape, %lld over the "
+                    "frame's limit)",
                     (now - st.stats_t0) / 1e9, (long long)st.n_draws, (long long)st.n_new, (long long)st.n_moved,
-                    (long long)st.n_queued, (long long)st.n_passes, (long long)st.n_no_pipe, (long long)st.n_no_room,
-                    (long long)st.n_mismatch, (long long)st.n_capped);
+                    (long long)st.n_bones, (long long)st.n_scene, (long long)st.n_queued, (long long)st.n_passes,
+                    (long long)st.n_no_pipe, (long long)st.n_no_room, (long long)st.n_mismatch, (long long)st.n_capped);
     st.n_draws = st.n_new = st.n_moved = st.n_queued = st.n_no_pipe = st.n_no_room = st.n_mismatch = st.n_passes = 0;
-    st.n_capped = 0;
+    st.n_capped = st.n_bones = st.n_scene = 0;
     st.stats_t0 = now;
 }
 
-/// The velocity target at the scene targets' size (made again when that changes)
+/// The velocity target, at least the scene targets' size: only ever larger (made again when they grow). Made for
+/// each size, it was made twice a frame in the first test (a pass into half-size targets each frame), each old one
+/// held by its retired view until the next trim: VRAM over 7.9 GB and the game out of video memory.
 bool ensure_target(uint32_t w, uint32_t h) {
-    if (st.vel && st.vw == w && st.vh == h) return st.vel_v != nullptr;
+    if (st.vel && st.vw >= w && st.vh >= h) return st.vel_v != nullptr;
+    w = std::max(w, st.vw), h = std::max(h, st.vh);
     if (st.vel_v) retire_view(st.vel_v);
     if (st.vel) wgpuTextureRelease(st.vel);
     WGPUTextureDescriptor td{};
@@ -483,29 +507,35 @@ WGPUBindGroupLayout objmv_fs_layout() {
     return st.fs_layout;
 }
 
-bool objmv_moved(uint64_t identity, ObjMvCapture& cap, uint64_t* turn_identity) {
+bool objmv_moved(uint64_t identity, uint64_t vs_key, ObjMvCapture& cap, uint64_t* turn_identity) {
     new_frame();
     stats();
     const uint64_t id = identity ^ (uint64_t)(st.turns[identity]++) * 0xD6E8FEB86659FD93ull;
     *turn_identity = id;
     st.n_draws++;
-    Snap& s = st.cur[id];
-    s.bind = std::move(cap.bind);
-    s.ub = std::move(cap.ub);
+    Entry& e = st.draws[id];
+    const int slot = (int)(frame_number & 1);
+    Snap& s = e.s[slot];
+    s.bind.swap(cap.bind);   // (the vectors trade places: their capacity is kept)
+    s.ub.swap(cap.ub);
     s.cam_row = cap.cam_row, s.cam_rows = cap.cam_rows;
+    e.f[slot] = frame_number;
     cap.clear();
-    auto it = st.last.find(id);
-    if (it == st.last.end()) {
+    if (e.f[slot ^ 1] != frame_number - 1) {   // (none last frame, or after a gap: not 2 frames' motion)
         st.n_new++;
         return false;
     }
-    const Snap& p = it->second;
+    const Snap& p = e.s[slot ^ 1];
     if (p.bind.size() != s.bind.size() || p.ub.size() != s.ub.size()) {
         st.n_mismatch++;
         return false;
     }
-    bool same = true;
-    for (size_t i = 0; i < s.bind.size() && same; i++) {
+    // what changed: storage buffers (bones), the block's rows from 4 and the constant buffers bound as storage (the
+    // camera's left out)
+    bool bones = false;
+    uint16_t changed[kSlots];   // (the slots that changed)
+    uint32_t nchanged = 0;
+    for (size_t i = 0; i < s.bind.size(); i++) {
         const ObjMvBinding &a = s.bind[i], &b = p.bind[i];
         if (a.kind != b.kind || a.dyn != b.dyn) {
             st.n_mismatch++;
@@ -516,17 +546,42 @@ bool objmv_moved(uint64_t identity, ObjMvCapture& cap, uint64_t* turn_identity) 
             st.n_mismatch++;
             return false;
         }
-        same = a.bytes->size() == b.bytes->size() && !std::memcmp(a.bytes->data(), b.bytes->data(), a.bytes->size());
+        const bool same =
+            a.bytes->size() == b.bytes->size() && !std::memcmp(a.bytes->data(), b.bytes->data(), a.bytes->size());
+        if (same) continue;
+        if (a.kind == 3) bones = true;
+        else if (i < 16) changed[nchanged++] = (uint16_t)(kRows + i);
     }
-    if (same) {   // (the uniform block from row 4, the camera's rows left out)
-        const size_t n = s.ub.size() / 16;
-        for (size_t row = 4; row < n && same; row++) {
-            if (row >= s.cam_row && row < (size_t)s.cam_row + s.cam_rows) continue;
-            same = !std::memcmp(s.ub.data() + row * 16, p.ub.data() + row * 16, 16);
-        }
+    const size_t n = s.ub.size() / 16;
+    for (size_t row = 4; row < n; row++) {
+        if (row >= s.cam_row && row < (size_t)s.cam_row + s.cam_rows) continue;
+        if (row < kRows && std::memcmp(s.ub.data() + row * 16, p.ub.data() + row * 16, 16)) changed[nchanged++] = (uint16_t)row;
     }
-    if (same) return false;
+    // this program's draws this frame (for next frame's "whole scene" rows)
+    VsRows& r = st.rows[vs_key];
+    if (r.frame != frame_number) {
+        r.global.reset();
+        if (r.frame == frame_number - 1 && r.draws >= 4)
+            for (uint32_t k = 0; k < kSlots; k++)
+                if (r.changed[k] * 2 >= r.draws) r.global.set(k);
+        r.last_draws = r.frame == frame_number - 1 ? r.draws : 0;
+        r.draws = 0;
+        std::memset(r.changed, 0, sizeof r.changed);
+        r.frame = frame_number;
+    }
+    r.draws++;
+    static const bool all = getenv("RX_OBJ_MV_ALL") && *getenv("RX_OBJ_MV_ALL") != '0';
+    bool own = bones;
+    for (uint32_t k = 0; k < nchanged; k++) {
+        if (r.changed[changed[k]] < 0xFFFF) r.changed[changed[k]]++;
+        own |= all || !r.global[changed[k]];
+    }
+    if (!own) {
+        if (nchanged) st.n_scene++;
+        return false;
+    }
     st.n_moved++;
+    if (bones) st.n_bones++;
     return true;
 }
 
@@ -535,15 +590,16 @@ void objmv_queue(uint64_t id, const ObjMvDraw& d) {
         st.n_no_pipe++;
         return;
     }
-    static const int max_draws = getenv("RX_OBJ_MV_MAX") ? atoi(getenv("RX_OBJ_MV_MAX")) : 512;
+    static const int max_draws = getenv("RX_OBJ_MV_MAX") ? atoi(getenv("RX_OBJ_MV_MAX")) : 256;
     if (st.frame_queued >= max_draws) {   // (a frame where everything changes: not the whole scene twice)
         st.n_capped++;
         return;
     }
-    auto ci = st.cur.find(id);
-    auto pi = st.last.find(id);
-    if (ci == st.cur.end() || pi == st.last.end()) return;
-    const Snap &s = ci->second, &p = pi->second;
+    auto ei = st.draws.find(id);
+    if (ei == st.draws.end()) return;
+    const int slot = (int)(frame_number & 1);
+    if (ei->second.f[slot] != frame_number || ei->second.f[slot ^ 1] != frame_number - 1) return;
+    const Snap &s = ei->second.s[slot], &p = ei->second.s[slot ^ 1];
     if (d.entries->size() != s.bind.size()) {
         st.n_mismatch++;
         return;

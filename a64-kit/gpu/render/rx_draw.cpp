@@ -4829,8 +4829,11 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     static ObjMvCapture objmv_cap;
     objmv_cap.clear();
     bool objmv_follow = false;
+    // (only the targets the scene camera was captured with: a pass into half-size G-buffer targets each frame made the
+    // velocity target alternate sizes)
     if (at.depth && s.ds.dt && prog->has_fs && s.chmask.mask && prog->vs_compute_wgsl.empty() && at.color[0] &&
-        at.color[0]->format == WGPUTextureFormat_RGBA8Unorm && objmv_on()) {
+        at.color[0]->format == WGPUTextureFormat_RGBA8Unorm && at.color[0]->tex == scene_mask &&
+        at.depth->tex == scene_depth && scene_camera.frame == frame_number && objmv_on()) {
         int ncolor = 0;
         bool hdr = false;
         for (const Image* ci : at.color)
@@ -5154,7 +5157,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
             if (vst.enabled && std::find(idk + 9, idk + k, vst.addr) == idk + k) idk[k++] = vst.addr;
         }
         uint64_t turn = 0;
-        if (objmv_moved(hash_bytes(idk, sizeof idk), objmv_cap, &turn)) {
+        if (objmv_moved(hash_bytes(idk, sizeof idk), prog->vs.key, objmv_cap, &turn)) {
             ObjMvDraw od;
             od.pipeline = objmv_pipeline(*prog, vs_res, vi, prim, pipe->layouts[0]);
             od.layout0 = pipe->layouts[0];

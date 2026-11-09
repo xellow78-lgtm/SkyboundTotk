@@ -637,7 +637,7 @@ struct ObjMvDraw {   // a moving draw, as the velocity pass draws it again
 std::shared_ptr<const std::vector<uint8_t>> objmv_bytes(uint64_t va, uint64_t size);
 /// A scene draw's vertex inputs kept (cap is emptied); whether they changed since last frame's matching draw (then
 /// objmv_queue). turn_identity: the draw's identity with its turn among equal ones.
-bool objmv_moved(uint64_t identity, ObjMvCapture& cap, uint64_t* turn_identity);
+bool objmv_moved(uint64_t identity, uint64_t vs_key, ObjMvCapture& cap, uint64_t* turn_identity);
 void objmv_queue(uint64_t turn_identity, const ObjMvDraw& d);
 /// The velocity pass's modules: a vertex program's variant (null: none), the pixel stage; the pixel stage's group
 /// layout (group 2: the depth buffer)
