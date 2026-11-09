@@ -265,6 +265,7 @@ void a64_svc(Ctx *c, uint32_t imm) {
         return;
     case 0x07:   /* ExitProcess */
         hos_log("svcExitProcess");
+        hos_pgo_dump();
         hos_log_flush();
         TerminateProcess(GetCurrentProcess(), 0);   /* (as display.c's: no exit-time clean-up to crash in) */
         return;

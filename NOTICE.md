@@ -14,6 +14,7 @@ Rexcomp and the AArch64 kit are by NotRexed. This repository includes:
 | NVN texture storage layout, from deko3d `source/dk_image.cpp` by fincs (via the layer above) | `a64-kit/hos/nvn_layout.c` | zlib |
 | AMD FidelityFX Super Resolution 1 (EASU, RCAS), ported to WGSL | `a64-kit/gpu/render/rx_present_fx.cpp` | MIT (text in the file) |
 | RenderDoc's in-application API header (`renderdoc_app.h`, RenderDoc 1.46, unmodified) | `a64-kit/gpu/render/renderdoc_app.h` | MIT (text in the file) |
+| LLVM compiler-rt's profile runtime (`lib/profile`, `include/profile`), llvm-project commit `510126255f89d693717c1ce7105b593f995f07c1`, compiled in only for instrumented PGO builds (`RX_PGO=gen`) | `third_party/llvm-profile/` | Apache-2.0 WITH LLVM-exception (`LICENSE.TXT` there) |
 | Zstandard 1.5.6 decoder (the single-file `zstddeclib.c` its release makes) | `third_party/zstd/` | BSD (`LICENSE` there) |
 | Where TOTK v1.0.0 sets its camera aspect and HUD scale, after TOTK-Ultrawide by Fruithapje21 (github.com/Fruithapje21/TOTK-Ultrawide) | `a64-kit/hos/totk_ultrawide*.c` | GPL-3.0 (locations only; the code is ours) |
 

@@ -43,3 +43,4 @@ third_party/wgpu-native/lib/libwgpu_native.so
 
 # Local build options (a64-kit/build.py reads them; not shared).
 /build_options.txt
+*.profraw

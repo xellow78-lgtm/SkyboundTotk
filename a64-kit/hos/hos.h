@@ -70,6 +70,9 @@ extern uint64_t hos_space_end;   /* web: the guest window ends where the host's 
 extern int hos_trace;
 void hos_log(const char *fmt, ...);
 void hos_log_flush(void);
+/* hos_pgo.c: an instrumented build's counters (build.py RX_PGO=gen): written every minute and by hos_pgo_dump() at exit */
+void hos_pgo_start(void);
+void hos_pgo_dump(void);
 #define HOS_TRACE_CALL(name) do { if (hos_trace) hos_log("%s(%#llx, %#llx, %#llx, %#llx) lr %#llx", name, \
     (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2], \
     (unsigned long long)c->x[3], (unsigned long long)c->x[30]); } while (0)

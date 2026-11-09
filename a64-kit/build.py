@@ -13,6 +13,7 @@ and returns 0, so the game links from day one and the log says what to implement
 import argparse
 import concurrent.futures as cf
 import hashlib
+import glob
 import json
 import os
 import re
@@ -579,6 +580,76 @@ def gpu_sources():
     return sorted(out)
 
 
+PGO_RUNTIME = ["InstrProfiling.c", "InstrProfilingInternal.c", "InstrProfilingBuffer.c", "InstrProfilingMerge.c",
+               "InstrProfilingMergeFile.c", "InstrProfilingNameVar.c", "InstrProfilingWriter.c", "InstrProfilingFile.c",
+               "InstrProfilingUtil.c", "InstrProfilingValue.c", "InstrProfilingRuntime.cpp"]
+
+
+def pgo_setup(name, nat, lifted_hash):
+    """Instrumented profile-guided optimization (RX_PGO), of the lifted code, rt/, hos/ and the renderer:
+    RX_PGO=gen     an instrumented build: it plays slower and writes its counts to <exe folder>/pgo/*.profraw
+                   (hos/hos_pgo.c); compiler-rt's profile runtime is compiled in from third_party/llvm-profile, as
+                   emsdk's LLVM ships none
+    RX_PGO=<folder> of .profraw files (e.g. dist/SkyboundTOTK/pgo): merged into native/pgo.profdata by emsdk's
+                   llvm-profdata (again when a .profraw is newer), then a build with that profile
+    RX_PGO=<file>.profdata, or port (ports/zelda-<name>/pgo.profdata): a build with that profile
+    Relative paths are from the source root. A profile matches functions by name and a hash of their control flow, so a
+    function whose code changed since the training loses its counts, silently; the rest keep theirs. Returns (compile
+    flags, a key of the profile's content for the object stamps, the object folder's name) or None without RX_PGO.
+    (After valentderah/totk-pc-recomp's tools/build_game.py --pgo, MIT: there 12-15% a frame in a trained fight and ~6%
+    in an untrained one, against a build at -O1 or -O2; the lifted code here is at -O3 already.)"""
+    pgo = os.environ.get("RX_PGO") or ""
+    if not pgo:
+        return None
+    root = os.path.join(HERE, "..")
+    # (static functions named by file name, not path: a profile trained in one folder fits a build in another)
+    names = ["-mllvm", "-static-func-full-module-prefix=false"]
+    if pgo == "gen":
+        open(os.path.join(nat, "pgo_gen.lifted"), "w").write(lifted_hash + "\n")
+        print("PGO: instrumented build (RX_PGO=gen): play it through varied places for 20-30 minutes; its counts go to "
+              "<exe folder>\\pgo every minute and when the window closes")
+        return ["-fprofile-generate"] + names, "gen", "obj-pgogen"
+    if pgo == "port":
+        profile = os.path.join(port_dir(name), "pgo.profdata")
+        if not os.path.isfile(profile):
+            print("PGO: %s not there: a build without a profile" % os.path.relpath(profile, root))
+            return None
+    else:
+        profile = pgo if os.path.isabs(pgo) else os.path.join(root, pgo)
+    if os.path.isdir(profile):
+        raws = sorted(glob.glob(os.path.join(profile, "*.profraw")))
+        if not raws:
+            sys.exit("RX_PGO: no .profraw in %s: play the RX_PGO=gen build first" % profile)
+        merged = os.path.join(nat, "pgo.profdata")
+        newest = max(os.path.getmtime(r) for r in raws)
+        if not os.path.isfile(merged) or os.path.getmtime(merged) < newest:
+            tool = toolchain.need(toolchain.find("llvm-profdata"))
+            r = subprocess.run([tool, "merge", "--failure-mode=all", "-o", merged + ".tmp"] + raws,
+                               capture_output=True, text=True)
+            if r.returncode:
+                sys.exit("RX_PGO: llvm-profdata merge failed: %s" % (r.stdout + r.stderr).strip()[-2000:])
+            os.replace(merged + ".tmp", merged)
+            gen_stamp = os.path.join(nat, "pgo_gen.lifted")
+            open(merged[:-9] + ".lifted", "w").write(
+                (open(gen_stamp).read().strip() if os.path.isfile(gen_stamp) else "unknown") + "\n")
+            print("PGO: merged %d .profraw (%.0f MB) into %s (%.0f MB)" % (
+                len(raws), sum(os.path.getsize(r) for r in raws) / 2 ** 20, merged, os.path.getsize(merged) / 2 ** 20))
+        profile = merged
+    if not os.path.isfile(profile):
+        sys.exit("RX_PGO: no %s" % profile)
+    stamp = profile[:-9] + ".lifted" if profile.endswith(".profdata") else None
+    trained = open(stamp).read().strip() if stamp and os.path.isfile(stamp) else None
+    if trained and trained != lifted_hash:
+        print("PGO: the profile was trained on other lifted code (%s, this build %s): the game's functions that "
+              "changed get no counts" % (trained[:12], lifted_hash[:12]))
+    h = hashlib.sha1()
+    with open(profile, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    print("PGO: building with %s" % os.path.abspath(profile))
+    return ["-fprofile-use=" + os.path.abspath(profile)] + names, "use:" + h.hexdigest(), "obj-pgo"
+
+
 def capture_tracking_flag():
     """The lifted code's context parameter is A64_NOESC (rt/a64.h), but LLVM looks at only a pointer's first 100 uses
     to see whether it escapes: past that every guest store may have changed the context. 5000 covers the hot castle
@@ -687,6 +758,16 @@ def cmd_native(a):
                 sys.exit("RX_SAMPLE_PROFILE: no %s" % sample_profile)
             print("sample profile: %s" % os.path.abspath(sample_profile))
             lifted_lto = lifted_lto + ["-fprofile-sample-use=" + os.path.abspath(sample_profile)]
+    # instrumented PGO (RX_PGO, pgo_setup): the lifted code, rt/, hos/ and the renderer, objects in a folder of their own
+    pgo = pgo_setup(a.name, nat, lifted_hash)
+    pgo_flags, pgo_key = [], ""
+    if pgo:
+        pgo_flags, pgo_key, pgo_obj = pgo
+        if any(f.startswith("-fprofile-sample-use=") for f in lifted_lto):
+            print("sample profile: not used with RX_PGO")
+            lifted_lto = [f for f in lifted_lto if not f.startswith("-fprofile-sample-use=")]
+        obj_dir = os.path.join(nat, os.environ.get("RX_OBJ_DIR", pgo_obj))
+        os.makedirs(obj_dir, exist_ok=True)
     deps_lifted = headers_key(RT, gen)
     deps_runtime = headers_key(RT, HOS, gen, os.path.join(GPU, "render"), *([linux_hos] if linux else []))
     # the renderer: WebGPU through wgpu-native (a release of github.com/gfx-rs/wgpu-native: include/, lib/)
@@ -715,9 +796,28 @@ def cmd_native(a):
         # (the profile's hot functions, lifted with A64_HOT_CHUNK=1: RX_HOT_CFLAGS, e.g. a higher inline threshold)
         if os.path.basename(src) == "code_hot.c" and os.environ.get("RX_HOT_CFLAGS"):
             flags = flags + os.environ["RX_HOT_CFLAGS"].split()
+        if pgo_flags:
+            flags = flags + pgo_flags + (["-DRX_PGO_GEN=1"] if pgo_key == "gen" and src not in lifted else [])
         hos = os.path.dirname(src) == HOS
         jobs.append((cc, src, os.path.join(obj_dir, os.path.basename(src)[:-2] + ".o"),
-                     base + flags, deps))
+                     base + flags, deps + pgo_key))
+    # an instrumented build's profile runtime: compiler-rt's (third_party/llvm-profile, the commit of emsdk's LLVM),
+    # not instrumented itself. Its InstrProfilingVersionVar.c stays out: every instrumented object defines that version
+    # (with the IR-level bit), and on Windows the runtime's weak copy could be the one the linker keeps.
+    if pgo_key == "gen":
+        prt = os.path.join(HERE, "..", "third_party", "llvm-profile")
+        pflags = toolchain.native_target() + ["-O2", "-g0", "-Wno-everything", "-DCOMPILER_RT_HAS_ATOMICS=1",
+                                              "-I" + os.path.join(prt, "lib"), "-I" + os.path.join(prt, "include")]
+        if linux:
+            pflags += ["-DCOMPILER_RT_HAS_FCNTL_LCK=1", "-DCOMPILER_RT_HAS_UNAME=1"]
+        plat = ["InstrProfilingPlatformLinux.c"] if linux else ["InstrProfilingPlatformWindows.c", "WindowsMMap.c"]
+        pkey = hashlib.sha1(b"".join(open(os.path.join(prt, "lib", "profile", f), "rb").read()
+                                     for f in sorted(os.listdir(os.path.join(prt, "lib", "profile"))))).hexdigest()
+        for f in PGO_RUNTIME + plat:
+            cpp = f.endswith(".cpp")
+            jobs.append((toolchain.need(toolchain.find("clang++" if cpp else "clang")),
+                         os.path.join(prt, "lib", "profile", f), os.path.join(obj_dir, "llvmprof_" + f.split(".")[0] + ".o"),
+                         pflags + (["-std=c++17"] if cpp else []), pkey))
     # libopus (third_party/opus, the 1.5.2 release sources: nn::codec's hardware Opus decoder in hos/nn_codec.c)
     opus = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "third_party", "opus")
     if os.path.isfile(os.path.join(opus, "sources.txt")):
@@ -732,7 +832,7 @@ def cmd_native(a):
         # (NDEBUG: no asserts in the renderer and suyu; ThinLTO: the renderer's small helpers inline across files.
         # RX_NO_LTO=1 builds without it)
         lto = [] if os.environ.get("RX_NO_LTO") else ["-flto=thin"]
-        gflags = toolchain.native_target() + ["-std=c++20", "-O2", "-g", "-DNDEBUG", "-Wno-everything"] + lto + soft_watch + [
+        gflags = toolchain.native_target() + ["-std=c++20", "-O2", "-g", "-DNDEBUG", "-Wno-everything"] + lto + soft_watch + pgo_flags + [
                                               "-I" + os.path.join(GPU, "compat"),
                                               "-I" + os.path.join(GPU, "third_party", "suyu"),
                                               "-I" + os.path.join(wgpu, "include")]
@@ -740,6 +840,7 @@ def cmd_native(a):
             gflags = ["-I" + linux_hos] + gflags
         gdeps = tree_headers_key(GPU) + hashlib.sha1(open(os.path.join(wgpu, "include", "webgpu", "webgpu.h"),
                                                           "rb").read()).hexdigest()
+        gdeps += pgo_key
         # DLSS (gpu/render/rx_dlss.cpp): when third_party has NVIDIA's DLSS SDK files and the Vulkan headers and the
         # wgpu-native build has the TOTK Vulkan interop (third_party/wgpu-native/build_dlss_deps.py makes all three)
         if dlss_deps(wgpu):
@@ -854,6 +955,8 @@ def cmd_native(a):
             # RX_LTO_LINK_FLAGS="<flags>" (experiments): more link flags, e.g. -Wl,/mllvm:-import-instr-limit=200
             order_flags += os.environ.get("RX_LTO_LINK_FLAGS", "").split()
         link_tail = ["-Wl,/STACK:268435456", "-Wl,/SUBSYSTEM:CONSOLE"] + order_flags + libs
+        if pgo_key == "gen":   # (instrumented objects ask for clang's profile library by name; its objects are linked in)
+            link_tail += ["-Wl,/NODEFAULTLIB:clang_rt.profile-x86_64.lib", "-Wl,/NODEFAULTLIB:clang_rt.profile.lib"]
     subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
                    ["-g", "-o", exe, "@" + rsp] + link_tail,
                    check=True)

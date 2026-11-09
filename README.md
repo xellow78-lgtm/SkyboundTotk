@@ -365,6 +365,22 @@ At the same spot the game alone (Ctrl+F5) ran 70.9 and 70.5 fps with the profile
 standing 57-61 against 62-66 fps; the build grew from 363 to 370 MB. So it is off by default. A much longer profile
 (a few samples a line is thin for the game's giant functions) is the untried next step.
 
+**Profile-guided build, instrumented (experiment, `RX_PGO`):** exact counts instead of samples, as
+valentderah/totk-pc-recomp does it (12-15% a frame there in a trained fight, about 6% in an untrained one). It covers
+the translated game code, `rt/`, `hos/` and the renderer:
+1. `RX_PGO=gen` in `build_options.txt`, then build. The objects go to `build/totk/native/obj-pgogen`, so the normal
+   ones stay. The instrumented game is slower. emsdk's LLVM ships no profile runtime, so compiler-rt's is compiled in
+   from `third_party/llvm-profile` (the commit of emsdk's LLVM).
+2. Play it through varied places for 20-30 minutes: fights, towns, riding, building, the Depths, menus. It writes
+   `dist/SkyboundTOTK/pgo/skybound-<build>.profraw` every minute and when the window closes (the log says so); later
+   sessions of the same build add to that file.
+3. `RX_PGO=dist/SkyboundTOTK/pgo` instead, then build again: emsdk's `llvm-profdata` merges the `.profraw` files into
+   `build/totk/native/pgo.profdata` (again when a newer one is there), and the build uses it (objects in `obj-pgo`).
+   `RX_PGO=<file>.profdata` or `RX_PGO=port` (`ports/zelda-totk/pgo.profdata`) take a merged profile.
+
+Functions are matched by name and a hash of their control flow, so code that changed after the training gets no
+counts, without a warning: train again after a change to the lifter or the renderer.
+
 **Troubleshooting:** Python or `lz4` missing → install them for the Python on PATH. Headers or libraries missing →
 use the x64 Native Tools prompt and check the C++ tools, Windows SDK, clang and lld. "Wrong module" → check the
 folder layout and version. DLSS starts as FSR 2 → build with **DLSS library** ticked (the WebGPU library has to be
