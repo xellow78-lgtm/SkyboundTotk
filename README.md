@@ -360,6 +360,11 @@ in the open world, so their code is built with clang's `-fprofile-sample-use` fr
    `ports/zelda-totk/sample_profile.txt`, only when its `.lifted` stamp matches the translated code being built
    (`build/totk/native/lifted.sha1`): the profile counts samples by line of that code.
 
+Measured on 2026-11-09 (Ryzen 5 5500, the committed 5-minute profile, 145,835 samples over 66,595 lines): no gain.
+At the same spot the game alone (Ctrl+F5) ran 70.9 and 70.5 fps with the profile against 75.6 and 70.7 without, and
+standing 57-61 against 62-66 fps; the build grew from 363 to 370 MB. So it is off by default. A much longer profile
+(a few samples a line is thin for the game's giant functions) is the untried next step.
+
 **Troubleshooting:** Python or `lz4` missing → install them for the Python on PATH. Headers or libraries missing →
 use the x64 Native Tools prompt and check the C++ tools, Windows SDK, clang and lld. "Wrong module" → check the
 folder layout and version. DLSS starts as FSR 2 → build with **DLSS library** ticked (the WebGPU library has to be
