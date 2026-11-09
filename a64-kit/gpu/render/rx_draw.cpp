@@ -4522,10 +4522,33 @@ void nvn_vs_compute(NvnState& s, const NvnDraw& d, ProgramPair& prog, const floa
     }
 }
 
+/// Ctrl+F5 (hos/display.c, measuring): no draws for a few seconds, then the frame rate the game's threads gave meanwhile
+std::atomic<int64_t> no_draws_until{0};
+void no_draws_window() {
+    static int64_t start_ns, start_frame = -1;
+    const int64_t until = no_draws_until.load(std::memory_order_relaxed), now = hos_now_ns();
+    if (now < until) {
+        if (start_frame < 0) start_ns = now, start_frame = frame_number;
+        return;
+    }
+    if (start_frame >= 0) {   // (the window is over: its frames)
+        const double s = (now - start_ns) / 1e9;
+        hos_log("rx: %.1f s without draws (Ctrl+F5): %lld frames, %.1f fps (the game's own threads' limit; with draws "
+                "before it: see the presents lines)", s, (long long)(frame_number - start_frame),
+                s > 0 ? (frame_number - start_frame) / s : 0.0);
+        start_frame = -1;
+    }
+    no_draws_until.store(0, std::memory_order_relaxed);
+}
+
 void nvn_draw(NvnState& s, const NvnDraw& d) {
     // RX_NVN_NO_DRAWS=1 (measurement only: the screen is wrong): no draw is prepared, so the frame rate is what the
     // game's own threads allow (the web: how far preparing draws faster could go)
     if (static const bool no_draws = env_flag("RX_NVN_NO_DRAWS"); no_draws) return;
+    if (no_draws_until.load(std::memory_order_relaxed)) {   // (Ctrl+F5: the same for a few seconds)
+        no_draws_window();
+        if (no_draws_until.load(std::memory_order_relaxed)) return;
+    }
     // RX_DEBUG_DRAW_SPIN_NS=<ns> (measurement only): the replay thread spins that long per draw, to measure how much
     // the frame rate depends on the replay's time (what making it faster could give)
     if (static const int64_t spin = getenv("RX_DEBUG_DRAW_SPIN_NS") ? atoll(getenv("RX_DEBUG_DRAW_SPIN_NS")) : 0; spin) {
@@ -5553,3 +5576,8 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
 }
 
 } // namespace rx
+
+extern "C" void rx_measure_no_draws(int seconds) {
+    rx::no_draws_until.store(hos_now_ns() + (int64_t)seconds * 1000000000LL, std::memory_order_relaxed);
+    hos_log("rx: Ctrl+F5: %d s without draws from now (measuring the game's own frame rate)", seconds);
+}

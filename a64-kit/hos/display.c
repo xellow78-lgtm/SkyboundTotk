@@ -290,7 +290,14 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
         if (wp == VK_F5 && !(lp & (1 << 30))) {   /* (debugging: 15 s of the sampling profiler, from now) */
             void hos_profile_start(int seconds);   /* hos_prof.c */
-            hos_profile_start(15);
+            void rx_measure_no_draws(int seconds); /* gpu/render/rx_draw.cpp */
+            /* Ctrl+F5 (measuring): 8 s without the renderer's draws (the picture freezes or goes wrong), the frame rate
+               the game's own threads allow then in the log: how far a faster renderer could go */
+            if (GetKeyState(VK_CONTROL) < 0) {
+                if (renderer) rx_measure_no_draws(8);
+            } else {
+                hos_profile_start(15);
+            }
         }
         if (wp == VK_F4 && !(lp & (1 << 30)) && renderer) {   /* the 3D scene's resolution mode (totk_drs.c) */
             const char *hos_render_mode_cycle(void);

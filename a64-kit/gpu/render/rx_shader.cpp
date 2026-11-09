@@ -1390,10 +1390,12 @@ ProgramPair* nvn_programs(const NvnState& s, const uint8_t out_types[8]) {
     std::memcpy(&out_bits, out_types, 8);
     Memo& memo = memos[hash_bytes(&out_bits, 8, s.prog.serial * 0x9e3779b97f4a7c15ull ^ s.vtx_hash ^ vbufs) & 511];
     if (!no_memo && memo.pair && memo.s == &s && memo.serial == s.prog.serial && memo.vtx == s.vtx_hash &&
-        memo.vbufs == vbufs && memo.frame == frame_number && !std::memcmp(memo.out, out_types, 8)) {
-        if (memo.epoch == s.prog_epoch) return memo.pair;
-        // only handles changed (or another program was bound between): the variant holds while the texture types it
-        // was translated for do
+        memo.vbufs == vbufs && !std::memcmp(memo.out, out_types, 8)) {
+        if (memo.epoch == s.prog_epoch && memo.frame == frame_number) return memo.pair;
+        // only handles changed (or another program was bound between), or a new frame (texture pool entries can change
+        // a handle's type): the variant holds while the texture types it was translated for do. (A new frame went the
+        // whole way, nvn_programs_uncached: 5 % of the replay thread in the 2026-11-08 profile, every program again
+        // each frame.)
         if (memo.var) {
             bool same = true;
             for (int st = 0; st < 2 && same; st++)
@@ -1404,6 +1406,7 @@ ProgramPair* nvn_programs(const NvnState& s, const uint8_t out_types[8]) {
                     }
             if (same) {
                 memo.epoch = s.prog_epoch;
+                memo.frame = frame_number;
                 count("nvn_program_memo_rechecked");
                 return memo.pair;
             }
