@@ -5,5 +5,5 @@
 #
 # main build ID                              version  hot functions   link order
 082ce09b06e33a123cb1e2770f5f9147709033db     100      hot_funcs.txt   link_order.txt
-277178b7dba1b6d4949a84778d4abc58b31b34f5     143      hot_funcs_143.txt   link_order_143.txt
+277178b7dba1b6d4949a84778d4abc58b31b34f5     143      -               -   # (hot_funcs_143.txt, link_order_143.txt: measured, no gain; see hot_funcs_143.txt)
 9b4e4365                                   121      -               -   # 1.2.1 (upstream PR #19; its build ID as far as it was given)

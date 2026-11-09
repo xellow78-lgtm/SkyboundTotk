@@ -1,5 +1,8 @@
 # TOTK 1.4.3: the 400 lifted functions with the most samples in sample_profile.txt (a 5-minute play session,
 # 2026-11-08, Ryzen 5 5500): 73% of the lifted-code samples. build.py lift reads it through versions.txt.
+# Measured 2026-11-09 with link_order_143.txt (Ultra 9 285K, the pond by Link's house, no PGO): 89.0 fps standing and
+# 89.7 game-only (Ctrl+F5) against 91.5 and 90.0 / 93.7 without them; the exe grew from 380 to 392 MB. Not used:
+# versions.txt names neither for 1.4.3. (build.py lift --hot ports/zelda-totk/hot_funcs_143.txt tries it again.)
 f_0807a1f0 6027
 f_08082e00 4229
 f_0835bc50 4165
