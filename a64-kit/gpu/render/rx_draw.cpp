@@ -3823,6 +3823,7 @@ bool nvn_vs_storage_writable;   // (nvn_vs_compute: the vertex stage's stores ar
 void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, const Shader::Info& info,
                          WGPUShaderStage vis, const float rescale[16], const Attachments& at, uint32_t& dynamic_storage,
                          ObjMvCapture* cap = nullptr) {
+    bool cap_bones = false;   // (a storage buffer kept: bones)
     // (an entry just added: its kind and contents, its dynamic offset the last one when it has one)
     auto capture = [&](uint8_t kind, bool camera, std::shared_ptr<const std::vector<uint8_t>> bytes) {
         if (!cap) return;
@@ -3994,9 +3995,13 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
                 getenv("RX_OBJ_MV_SSBO_MAX") ? strtoull(getenv("RX_OBJ_MV_SSBO_MAX"), nullptr, 10) : 256u << 10;
             if (writable || (raw_va && gpu_written(va, sb.size))) cap->ok = false;
             if (!raw_va || sb.size > keep_max) capture(0, false, nullptr);
-            else capture(3, false, objmv_bytes(va, sb.size));
+            else capture(3, false, objmv_bytes(va, sb.size)), cap_bones = true;
         }
         b += d.count;
+    }
+    if (cap && !cap_bones && !objmv_rigid()) {   // (no bones: not followed, nothing more kept)
+        cap->ok = false;
+        cap = nullptr;
     }
     if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty() ||
         !info.image_descriptors.empty()) {
@@ -4833,7 +4838,8 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     // velocity target alternate sizes)
     if (at.depth && s.ds.dt && prog->has_fs && s.chmask.mask && prog->vs_compute_wgsl.empty() && at.color[0] &&
         at.color[0]->format == WGPUTextureFormat_RGBA8Unorm && at.color[0]->tex == scene_mask &&
-        at.depth->tex == scene_depth && scene_camera.frame == frame_number && objmv_on()) {
+        at.depth->tex == scene_depth && scene_camera.frame == frame_number &&
+        (objmv_rigid() || !prog->vs.info.storage_buffers_descriptors.empty()) && objmv_on()) {   // (bones: storage)
         int ncolor = 0;
         bool hdr = false;
         for (const Image* ci : at.color)
@@ -5151,7 +5157,9 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         objmv_cap.bind.resize(vs_res.entries.size());   // (the pulled vertex streams: this frame's)
         uint64_t idk[12] = {prog->vs.key, prog->has_fs ? prog->fs.key : 0, (uint64_t)d.indexed, d.index_gpu, d.first,
                             d.count, (uint64_t)(int64_t)d.base_vertex, d.instances, d.base_instance, 0, 0, 0};
-        for (uint32_t i = 0, k = 9; i < 16 && k < 12; i++) {   // (the vertex streams it reads)
+        // (the vertex streams it reads, for draws without an index list: an indexed draw is its index list's range;
+        // in the profile run only 2 draws a frame with bones were compared with last frame's, 256 a frame had none)
+        for (uint32_t i = 0, k = 9; i < 16 && k < 12 && !d.indexed; i++) {
             if (!(prog->vs.generic_loads() >> i & 1)) continue;
             const NvnStream vst = nvn_stream(s, nvn_attribute(s.vattr[i]).buffer % 16);
             if (vst.enabled && std::find(idk + 9, idk + k, vst.addr) == idk + k) idk[k++] = vst.addr;

@@ -295,7 +295,9 @@ environment variables (in `launcher.ini` as `env.NAME = value`):
 | `RX_OBJ_MV=0` / `1` | Per-object motion off / on even without motion blur |
 | `RX_OBJ_MV_DEBUG=1` | Show the per-object motion as colour instead of the blur |
 | `RX_OBJ_MV_STATS=1` | What per-object motion followed and redrew, in the log every 5 s |
-| `RX_OBJ_MV_ALL=1` | Per-object motion redraws everything whose constants changed (the first build's way: slow) |
+| `RX_OBJ_MV_RIGID=1` | Per-object motion also follows draws without bones (slower: off by default) |
+| `RX_OBJ_MV_ALL=1` | With `RX_OBJ_MV_RIGID=1`: redraw everything whose constants changed (the first build's way: slow) |
+| F5 in game | 15 s of the sampling profiler, every thread with each one's load; F5 again: the renderer's replay thread with whole call stacks (`HOS_PROFILE_F5_THREAD=<name>` for another) |
 | `RX_DUMP_DIR=<folder>` | Where F12 frame dumps go (default `rx_frame`) |
 
 ---

@@ -271,7 +271,7 @@ struct State {
     bool failed = false;
     // (RX_OBJ_MV_STATS)
     int64_t n_draws = 0, n_new = 0, n_moved = 0, n_queued = 0, n_no_pipe = 0, n_no_room = 0, n_mismatch = 0, n_passes = 0,
-            n_capped = 0, n_bones = 0, n_scene = 0;
+            n_capped = 0, n_bones = 0, n_scene = 0, n_matched = 0;
     int frame_queued = 0;   // (this frame's velocity draws: at most RX_OBJ_MV_MAX, 256)
     int64_t groups_made = 0;
     int64_t stats_t0 = 0;
@@ -304,15 +304,17 @@ void stats() {
     if (now - st.stats_t0 < 5000000000ll) return;
     if (on || st.n_queued)
         log_limited("objmv_stats", on ? 100000 : 30,
-                    "rx: object motion in the last %.1f s: %lld scene draws followed, %lld without a last frame, %lld "
+                    "rx: object motion in the last %.1f s: %lld scene draws followed (%lld matched to last frame's), "
+                    "%lld without a last frame, %lld "
                     "moved (%lld by their bones; %lld changed only what the whole scene changes, not drawn), %lld redrawn "
                     "in %lld passes (%lld waiting for a pipeline, %lld no room, %lld changed shape, %lld over the "
                     "frame's limit)",
-                    (now - st.stats_t0) / 1e9, (long long)st.n_draws, (long long)st.n_new, (long long)st.n_moved,
+                    (now - st.stats_t0) / 1e9, (long long)st.n_draws, (long long)st.n_matched, (long long)st.n_new,
+                    (long long)st.n_moved,
                     (long long)st.n_bones, (long long)st.n_scene, (long long)st.n_queued, (long long)st.n_passes,
                     (long long)st.n_no_pipe, (long long)st.n_no_room, (long long)st.n_mismatch, (long long)st.n_capped);
     st.n_draws = st.n_new = st.n_moved = st.n_queued = st.n_no_pipe = st.n_no_room = st.n_mismatch = st.n_passes = 0;
-    st.n_capped = st.n_bones = st.n_scene = 0;
+    st.n_capped = st.n_bones = st.n_scene = st.n_matched = 0;
     st.stats_t0 = now;
 }
 
@@ -436,6 +438,15 @@ bool check_draw(const VelDraw& v) {
 
 }  // namespace
 
+/// Whether draws without bones are followed too (RX_OBJ_MV_RIGID=1). Not by default: in the profile of 2026-11-08
+/// 20:33 the render thread was the frame's limit (its draws 15-21 ms of a 22 ms frame, the game's main thread waiting
+/// 2-7 ms a frame for it), objmv_moved its 4th hottest function, ~400 draws a frame still "moved" by rows the
+/// per-program filter did not catch and ~220 a frame drawn again. Draws with bones are a few dozen.
+bool objmv_rigid() {
+    static const bool on = getenv("RX_OBJ_MV_RIGID") && *getenv("RX_OBJ_MV_RIGID") != '0';
+    return on;
+}
+
 bool objmv_on() {
     if (st.failed) return false;
     const int m = env_mode();
@@ -530,6 +541,7 @@ bool objmv_moved(uint64_t identity, uint64_t vs_key, ObjMvCapture& cap, uint64_t
         st.n_mismatch++;
         return false;
     }
+    st.n_matched++;
     // what changed: storage buffers (bones), the block's rows from 4 and the constant buffers bound as storage (the
     // camera's left out)
     bool bones = false;
@@ -556,6 +568,11 @@ bool objmv_moved(uint64_t identity, uint64_t vs_key, ObjMvCapture& cap, uint64_t
     for (size_t row = 4; row < n; row++) {
         if (row >= s.cam_row && row < (size_t)s.cam_row + s.cam_rows) continue;
         if (row < kRows && std::memcmp(s.ub.data() + row * 16, p.ub.data() + row * 16, 16)) changed[nchanged++] = (uint16_t)row;
+    }
+    if (!objmv_rigid()) {   // (bones only)
+        if (!bones) return false;
+        st.n_moved++, st.n_bones++;
+        return true;
     }
     // this program's draws this frame (for next frame's "whole scene" rows)
     VsRows& r = st.rows[vs_key];

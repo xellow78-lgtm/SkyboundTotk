@@ -591,8 +591,10 @@ PullPlan pull_plan(const Regs& r, const std::bitset<32>& loads);
 uint8_t vertex_unpack(const Regs::VertexAttribute& a);
 
 // ---- per-object motion (rx_objmv.cpp): the moving draws of the scene drawn again into a velocity target ----
-/// Whether the scene's draws are followed (motion blur on with FSR 2 / DLSS; RX_OBJ_MV=0 / 1 overrides)
+/// Whether the scene's draws are followed (motion blur on with FSR 2 / DLSS; RX_OBJ_MV=0 / 1 overrides); whether those
+/// without bones are too (RX_OBJ_MV_RIGID=1)
 bool objmv_on();
+bool objmv_rigid();
 /// One entry of a vertex stage's bind group, as the velocity pass's copy with last frame's contents needs it
 struct ObjMvBinding {
     uint8_t kind = 0;      // 0 bound as this frame's (vertex streams, textures, big storage); 1 the uniform block;

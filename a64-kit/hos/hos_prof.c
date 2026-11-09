@@ -360,24 +360,43 @@ static int ncallers;
 static DWORD64 *pcs, *pcs_fn;   /* HOS_PROFILE_PCS: the self samples' addresses and their functions' */
 static unsigned npcs;
 static int cmp_callers(const void *a, const void *b) { return (int)((const Caller *)b)->n - (int)((const Caller *)a)->n; }
+/* Per thread (by name) in the every-thread profile: samples busy and waiting (its leaf in a wait or sleep function),
+   so the report says which threads are saturated (100 % busy) rather than only which functions are hot */
+typedef struct { char name[64]; unsigned busy, wait; } ThreadLoad;
+static ThreadLoad loads[256];
+static int nloads;
+static int cmp_loads(const void *a, const void *b) {
+    return (int)((const ThreadLoad *)b)->busy - (int)((const ThreadLoad *)a)->busy;
+}
+static int waiting_name(const char *nm) {
+    return !strncmp(nm, "Zw", 2) || !strncmp(nm, "Nt", 2) || strstr(nm, "Wait") || strstr(nm, "Sleep");
+}
+static const char *volatile prof_only;   /* (hos_profile_start's second run: one thread, whole stacks) */
+static volatile int prof_from_f5;        /* (an F5 run: no HOS_PROFILE_DELAY, which is the startup run's) */
 static DWORD WINAPI prof_main(void *p) {
     int seconds = (int)(intptr_t)p;
-    const char *delay = getenv("HOS_PROFILE_DELAY"), *only = getenv("HOS_PROFILE_THREAD");
+    const char *delay = getenv("HOS_PROFILE_DELAY"), *only = prof_only ? prof_only : getenv("HOS_PROFILE_THREAD");
+    nhits = 0;
+    nloads = 0;
+    memset(hit_slot, 0, sizeof hit_slot);
+    memset(pc_cache, 0, sizeof pc_cache);
     const char *callers_of = only ? getenv("HOS_PROFILE_CALLERS") : NULL;   /* (with HOS_PROFILE_THREAD) */
     const char *exclude = only ? getenv("HOS_PROFILE_EXCLUDE") : NULL;      /* samples under that frame: skipped */
     const char *lines_of = only ? getenv("HOS_PROFILE_LINES") : NULL;       /* self samples there, by source line */
     if (lines_of) SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-    if (delay) Sleep((DWORD)atoi(delay) * 1000);
+    if (delay && !prof_from_f5) Sleep((DWORD)atoi(delay) * 1000);
     HANDLE proc = GetCurrentProcess();
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-    sym_init(proc);
-    hits = (Hit *)calloc(MAXH, sizeof *hits);
+    static int sym_ready;   /* (once: an F5 run after another reuses it) */
+    if (!sym_ready) sym_init(proc), sym_ready = 1;
+    if (!hits) hits = (Hit *)calloc(MAXH, sizeof *hits);
+    else memset(hits, 0, MAXH * sizeof *hits);
     /* HOS_PROFILE_PCS=<file>: every self sample's host instruction address and its function's start, as offsets in
        the exe (other modules': "abs <address>"), then "fn <start> <name>" lines: with llvm-objdump, which
        instructions of the hot lifted code cost */
     const char *pcs_file = getenv("HOS_PROFILE_PCS");
     if (pcs_file) pcs = (DWORD64 *)malloc(MAXPCS * sizeof *pcs), pcs_fn = (DWORD64 *)malloc(MAXPCS * sizeof *pcs_fn);
-    unsigned total = 0;
+    unsigned total = 0, rounds = 0;
     int64_t end = hos_now_ns() + (int64_t)seconds * 1000000000LL;
     hos_log("profile: sampling %s for %d s", only ? only : "every thread", seconds);
     extern volatile long hos_prof_gate;   /* (nn_os_sync.c HOS_PROFILE_GATE) */
@@ -495,11 +514,28 @@ static DWORD WINAPI prof_main(void *p) {
                 seen[nseen++] = j;
                 hits[j].hits++;
             }
+            if (!only && depth) {   /* (the thread's load: busy unless its leaf waits) */
+                const int j = hit_index(proc, stack[0], names[i]);
+                const int w = j >= 0 && waiting_name(hits[j].name);
+                int k;
+                for (k = 0; k < nloads && strcmp(loads[k].name, names[i]); k++) {}
+                if (k == nloads && nloads < 256) { snprintf(loads[k].name, sizeof loads[k].name, "%s", names[i]); nloads++; }
+                if (k < nloads) w ? loads[k].wait++ : loads[k].busy++;
+            }
             total++;
         }
+        rounds++;
         Sleep(1);
     }
     fprintf(stderr, "[hos profile] %u samples over %d s (guest address = the f_ name)\n", total, seconds);
+    if (!only && nloads) {   /* which threads are busy: % of the sampling rounds (100 %: always running) */
+        qsort(loads, nloads, sizeof *loads, cmp_loads);
+        fprintf(stderr, "[hos profile] threads, busy %% of %u rounds (several threads of one name add up):\n", rounds);
+        for (int i = 0; i < nloads && i < 40; i++)
+            if (loads[i].busy)
+                fprintf(stderr, "  %5.1f%% busy  %5.1f%% waiting  %s\n", 100.0 * loads[i].busy / (rounds ? rounds : 1),
+                        100.0 * loads[i].wait / (rounds ? rounds : 1), loads[i].name);
+    }
     if (only) {
         qsort(hits, nhits, sizeof *hits, cmp_hits);
         fprintf(stderr, "[hos profile] inclusive:\n");
@@ -578,16 +614,30 @@ static DWORD WINAPI prof_main(void *p) {
     return 0;
 }
 
+static volatile LONG *f5_running;
+static DWORD WINAPI prof_f5_main(void *p) {   /* (an F5 run; another may start once it is done) */
+    prof_main(p);
+    prof_only = NULL;
+    if (f5_running) InterlockedExchange(f5_running, 0);
+    return 0;
+}
+
 /* F5 in the game (display.c): the sampling profiler for that many seconds from now, once at a time (what HOS_PROFILE
    does from the start, aimed at a place: a slow shrine). The report goes to the log as HOS_PROFILE's does. */
 void hos_profile_start(int seconds) {
-    static volatile LONG running;
+    static volatile LONG running, runs;
+    f5_running = &running;
     if (InterlockedCompareExchange(&running, 1, 0)) {
         hos_log("profile: one is already running");
         return;
     }
-    hos_log("profile: sampling every thread for %d s (F5)", seconds);
-    HANDLE h = CreateThread(NULL, 0, prof_main, (void *)(intptr_t)seconds, 0, NULL);
+    /* (the first F5 every thread, the next ones one thread with whole call stacks: HOS_PROFILE_F5_THREAD, the
+       renderer's replay thread by default, where the frame's time went in the 2026-11-08 profile) */
+    const char *t = getenv("HOS_PROFILE_F5_THREAD");
+    prof_only = InterlockedIncrement(&runs) > 1 ? (t && *t ? t : "NVN replay") : NULL;
+    prof_from_f5 = 1;
+    hos_log("profile: sampling %s for %d s (F5)", prof_only ? prof_only : "every thread", seconds);
+    HANDLE h = CreateThread(NULL, 0, prof_f5_main, (void *)(intptr_t)seconds, 0, NULL);
     if (h) CloseHandle(h);
 }
 
