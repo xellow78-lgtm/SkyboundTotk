@@ -4545,6 +4545,10 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     // RX_NVN_NO_DRAWS=1 (measurement only: the screen is wrong): no draw is prepared, so the frame rate is what the
     // game's own threads allow (the web: how far preparing draws faster could go)
     if (static const bool no_draws = env_flag("RX_NVN_NO_DRAWS"); no_draws) return;
+    // (HOS_AB_SWITCH=RX_NVN_NO_DRAWS with HOS_AB=<ms>: without draws every other period, so the A/B's per-phase game
+    // CPU ms per frame says whether drawing makes the game's own threads slower (they share the CPU's cores with the
+    // renderer's) or only makes them wait longer: the 2026-11-08 main-thread profile waited 43 % for its workers)
+    if (static const bool no_draws_ab = ab_named("RX_NVN_NO_DRAWS"); no_draws_ab && ab_flipped()) return;
     if (no_draws_until.load(std::memory_order_relaxed)) {   // (Ctrl+F5: the same for a few seconds)
         no_draws_window();
         if (no_draws_until.load(std::memory_order_relaxed)) return;
