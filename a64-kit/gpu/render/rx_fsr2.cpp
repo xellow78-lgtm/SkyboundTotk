@@ -120,6 +120,7 @@ struct RcasConstants {
 };
 struct MvConstants {
     float inv_cur[16], vp_prev[16], size[4], dz[4];
+    float ov[4];   // (per-object motion: 1 when the velocity target holds this frame's)
 };
 
 constexpr int kRing = 8;   // (constant buffers and blit groups in flight: recordings are replayed later)
@@ -166,16 +167,25 @@ struct State {
     WGPUSampler blur_sampler = nullptr;
     WGPUBuffer cb_blur[kRing] = {};
     int blur_logged = -1;
+    // per-object motion (rx_objmv.cpp): where the motion vectors took an object's motion; the fastest of it per tile
+    Tex objok, tiles;
+    WGPUComputePipeline tile_pipe = nullptr;
+    WGPUBindGroupLayout tile_layout = nullptr;
+    WGPUBuffer cb_tile[kRing] = {};
+    bool tile_checked = false;
+    int objmv_logged = -1;
 } st;
 
 const char* kMvWgsl = R"(
-struct M { inv_cur: mat4x4<f32>, vp_prev: mat4x4<f32>, size: vec4<f32>, dz: vec4<f32> };
+struct M { inv_cur: mat4x4<f32>, vp_prev: mat4x4<f32>, size: vec4<f32>, dz: vec4<f32>, ov: vec4<f32> };
 @group(0) @binding(0) var dep: texture_depth_2d;
 @group(0) @binding(1) var<uniform> m: M;
 @group(0) @binding(2) var mv: texture_storage_2d<rg16float, write>;
 @group(0) @binding(3) var objects: texture_2d<f32>;
 @group(0) @binding(4) var reactive: texture_storage_2d<r8unorm, write>;
 @group(0) @binding(5) var depth_out: texture_storage_2d<r32float, write>;
+@group(0) @binding(6) var objv: texture_2d<f32>;
+@group(0) @binding(7) var objok: texture_storage_2d<r8unorm, write>;
 @compute @workgroup_size(8, 8, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (f32(id.x) >= m.size.x || f32(id.y) >= m.size.y) { return; }
   let q = vec2<i32>(id.xy);
@@ -196,7 +206,53 @@ struct M { inv_cur: mat4x4<f32>, vp_prev: mat4x4<f32>, size: vec4<f32>, dz: vec4
   let c = m.vp_prev * w;
   let pn = c.xy / c.w;
   let puv = vec2<f32>(pn.x * 0.5 + 0.5, 0.5 - fy * pn.y * 0.5);
-  textureStore(mv, q, vec4<f32>(puv - uv, 0.0, 0.0));
+  // (per-object motion, rx_objmv.cpp: where the velocity pass drew the surface that is there in the end (its 1 - depth
+  // that of the depth buffer, within 2 %), that pixel's own motion; a quarter of the picture or more in one frame is
+  // taken for a mismatch)
+  var v = puv - uv;
+  var own = 0.0;
+  if (m.ov.x > 0.5 && all(q < vec2<i32>(textureDimensions(objv)))) {
+    let o = textureLoad(objv, q, 0);
+    let r = 1.0 - d;
+    if (o.w > 0.5 && abs(o.z - r) <= r * 0.02 + 1e-6 && dot(o.xy, o.xy) < 0.0625) {
+      v = o.xy;
+      own = 1.0;
+    }
+  }
+  textureStore(mv, q, vec4<f32>(v, 0.0, 0.0));
+  textureStore(objok, q, vec4<f32>(own, 0.0, 0.0, 0.0));
+}
+)";
+// The fastest object motion (rx_objmv.cpp's pixels only) in each 40 x 40 tile of the motion vectors: how far the
+// motion blur looks around a pixel for something that sweeps over it
+const char* kTileWgsl = R"(
+@group(0) @binding(0) var mvt: texture_2d<f32>;
+@group(0) @binding(1) var okt: texture_2d<f32>;
+@group(0) @binding(2) var tiles: texture_storage_2d<rg16float, write>;
+@group(0) @binding(3) var<uniform> t: vec4<f32>;   // the scene's width and height in the motion vectors
+var<workgroup> best: array<vec4<f32>, 64>;
+@compute @workgroup_size(8, 8, 1) fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
+                                          @builtin(local_invocation_index) li: u32) {
+  let lim = vec2<i32>(t.xy);
+  var b = vec4<f32>(0.0);
+  let base = vec2<i32>(wg.xy) * 40 + vec2<i32>(lid.xy) * 5;
+  for (var y = 0; y < 5; y++) {
+    for (var x = 0; x < 5; x++) {
+      let q = base + vec2<i32>(x, y);
+      if (q.x >= lim.x || q.y >= lim.y) { continue; }
+      if (textureLoad(okt, q, 0).r < 0.5) { continue; }
+      let v = textureLoad(mvt, q, 0).xy;
+      let l = dot(v * t.xy, v * t.xy);
+      if (l > b.x) { b = vec4<f32>(l, v, 0.0); }
+    }
+  }
+  best[li] = b;
+  workgroupBarrier();
+  for (var s = 32u; s > 0u; s = s >> 1u) {
+    if (li < s && best[li + s].x > best[li].x) { best[li] = best[li + s]; }
+    workgroupBarrier();
+  }
+  if (li == 0u) { textureStore(tiles, vec2<i32>(wg.xy), vec4<f32>(best[0].yz, 0.0, 0.0)); }
 }
 )";
 const char* kBlitWgsl = R"(
@@ -211,18 +267,33 @@ const char* kBlitWgsl = R"(
 )";
 
 // Motion blur (F1 > Graphics, the launcher, input.ini motion_blur; live): the blit of the upscaled scene into the game's
-// target, each pixel averaged along the camera's motion there (the motion vectors made above, per scene pixel: the
-// camera's, exact for the world). Before the HUD, which the game draws over that target afterwards. Link and what he
-// holds (the reactive mask: the camera's motion is not theirs) are left sharp, and their pixels are not smeared into
-// what is behind them. The length: the motion in one frame x the shutter (Low 0.25, Medium 0.5, High 1.0), at most
-// max_px; more than a quarter of the picture in one frame (a cut, a teleport): none.
+// target, each pixel averaged along its motion (the motion vectors made above, per scene pixel). Before the HUD, which
+// the game draws over that target afterwards. The length: the motion in one frame x the shutter (Low 0.25, Medium 0.5,
+// High 1.0), at most max_px; more than a quarter of the picture in one frame (a cut, a teleport): none.
+//   - The world: averaged along the camera's motion there (exact for it). What moves by itself without its own motion
+//     (the reactive mask without per-object motion: the camera's motion is not theirs) is left sharp, and not smeared
+//     into what is behind it.
+//   - Link, what he holds, the characters (per-object motion, rx_objmv.cpp: their own motion, where the motion vectors
+//     took it): a reconstruction filter after McGuire, Hennessy, Bukowski and Osman, "A Reconstruction Filter for
+//     Plausible Motion Blur" (I3D 2012), so a swing smears over what is behind it instead of only inside its own
+//     outline. Around each pixel, the fastest object motion of the 3 x 3 tiles of 40 motion vector texels (kTileWgsl);
+//     samples along it, each counted when it is in front and its own motion reaches this pixel (it sweeps over it),
+//     or behind and this pixel's motion reaches it (seen through this pixel's smear), or both are moving through
+//     each other; depth compared softly (3 % of the distance). Their smear reaches 1.5 x the camera's at most (72
+//     pixels at 1080p on High), with 12 more samples (the blade's edges came out as stripes with 16).
+// RX_OBJ_MV_DEBUG=1: the object motion as colour (red right, green down, brighter faster) instead of the blur.
 const char* kBlurWgsl = R"(
-struct B { scale: vec4<f32>, p: vec4<f32> };   // the motion vectors' UV scale, the output's size; shutter, max, taps, noise
+struct B { scale: vec4<f32>, p: vec4<f32>, q: vec4<f32> };
+// scale: the motion vectors' UV scale (render / their size), the output's size; p: shutter, max, taps, noise;
+// q: debug, objects (1: per-object motion this frame), tile size (motion vector texels), objects' longest smear
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
 @group(0) @binding(2) var mvt: texture_2d<f32>;
 @group(0) @binding(3) var react: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> b: B;
+@group(0) @binding(5) var okt: texture_2d<f32>;
+@group(0) @binding(6) var tiles: texture_2d<f32>;
+@group(0) @binding(7) var dep: texture_2d<f32>;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
   let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
   return vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
@@ -231,34 +302,101 @@ fn scene_px(px: vec2<f32>) -> vec2<i32> {   // (the motion vectors' texel under 
   let d = vec2<f32>(textureDimensions(mvt));
   return clamp(vec2<i32>(px / b.scale.zw * b.scale.xy * d), vec2<i32>(0), vec2<i32>(d) - 1);
 }
-@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-  let center = textureLoad(src, vec2<i32>(p.xy), 0).rgb;
-  let q = scene_px(p.xy);
-  if (textureLoad(react, q, 0).r > 0.0) { return vec4<f32>(center, 1.0); }
-  // (now - last, in output pixels, times the shutter)
+fn inside(s: vec2<f32>) -> bool { return s.x >= 0.0 && s.y >= 0.0 && s.x < b.scale.z && s.y < b.scale.w; }
+fn has_own(q: vec2<i32>) -> bool { return b.q.y > 0.5 && textureLoad(okt, q, 0).r > 0.5; }
+fn stays(q: vec2<i32>) -> bool { return textureLoad(react, q, 0).r > 0.0 && !has_own(q); }
+// (an object's motion vector as now - last in output pixels x the shutter, at most the objects' longest)
+fn to_px(mv: vec2<f32>) -> vec2<f32> {
+  var v = -mv * b.scale.zw * b.p.x;
+  let l = length(v);
+  if (l > b.q.w) { v = v * (b.q.w / l); }
+  return v;
+}
+fn own_v(q: vec2<i32>) -> vec2<f32> {   // (an object pixel's motion; 0 for the rest)
+  if (!has_own(q)) { return vec2<f32>(0.0); }
+  return to_px(textureLoad(mvt, q, 0).xy);
+}
+fn dist_of(q: vec2<i32>) -> f32 { return 1.0 / max(1.0 - textureLoad(dep, q, 0).r, 1e-7); }   // (distance / near)
+fn front(a: f32, c: f32) -> f32 { return clamp(1.0 - (a - c) / max(0.03 * min(a, c), 1e-3), 0.0, 1.0); }   // (a in front of c)
+fn cone(d: f32, r: f32) -> f32 { return clamp(1.0 - d / max(r, 1e-3), 0.0, 1.0); }
+fn cyl(d: f32, r: f32) -> f32 { return 1.0 - smoothstep(0.95 * r, 1.05 * r + 1e-3, d); }
+fn camera_blur(p: vec2<f32>, center: vec3<f32>, q: vec2<i32>, jit: f32) -> vec3<f32> {
   var v = -textureLoad(mvt, q, 0).xy * b.scale.zw;
-  let full = length(v);
-  if (full > 0.25 * max(b.scale.z, b.scale.w)) { return vec4<f32>(center, 1.0); }
+  if (length(v) > 0.25 * max(b.scale.z, b.scale.w)) { return center; }
   v = v * b.p.x;
   let len = length(v);
-  if (len < 0.75) { return vec4<f32>(center, 1.0); }
+  if (len < 0.75) { return center; }
   if (len > b.p.y) { v = v * (b.p.y / len); }
   let n = i32(b.p.z);
-  let jit = fract(52.9829189 * fract(dot(p.xy, vec2<f32>(0.06711056, 0.00583715))) + b.p.w);
   var sum = center;
   var w = 1.0;
   for (var i = 0; i < n; i++) {
-    let s = p.xy + v * ((f32(i) + jit) / f32(n) - 0.5);
-    if (s.x < 0.0 || s.y < 0.0 || s.x >= b.scale.z || s.y >= b.scale.w) { continue; }
-    if (textureLoad(react, scene_px(s), 0).r > 0.0) { continue; }
+    let s = p + v * ((f32(i) + jit) / f32(n) - 0.5);
+    if (!inside(s)) { continue; }
+    let qs = scene_px(s);
+    if (textureLoad(react, qs, 0).r > 0.0) { continue; }   // (nothing of Link and the rest smeared by the camera)
     sum += textureSampleLevel(src, smp, s / b.scale.zw, 0.0).rgb;
     w += 1.0;
+  }
+  return sum / w;
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let center = textureLoad(src, vec2<i32>(p.xy), 0).rgb;
+  let q = scene_px(p.xy);
+  let jit = fract(52.9829189 * fract(dot(p.xy, vec2<f32>(0.06711056, 0.00583715))) + b.p.w);
+  let own = has_own(q);
+  var col = center;
+  if (!own && textureLoad(react, q, 0).r <= 0.0) { col = camera_blur(p.xy, center, q, jit); }
+  if (b.q.y < 0.5) { return vec4<f32>(col, 1.0); }
+  // the fastest object motion around (the tile under a point jittered by up to a quarter tile: tiles' edges turn to
+  // noise instead of steps; Guertin, Bukowski and McGuire, "A Fast and Stable Feature-Aware Motion Blur Filter", 2014)
+  let td = vec2<i32>(textureDimensions(tiles));
+  let tj = vec2<f32>(jit, fract(jit * 7.31 + 0.37)) - 0.5;
+  let tq = vec2<i32>(floor((vec2<f32>(q) + tj * 0.5 * b.q.z) / b.q.z));
+  var vn = vec2<f32>(0.0);
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      let t = clamp(tq + vec2<i32>(dx, dy), vec2<i32>(0), td - 1);
+      let v = to_px(textureLoad(tiles, t, 0).xy);
+      if (dot(v, v) > dot(vn, vn)) { vn = v; }
+    }
+  }
+  if (b.q.x > 0.5) {   // (RX_OBJ_MV_DEBUG)
+    if (own) {
+      let v = own_v(q) / max(b.q.w, 1.0);
+      return vec4<f32>(clamp(0.5 + v.x, 0.0, 1.0), clamp(0.5 + v.y, 0.0, 1.0), 0.2 + 0.8 * min(length(v), 1.0), 1.0);
+    }
+    return vec4<f32>(center * select(0.35, 0.6, dot(vn, vn) >= 1.0), 1.0);
+  }
+  if (dot(vn, vn) < 1.0) { return vec4<f32>(col, 1.0); }
+  let vx = own_v(q);
+  let rx = 0.5 * length(vx);   // (the smear's reach either side: half the motion)
+  let zx = dist_of(q);
+  var w = 1.0 / max(rx, 1.0);
+  var sum = col * w;
+  let n = i32(b.p.z) + 12;
+  // (a moving pixel samples along its own motion every other time: its smear keeps its direction where the tile's
+  // fastest goes another way, as along a turning blade)
+  let along_own = dot(vx, vx) > 2.25;
+  for (var i = 0; i < n; i++) {
+    let dir = select(vn, vx, along_own && (i & 1) == 1);
+    let off = dir * (((f32(i) + jit) / f32(n)) - 0.5);
+    let s = p.xy + off;
+    if (!inside(s)) { continue; }
+    let qs = scene_px(s);
+    if (stays(qs)) { continue; }
+    let d = length(off);
+    let rs = 0.5 * length(own_v(qs));
+    let zs = dist_of(qs);
+    let ws = front(zs, zx) * cone(d, rs) + front(zx, zs) * cone(d, rx) + cyl(d, rs) * cyl(d, rx) * 2.0;
+    sum += textureSampleLevel(src, smp, s / b.scale.zw, 0.0).rgb * ws;
+    w += ws;
   }
   return vec4<f32>(sum / w, 1.0);
 }
 )";
 struct BlurConstants {
-    float scale[4], p[4];
+    float scale[4], p[4], q[4];
 };
 
 WGPUShaderModule module(const std::string& code, const char* label) {
@@ -366,7 +504,7 @@ bool init_pipelines() {
         }
     }
     {
-        WGPUBindGroupLayoutEntry e[6]{};
+        WGPUBindGroupLayoutEntry e[8]{};
         e[5].binding = 5;
         e[5].visibility = WGPUShaderStage_Compute;
         e[5].storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
@@ -393,8 +531,17 @@ bool init_pipelines() {
         e[2].storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
         e[2].storageTexture.format = WGPUTextureFormat_RG16Float;
         e[2].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+        e[6].binding = 6;   // (per-object motion: the velocity target, and where it was taken)
+        e[6].visibility = WGPUShaderStage_Compute;
+        e[6].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+        e[6].texture.viewDimension = WGPUTextureViewDimension_2D;
+        e[7].binding = 7;
+        e[7].visibility = WGPUShaderStage_Compute;
+        e[7].storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
+        e[7].storageTexture.format = WGPUTextureFormat_R8Unorm;
+        e[7].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
         WGPUBindGroupLayoutDescriptor bd{};
-        bd.entryCount = 6;
+        bd.entryCount = 8;
         bd.entries = e;
         st.mv_layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
         scope_push();
@@ -418,9 +565,42 @@ bool init_pipelines() {
         bd.entries = &e;
         st.blit_layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
     }
-    {   // (motion blur: the output, a sampler, the motion vectors, the reactive mask, its constants)
-        WGPUBindGroupLayoutEntry e[5]{};
-        for (int i = 0; i < 5; i++) e[i].binding = (uint32_t)i, e[i].visibility = WGPUShaderStage_Fragment;
+    {   // (per-object motion's tiles: the motion vectors, where they are an object's, the tiles, the scene's size)
+        WGPUBindGroupLayoutEntry e[4]{};
+        for (int i = 0; i < 4; i++) e[i].binding = (uint32_t)i, e[i].visibility = WGPUShaderStage_Compute;
+        e[0].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+        e[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+        e[1].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+        e[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+        e[2].storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
+        e[2].storageTexture.format = WGPUTextureFormat_RG16Float;
+        e[2].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+        e[3].buffer.type = WGPUBufferBindingType_Uniform;
+        e[3].buffer.minBindingSize = 16;
+        WGPUBindGroupLayoutDescriptor bd{};
+        bd.entryCount = 4;
+        bd.entries = e;
+        st.tile_layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
+        scope_push();
+        WGPUShaderModule mod = module(kTileWgsl, "rx object motion tiles");
+        st.tile_pipe = compute_pipeline(mod, {st.tile_layout});
+        wgpuShaderModuleRelease(mod);
+        const std::string err = scope_pop();
+        if (!err.empty() || !st.tile_pipe) {   // (motion blur keeps the camera's, objects stay sharp)
+            hos_log("rx: object motion: the tile pass did not build: %s", err.c_str());
+            if (st.tile_pipe) wgpuComputePipelineRelease(st.tile_pipe);
+            st.tile_pipe = nullptr;
+        }
+        for (WGPUBuffer& b : st.cb_tile) b = make_buffer(16, WGPUBufferUsage_Uniform);
+    }
+    {   // (motion blur: the output, a sampler, the motion vectors, the reactive mask, its constants; per-object motion:
+        // where the motion vectors are an object's, the tiles, the depth)
+        WGPUBindGroupLayoutEntry e[8]{};
+        for (int i = 0; i < 8; i++) e[i].binding = (uint32_t)i, e[i].visibility = WGPUShaderStage_Fragment;
+        for (int i : {5, 6, 7}) {
+            e[i].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+            e[i].texture.viewDimension = WGPUTextureViewDimension_2D;
+        }
         e[0].texture.sampleType = WGPUTextureSampleType_Float;
         e[0].texture.viewDimension = WGPUTextureViewDimension_2D;
         e[1].sampler.type = WGPUSamplerBindingType_Filtering;
@@ -431,7 +611,7 @@ bool init_pipelines() {
         e[4].buffer.type = WGPUBufferBindingType_Uniform;
         e[4].buffer.minBindingSize = sizeof(BlurConstants);
         WGPUBindGroupLayoutDescriptor bd{};
-        bd.entryCount = 5;
+        bd.entryCount = 8;
         bd.entries = e;
         st.blur_layout = wgpuDeviceCreateBindGroupLayout(dev.device, &bd);
         WGPUSamplerDescriptor sd{};
@@ -492,7 +672,7 @@ void free_sized() {
     }
     for (Tex* t : {&st.prepared, &st.dil_mv[0], &st.dil_mv[1], &st.dil_depth, &st.lock[0], &st.lock[1], &st.lock_luma,
                    &st.new_locks, &st.up[0], &st.up[1], &st.lum, &st.luma_hist[0], &st.luma_hist[1], &st.dil_reactive,
-                   &st.mv, &st.out, &st.reactive, &st.depth_copy, &st.color_copy})
+                   &st.mv, &st.out, &st.reactive, &st.depth_copy, &st.color_copy, &st.objok, &st.tiles})
         free_tex(*t);
     if (st.lum_mip4) wgpuTextureViewRelease(st.lum_mip4), st.lum_mip4 = nullptr;
     if (st.lum_mip5) wgpuTextureViewRelease(st.lum_mip5), st.lum_mip5 = nullptr;
@@ -518,6 +698,8 @@ void ensure_sized(uint32_t mw, uint32_t mh, uint32_t dw, uint32_t dh) {
     st.new_locks = make_tex("FSR2 new locks", WGPUTextureFormat_R8Unorm, dw, dh);
     st.dil_reactive = make_tex("FSR2 dilated reactive", WGPUTextureFormat_RG8Unorm, mw, mh);
     st.mv = make_tex("FSR2 motion vectors", WGPUTextureFormat_RG16Float, mw, mh);
+    st.objok = make_tex("rx object motion taken", WGPUTextureFormat_R8Unorm, mw, mh);
+    st.tiles = make_tex("rx object motion tiles", WGPUTextureFormat_RG16Float, (mw + 39) / 40, (mh + 39) / 40);
     st.reactive = make_tex("FSR2 reactive", WGPUTextureFormat_R8Unorm, mw, mh);
     st.depth_copy = make_tex("FSR2 depth copy", WGPUTextureFormat_R32Float, mw, mh);
     st.out = make_tex("FSR2 output", WGPUTextureFormat_RGBA16Float, dw, dh);
@@ -806,6 +988,14 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
         static const float reactive = getenv("RX_FSR2_REACTIVE") ? (float)atof(getenv("RX_FSR2_REACTIVE")) : 0.9f;
         mc.dz[0] = cur.depth_a != 0 ? cur.depth_a : 1, mc.dz[1] = cur.depth_b, mc.dz[2] = scene_mask ? reactive : 0, mc.dz[3] = 1;
     }
+    // per-object motion (rx_objmv.cpp): its velocity target, when it holds this frame's and is the scene's size
+    WGPUTextureView objv = objmv_view();
+    if (objv && st.objok.t == nullptr) objv = nullptr;
+    mc.ov[0] = objv ? 1.0f : 0.0f;
+    if ((int)(objv != nullptr) != st.objmv_logged) {
+        log_limited("objmv_on", 20, "rx: object motion %s", objv ? "in the motion vectors" : "not this frame");
+        st.objmv_logged = objv != nullptr;
+    }
     wgpuQueueWriteBuffer(dev.queue, st.cb_mv[slot], 0, &mc, sizeof mc);
 
     // ---- the inputs' views ----
@@ -865,8 +1055,46 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
     std::vector<Job> jobs;
     jobs.push_back({st.mv_pipe, st.mv_layout, nullptr,
                     {tex_entry(0, depth_v), buf_entry(1, st.cb_mv[slot], sizeof(MvConstants)), tex_entry(2, st.mv.v),
-                     tex_entry(3, mask_v ? mask_v : st.dummy.v), tex_entry(4, st.reactive.v), tex_entry(5, st.depth_copy.v)},
+                     tex_entry(3, mask_v ? mask_v : st.dummy.v), tex_entry(4, st.reactive.v), tex_entry(5, st.depth_copy.v),
+                     tex_entry(6, objv ? objv : st.dummy.v), tex_entry(7, st.objok.v)},
                     {}, (rw + 7) / 8, (rh + 7) / 8});
+    // (the tiles of object motion, for the motion blur's reach: checked once on an encoder of its own)
+    bool tiles = blur_mode && objv && st.tile_pipe && st.blur;
+    if (tiles) {
+        const float tsz[4] = {(float)rw, (float)rh, 0, 0};
+        wgpuQueueWriteBuffer(dev.queue, st.cb_tile[slot], 0, tsz, sizeof tsz);
+        const Job tj{st.tile_pipe, st.tile_layout, nullptr,
+                     {tex_entry(0, st.mv.v), tex_entry(1, st.objok.v), tex_entry(2, st.tiles.v), buf_entry(3, st.cb_tile[slot], 16)},
+                     {}, (rw + 39) / 40, (rh + 39) / 40};
+        if (!st.tile_checked) {
+            scope_push();
+            WGPUCommandEncoder te = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
+            WGPUComputePassEncoder tp = wgpuCommandEncoderBeginComputePass(te, nullptr);
+            WGPUBindGroupDescriptor bd{};
+            bd.layout = tj.layout0;
+            bd.entryCount = tj.e0.size();
+            bd.entries = tj.e0.data();
+            WGPUBindGroup g = wgpuDeviceCreateBindGroup(dev.device, &bd);
+            wgpuComputePassEncoderSetPipeline(tp, tj.pipe);
+            wgpuComputePassEncoderSetBindGroup(tp, 0, g, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(tp, 1, 1, 1);
+            wgpuComputePassEncoderEnd(tp);
+            wgpuComputePassEncoderRelease(tp);
+            WGPUCommandBuffer cb = wgpuCommandEncoderFinish(te, nullptr);
+            if (cb) wgpuCommandBufferRelease(cb);
+            wgpuCommandEncoderRelease(te);
+            if (g) wgpuBindGroupRelease(g);
+            const std::string err = scope_pop();
+            st.tile_checked = true;
+            if (!err.empty()) {
+                hos_log("rx: object motion: the tile pass does not check out: objects stay sharp. %s", err.c_str());
+                wgpuComputePipelineRelease(st.tile_pipe);
+                st.tile_pipe = nullptr;
+                tiles = false;
+            }
+        }
+        if (tiles) jobs.push_back(tj);
+    }
     std::vector<WGPUBindGroupEntry> samplers(2);
     samplers[0] = {};
     samplers[0].binding = 0;
@@ -1037,14 +1265,20 @@ bool fsr2_replace_draw(const Attachments& at, uint64_t fs_key, uint32_t vertex_c
             bc.p[1] = 48.0f * (float)dh / 1080.0f;   // (the longest blur: 48 pixels at 1080p)
             bc.p[2] = blur_mode == 3 ? 16.0f : 12.0f;
             bc.p[3] = (float)((st.dispatches * 7) % 16) / 16.0f;   // (the taps' offset moves each frame)
+            static const bool objmv_debug = env_flag("RX_OBJ_MV_DEBUG");
+            bc.q[0] = objmv_debug ? 1.0f : 0.0f;
+            bc.q[1] = tiles ? 1.0f : 0.0f;   // (objects: their own motion, the reconstruction)
+            bc.q[2] = 40.0f;
+            bc.q[3] = 1.5f * bc.p[1];
             wgpuQueueWriteBuffer(dev.queue, st.cb_blur[slot], 0, &bc, sizeof bc);
-            WGPUBindGroupEntry be[5] = {tex_entry(0, st.out.v), {}, tex_entry(2, st.mv.v), tex_entry(3, st.reactive.v),
-                                        buf_entry(4, st.cb_blur[slot], sizeof(BlurConstants))};
+            WGPUBindGroupEntry be[8] = {tex_entry(0, st.out.v), {}, tex_entry(2, st.mv.v), tex_entry(3, st.reactive.v),
+                                        buf_entry(4, st.cb_blur[slot], sizeof(BlurConstants)), tex_entry(5, st.objok.v),
+                                        tex_entry(6, st.tiles.v), tex_entry(7, st.depth_copy.v)};
             be[1].binding = 1;
             be[1].sampler = st.blur_sampler;
             WGPUBindGroupDescriptor bd{};
             bd.layout = st.blur_layout;
-            bd.entryCount = 5;
+            bd.entryCount = 8;
             bd.entries = be;
             st.blit_groups[slot] = wgpuDeviceCreateBindGroup(dev.device, &bd);
         } else {

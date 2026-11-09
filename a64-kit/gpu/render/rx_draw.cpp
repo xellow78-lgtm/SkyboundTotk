@@ -1861,6 +1861,65 @@ Pipeline* get_pipeline(const std::vector<uint32_t>& key, ProgramPair& prog, cons
     return raw->state == 2 ? nullptr : raw;
 }
 
+/// The velocity pass's pipeline for a moving scene draw (rx_objmv.cpp): its vertex program's variant with the draw's
+/// vertex layout and primitive state, groups 0 and 1 its vertex stage's layout (this frame's and last frame's
+/// constants), 2 the pixel stage's; compiled on the pipeline workers as the game's are. Null while compiling, or
+/// when there is none (no variant, too many dynamic offsets for two copies of the layout).
+WGPURenderPipeline objmv_pipeline(ProgramPair& prog, const StageResources& vs_res, const VertexInput& vi,
+                                  const WGPUPrimitiveState& prim, WGPUBindGroupLayout vs_layout) {
+    static std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> made;
+    std::vector<uint32_t> key;
+    key.reserve(16 + vi.key.size() + vs_res.layout.size());
+    key.insert(key.end(), {(uint32_t)prog.vs.text_hash, (uint32_t)(prog.vs.text_hash >> 32), (uint32_t)prog.vs.key,
+                           (uint32_t)(prog.vs.key >> 32), (uint32_t)prim.topology, (uint32_t)prim.stripIndexFormat,
+                           (uint32_t)prim.frontFace, (uint32_t)prim.cullMode, (uint32_t)prim.unclippedDepth, 0xA11u});
+    key.insert(key.end(), vs_res.layout.begin(), vs_res.layout.end());
+    key.push_back(0xB22u);
+    key.insert(key.end(), vi.key.begin(), vi.key.end());
+    const uint64_t h = hash_bytes(key.data(), key.size() * 4) ^ (uint64_t)(uintptr_t)vs_layout;
+    auto it = made.find(h);
+    if (it != made.end()) return it->second && it->second->state == 1 ? it->second->pipeline : nullptr;
+    std::unique_ptr<Pipeline>& slot = made[h];
+    ShaderModule* vm = objmv_vs_module(prog.vs);
+    if (!vm) return nullptr;
+    uint32_t dyn_storage = 0, dyn_uniform = 0;
+    for (uint32_t v : vs_res.layout) {
+        const WGPUBindGroupLayoutEntry e = unpack_layout(v);
+        if (!e.buffer.hasDynamicOffset) continue;
+        if (e.buffer.type == WGPUBufferBindingType_Uniform) dyn_uniform++;
+        else dyn_storage++;
+    }
+    if (2 * dyn_storage > dev.limits.maxDynamicStorageBuffersPerPipelineLayout ||
+        2 * dyn_uniform > dev.limits.maxDynamicUniformBuffersPerPipelineLayout) {
+        log_limited("objmv_dynamic", 10, "rx: object motion: vertex program %016llx: %u + %u dynamic offsets, twice is too many",
+                    (unsigned long long)prog.vs.key, dyn_storage, dyn_uniform);
+        return nullptr;
+    }
+    slot = std::make_unique<Pipeline>();
+    WGPUBindGroupLayout layouts[3] = {vs_layout, vs_layout, objmv_fs_layout()};
+    WGPUPipelineLayoutDescriptor pld{};
+    pld.bindGroupLayoutCount = 3;
+    pld.bindGroupLayouts = layouts;
+    auto job = std::make_unique<PipelineJob>();
+    job->target = slot.get();
+    job->layout = wgpuDeviceCreatePipelineLayout(dev.device, &pld);
+    job->vs_module = vm;
+    job->fs_module = objmv_fs_module();
+    job->packed[0] = vs_res.layout;
+    job->buffers = vi.layouts;
+    job->attributes.assign(vi.attributes.begin(), vi.attributes.begin() + (ptrdiff_t)vi.nattr);
+    WGPUColorTargetState t{};
+    t.format = WGPUTextureFormat_RGBA16Float;
+    t.writeMask = WGPUColorWriteMask_All;
+    job->targets = {t};
+    job->primitive = prim;
+    job->has_depth = false;
+    static const bool sync = RX_WEB || getenv("RX_SYNC_PIPELINES") != nullptr;
+    if (sync) compile(*job);
+    else pipeline_workers.submit(std::move(job));
+    return slot->state == 1 ? slot->pipeline : nullptr;
+}
+
 std::vector<Pipeline*> prewarming;   // (cached pipelines submitted, until they are compiled)
 
 } // namespace
@@ -3760,8 +3819,21 @@ bool watch_ub_bank(const NvnState& s, int stage, uint32_t index, const uint8_t* 
 /// One stage's uniform block, constant / storage buffers and textures for an NVN draw (stage_resources' twin; the
 /// layout is the WGSL backend's)
 bool nvn_vs_storage_writable;   // (nvn_vs_compute: the vertex stage's stores are made, by a compute program)
+/// cap (the vertex stage of a scene draw, per-object motion: rx_objmv.cpp): what each entry holds this frame
 void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, const Shader::Info& info,
-                         WGPUShaderStage vis, const float rescale[16], const Attachments& at, uint32_t& dynamic_storage) {
+                         WGPUShaderStage vis, const float rescale[16], const Attachments& at, uint32_t& dynamic_storage,
+                         ObjMvCapture* cap = nullptr) {
+    // (an entry just added: its kind and contents, its dynamic offset the last one when it has one)
+    auto capture = [&](uint8_t kind, bool camera, std::shared_ptr<const std::vector<uint8_t>> bytes) {
+        if (!cap) return;
+        ObjMvBinding b;
+        b.kind = kind;
+        b.camera = camera;
+        const WGPUBindGroupLayoutEntry l = unpack_layout(out.layout.back());
+        b.dyn = l.buffer.hasDynamicOffset ? (int16_t)(out.dynamic_offsets.size() - 1) : (int16_t)-1;
+        b.bytes = std::move(bytes);
+        cap->bind.push_back(std::move(b));
+    };
     NvnBanks banks;
     banks.c1 = nvn_c1(s, stage);
     if (frame_dump_active()) dump_textures.clear();
@@ -3806,6 +3878,7 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
     static std::vector<uint8_t> slot_bytes;
     slot_bytes.assign(info.texture_descriptors.size() * 32, 0);
     buffer_entry(0, WGPUBufferBindingType_Uniform, true, stream_ro.buffer, 0, (uint64_t)ub_size * 16);
+    capture(1, false, nullptr);
     const size_t ub_dynamic = out.dynamic_offsets.size() - 1;
     uint32_t b = 1;
     for (const auto& d : info.constant_buffer_descriptors) {   // (the ones not in the block: read-only storage)
@@ -3850,6 +3923,7 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
                 const bool dynamic = dynamic_storage > 0;
                 dynamic_storage -= dynamic;
                 buffer_entry(b, WGPUBufferBindingType_ReadOnlyStorage, dynamic, c.buffer, c.offset, size);
+                if (cap) capture(2, d.index == 4, objmv_bytes(s.ubo[stage][d.index - 3].addr, size));
                 count("cbuf_in_place", (int64_t)size);
                 b += d.count;
                 continue;
@@ -3866,6 +3940,9 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
         const bool dynamic = dynamic_storage > 0;
         dynamic_storage -= dynamic;
         buffer_entry(b, WGPUBufferBindingType_ReadOnlyStorage, dynamic, stream_ro.buffer, off, size);
+        if (cap)
+            capture(2, d.index == 4,
+                    std::make_shared<const std::vector<uint8_t>>(stream_ro.at(off), stream_ro.at(off) + size));
         b += d.count;
     }
     for (const auto& d : info.storage_buffers_descriptors) {
@@ -3912,6 +3989,13 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
         dynamic_storage -= dynamic;
         buffer_entry(b, writable ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_ReadOnlyStorage, dynamic,
                      sb.buffer, sb.offset, sb.size);
+        if (cap) {   // (storage up to 256 KB kept each frame (a character's bones); bigger: taken as unchanged)
+            static const uint64_t keep_max =
+                getenv("RX_OBJ_MV_SSBO_MAX") ? strtoull(getenv("RX_OBJ_MV_SSBO_MAX"), nullptr, 10) : 256u << 10;
+            if (writable || (raw_va && gpu_written(va, sb.size))) cap->ok = false;
+            if (!raw_va || sb.size > keep_max) capture(0, false, nullptr);
+            else capture(3, false, objmv_bytes(va, sb.size));
+        }
         b += d.count;
     }
     if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty() ||
@@ -3994,9 +4078,11 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
         se.binding = b + 1;
         se.sampler = t.sampler;
         if (!shared_sampler) out.entries.push_back(se);
+        if (cap) cap->bind.resize(out.entries.size());   // (textures and samplers: this frame's)
         b += 2;
     }
     out.next_binding = b;
+    if (cap && cap->bind.size() != out.entries.size()) cap->ok = false;   // (an entry not followed: not drawn again)
     // the uniform block: rescale, the texture slots, the constant banks that fit
     const uint64_t used_before = stream_ro.used;
     const uint64_t ub = stream_ro.alloc((uint64_t)ub_size * 16, dev.limits.minUniformBufferOffsetAlignment);
@@ -4017,6 +4103,12 @@ void nvn_stage_resources(StageResources& out, const NvnState& s, int stage, cons
                                      ub + (uint64_t)base[d.index % 18] * 16, size);
     }
     if (!slot_bytes.empty()) std::memcpy(block + 64, slot_bytes.data(), slot_bytes.size());
+    if (cap) {   // (the block; the camera's rows in it, when its constant buffer (4) is there)
+        cap->ub.assign(block, block + (size_t)ub_size * 16);
+        if (in_ub[4])
+            cap->cam_row = base[4],
+            cap->cam_rows = std::max(Common::DivCeil(info.constant_buffer_used_sizes[4], 16U), 1U);
+    }
     if (nvn_dump_vs_ub && stage == 0) dump_words("ub", 0, block, (uint64_t)ub_size * 16);
     else if (nvn_dump_draw_ub) dump_ub_words(stage, block, (uint64_t)ub_size * 16);
     // the same bytes as a block this batch already holds: that one is bound and this space given back (draws of a
@@ -4732,7 +4824,26 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     // (the program pair, for snapshot_for_feedback: a snapshot is kept across a run of draws of one program only)
     feedback_program = prog->vs.key * 0x9E3779B97F4A7C15ull ^ (prog->has_fs ? prog->fs.key : 0) ^ 1;
     begin_pass_writes();
-    nvn_stage_resources(vs_res, s, 0, prog->vs.info, WGPUShaderStage_Vertex, rescale, at, dynamic_storage);
+    // (per-object motion, rx_objmv.cpp: a draw that colours the scene's G-buffer (the camera capture's targets) keeps
+    // its vertex inputs, unless its vertices are what a dispatch wrote (GPU particles: last frame's are gone)
+    static ObjMvCapture objmv_cap;
+    objmv_cap.clear();
+    bool objmv_follow = false;
+    if (at.depth && s.ds.dt && prog->has_fs && s.chmask.mask && prog->vs_compute_wgsl.empty() && at.color[0] &&
+        at.color[0]->format == WGPUTextureFormat_RGBA8Unorm && objmv_on()) {
+        int ncolor = 0;
+        bool hdr = false;
+        for (const Image* ci : at.color)
+            if (ci) ncolor++, hdr |= ci->format == WGPUTextureFormat_RG11B10Ufloat;
+        objmv_follow = ncolor >= 4 && hdr;
+        for (uint32_t i = 0; i < 16 && objmv_follow; i++) {
+            if (!(prog->vs.generic_loads() >> i & 1)) continue;
+            const NvnStream vst = nvn_stream(s, nvn_attribute(s.vattr[i]).buffer % 16);
+            if (vst.enabled && gpu_written(vst.addr, vst.size)) objmv_follow = false;
+        }
+    }
+    nvn_stage_resources(vs_res, s, 0, prog->vs.info, WGPUShaderStage_Vertex, rescale, at, dynamic_storage,
+                        objmv_follow ? &objmv_cap : nullptr);
     nvn_dump_vs_ub = false;
     if (!vs_res.ok) return skip("vertex resources");
     static std::string nvn_vs_textures;
@@ -5031,6 +5142,45 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
         rp_draw(pass, d.count, d.instances, 0, 0);
     }
     feedback_program = 0;
+    // per-object motion (rx_objmv.cpp): a scene draw whose vertex inputs changed since last frame is drawn again into
+    // the velocity target at the pass's end, with the same buffers and draw call
+    if (objmv_follow && objmv_cap.ok && objmv_cap.bind.size() <= vs_res.entries.size()) {
+        objmv_cap.bind.resize(vs_res.entries.size());   // (the pulled vertex streams: this frame's)
+        uint64_t idk[12] = {prog->vs.key, prog->has_fs ? prog->fs.key : 0, (uint64_t)d.indexed, d.index_gpu, d.first,
+                            d.count, (uint64_t)(int64_t)d.base_vertex, d.instances, d.base_instance, 0, 0, 0};
+        for (uint32_t i = 0, k = 9; i < 16 && k < 12; i++) {   // (the vertex streams it reads)
+            if (!(prog->vs.generic_loads() >> i & 1)) continue;
+            const NvnStream vst = nvn_stream(s, nvn_attribute(s.vattr[i]).buffer % 16);
+            if (vst.enabled && std::find(idk + 9, idk + k, vst.addr) == idk + k) idk[k++] = vst.addr;
+        }
+        uint64_t turn = 0;
+        if (objmv_moved(hash_bytes(idk, sizeof idk), objmv_cap, &turn)) {
+            ObjMvDraw od;
+            od.pipeline = objmv_pipeline(*prog, vs_res, vi, prim, pipe->layouts[0]);
+            od.layout0 = pipe->layouts[0];
+            od.g0 = g0;
+            od.entries = &vs_res.entries;
+            od.offsets = &vs_res.dynamic_offsets;
+            for (const auto& vb : vi.bindings) od.vertex.push_back({vb.buffer, vb.offset, vb.size});
+            od.instances = d.instances;
+            if (cached && indexed) {
+                od.indexed = true, od.index = index_ref.buffer, od.index_format = index_format, od.count = d.count;
+                od.first = (uint32_t)(index_ref.offset / index_unit), od.base_vertex = d.base_vertex;
+                od.base_instance = d.base_instance;
+            } else if (cached) {
+                od.count = d.count, od.first = d.first, od.base_instance = d.base_instance;
+            } else if (indexed) {
+                od.indexed = true, od.index = stream_ro.buffer, od.index_format = index_format;
+                od.count = (uint32_t)indices.size(), od.first = (uint32_t)(index_off / index_unit);
+            } else {
+                od.count = d.count;
+            }
+            std::memcpy(od.scissor, rect, sizeof od.scissor);
+            od.depth = at.depth;
+            od.w = at.width, od.h = at.height;
+            objmv_queue(turn, od);
+        }
+    }
     // RX_END_PASS_AFTER_FS=<pixel program key>[,...] (debugging): a draw of those ends its render pass, as RX_DUMP_AFTER's
     // snapshots do (what found the GPU particle rule below)
     static const std::vector<uint64_t> end_pass_after = [] {

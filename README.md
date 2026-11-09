@@ -97,9 +97,13 @@ No game files are included. You need your own dump of the game (see [Game files]
   river. Only what is on screen can be reflected: reflections fade at the picture's edges, and Link's reflection
   shows his back.
 - **Motion blur** (new, live, with FSR 2 or DLSS): the camera's motion blur, from the per-pixel motion vectors made
-  for FSR 2 / DLSS, applied as the upscaled scene goes into the game's frame, so the HUD stays sharp. Link and what he
-  holds stay sharp too (the camera's motion is not theirs). Low / Medium / High (a quarter, half or all of a frame's
-  motion); none on a camera cut or teleport.
+  for FSR 2 / DLSS, applied as the upscaled scene goes into the game's frame, so the HUD stays sharp. Low / Medium /
+  High (a quarter, half or all of a frame's motion); none on a camera cut or teleport.
+  - **Per-object** (new, not tested in game yet): Link, his sword swings and the other characters blur with their own
+    motion. Each frame the draws that moved are drawn a second time with last frame's bones and transforms, so every
+    pixel knows where it was. A reconstruction filter (McGuire et al. 2012) lets a swing smear over what is behind it
+    instead of only inside its outline. The same motion goes into DLSS / FSR 2's motion vectors. Characters the game
+    animates some other way stay sharp, as before.
 - **Surface reflections** (new, live): the same on smooth surfaces (polished stone, ice, metal), picked by the
   smoothness the game keeps in its G-buffer. Soft: blurrier on rougher surfaces. Sharp: mirrors on every smooth
   surface. Characters are left out.
@@ -287,6 +291,9 @@ environment variables (in `launcher.ini` as `env.NAME = value`):
 | `HOS_HUD=center` | Keep the HUD in the middle 16:9 on wide screens |
 | `RX_FRAMEGEN_NO_CAMERA=1` | Frame generation with block matching only |
 | `RX_GPU_TIMING=1` | GPU time of the game's passes and of each frame generation stage, in the log every 5 s |
+| `RX_OBJ_MV=0` / `1` | Per-object motion off / on even without motion blur |
+| `RX_OBJ_MV_DEBUG=1` | Show the per-object motion as colour instead of the blur |
+| `RX_OBJ_MV_STATS=1` | What per-object motion followed and redrew, in the log every 5 s |
 | `RX_DUMP_DIR=<folder>` | Where F12 frame dumps go (default `rx_frame`) |
 
 ---

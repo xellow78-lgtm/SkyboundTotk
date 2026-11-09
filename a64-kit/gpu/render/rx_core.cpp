@@ -1788,6 +1788,7 @@ void end_render_pass(const char* why) {
             count("pass_results_cached", (int64_t)r.size);
         }
     }
+    objmv_pass_end();   // (the pass's moving draws again, into the velocity target: rx_objmv.cpp)
 }
 
 uint64_t pass_count() {

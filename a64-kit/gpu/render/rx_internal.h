@@ -590,6 +590,67 @@ PullPlan pull_plan(const Regs& r, const std::bitset<32>& loads);
 /// fetched in its own format).
 uint8_t vertex_unpack(const Regs::VertexAttribute& a);
 
+// ---- per-object motion (rx_objmv.cpp): the moving draws of the scene drawn again into a velocity target ----
+/// Whether the scene's draws are followed (motion blur on with FSR 2 / DLSS; RX_OBJ_MV=0 / 1 overrides)
+bool objmv_on();
+/// One entry of a vertex stage's bind group, as the velocity pass's copy with last frame's contents needs it
+struct ObjMvBinding {
+    uint8_t kind = 0;      // 0 bound as this frame's (vertex streams, textures, big storage); 1 the uniform block;
+                           // 2 a constant buffer bound as storage; 3 a storage buffer
+    bool camera = false;   // (2: the scene camera's constants, left out when comparing)
+    int16_t dyn = -1;      // its dynamic offset's index (-1: none)
+    std::shared_ptr<const std::vector<uint8_t>> bytes;   // (2, 3) what it holds this frame
+};
+struct ObjMvCapture {   // (filled by nvn_stage_resources for the vertex stage)
+    std::vector<ObjMvBinding> bind;
+    std::vector<uint8_t> ub;             // the uniform block
+    uint32_t cam_row = 0, cam_rows = 0;  // the camera's rows in it (left out when comparing)
+    bool ok = true;                      // (false: it stores, or reads what a dispatch wrote)
+    void clear() {
+        bind.clear();
+        ub.clear();
+        cam_row = cam_rows = 0;
+        ok = true;
+    }
+};
+struct ObjMvVertexBuffer {
+    WGPUBuffer buffer = nullptr;
+    uint64_t offset = 0, size = 0;
+};
+struct ObjMvDraw {   // a moving draw, as the velocity pass draws it again
+    WGPURenderPipeline pipeline = nullptr;   // (null: still compiling)
+    WGPUBindGroupLayout layout0 = nullptr;   // the vertex stage's group layout
+    WGPUBindGroup g0 = nullptr;              // its group this frame
+    const std::vector<WGPUBindGroupEntry>* entries = nullptr;
+    const std::vector<uint32_t>* offsets = nullptr;
+    std::vector<ObjMvVertexBuffer> vertex;
+    WGPUBuffer index = nullptr;
+    WGPUIndexFormat index_format = WGPUIndexFormat_Undefined;
+    bool indexed = false;
+    uint32_t count = 0, instances = 1, first = 0, base_instance = 0;
+    int32_t base_vertex = 0;
+    uint32_t scissor[4]{};
+    Image* depth = nullptr;
+    uint32_t w = 0, h = 0;
+};
+/// A guest range's bytes this frame (read once a frame per range; null when unreadable)
+std::shared_ptr<const std::vector<uint8_t>> objmv_bytes(uint64_t va, uint64_t size);
+/// A scene draw's vertex inputs kept (cap is emptied); whether they changed since last frame's matching draw (then
+/// objmv_queue). turn_identity: the draw's identity with its turn among equal ones.
+bool objmv_moved(uint64_t identity, ObjMvCapture& cap, uint64_t* turn_identity);
+void objmv_queue(uint64_t turn_identity, const ObjMvDraw& d);
+/// The velocity pass's modules: a vertex program's variant (null: none), the pixel stage; the pixel stage's group
+/// layout (group 2: the depth buffer)
+ShaderModule* objmv_vs_module(const ShaderModule& vs);
+ShaderModule* objmv_fs_module();
+WGPUBindGroupLayout objmv_fs_layout();
+/// (end_render_pass) the queued draws into the velocity target
+void objmv_pass_end();
+/// The velocity target when it holds this frame's motion (RGBA16F at the scene targets' size: last - now in scene UV,
+/// 1 - depth, 1 where written), else null
+WGPUTextureView objmv_view();
+std::string objmv_vs_variant(const std::string& src, const char** why);
+
 /// A compute dispatch as the launch descriptor (QMD) and the compute engine's registers describe it.
 struct ComputeLaunch {
     uint64_t code_base = 0;         // code_loc

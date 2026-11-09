@@ -429,7 +429,9 @@ bool ensure_module(ShaderModule& m) {
         s->ok = create_module(m, m.what, m.key);
         s->module = m.module;   // (modules live as long as the program pairs: never released)
         s->done = true;
-        if (!RX_WEB) release_module_text(m);
+        // (vertex programs keep their text: per-object motion makes a variant of the ones that move, rx_objmv.cpp;
+        // they are the small half, ~5-15 KB each)
+        if (!RX_WEB && std::strcmp(m.what, "vertex") != 0) release_module_text(m);
         return s->ok;
     }
     m.module = s->module;
