@@ -145,8 +145,9 @@ def lift_identity(exefs):
             if path.is_file() and path.suffix in (".py", ".c", ".cpp", ".h"):
                 digest.update(path.relative_to(ROOT).as_posix().encode())
                 digest.update(path.read_bytes())
-    for path in (KIT / "build.py", KIT / "tools/nso.py", ROOT / "ports/zelda-totk/hot_funcs.txt",
-                 ROOT / "ports/zelda-totk/versions.txt"):
+    # (the hot-function lists the lift reads: every one versions.txt can name, ports/zelda-totk/hot_funcs*.txt)
+    for path in [KIT / "build.py", KIT / "tools/nso.py", ROOT / "ports/zelda-totk/versions.txt"] + \
+            sorted((ROOT / "ports/zelda-totk").glob("hot_funcs*.txt")):
         if path.is_file():
             digest.update(path.relative_to(ROOT).as_posix().encode())
             digest.update(path.read_bytes())
