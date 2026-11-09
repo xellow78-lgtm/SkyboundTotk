@@ -659,7 +659,10 @@ def install(a, env):
              (native / "SDL2.dll", "SDL2.dll"), (native / "nvngx_dlss.dll", "nvngx_dlss.dll"),
              (native / "totk.pdb", "totk.pdb"), (native / "button_icons.py", "button_icons.py"),
              (native / "python.txt", "python.txt"), (native / "SkyboundTOTK Launcher.exe", "SkyboundTOTK Launcher.exe"),
-             (SOURCE / "launcher/pipeline.py", "pipeline.py")]
+             (SOURCE / "launcher/pipeline.py", "pipeline.py"),
+             # (the WebGPU library's symbols, from its Rust build when there: the F5 profiler then names wgpu's
+             # functions instead of the nearest export; a PDB that does not match the DLL is ignored by the profiler)
+             (SKYBOUND / "wgpu-build/target/release/wgpu_native.pdb", "wgpu_native.pdb")]
     for i, (src, name) in enumerate(files):
         if src.is_file():
             put(src, dist / name)

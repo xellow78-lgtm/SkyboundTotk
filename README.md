@@ -298,7 +298,7 @@ environment variables (in `launcher.ini` as `env.NAME = value`):
 | `RX_OBJ_MV_RIGID=1` | Per-object motion also follows draws without bones (slower: off by default) |
 | `RX_OBJ_MV_ALL=1` | With `RX_OBJ_MV_RIGID=1`: redraw everything whose constants changed (the first build's way: slow) |
 | Ctrl+F5 in game | 8 s without the renderer's draws (the picture freezes or goes wrong), then the frame rate the game's own threads gave in the log: the ceiling a faster renderer could reach |
-| F5 in game | 15 s of the sampling profiler, every thread with each one's load; F5 again (pressed during a run, it starts when that one ends): the game's main thread with whole call stacks and where it waits (`HOS_PROFILE_F5_THREAD=<name>` for another: `NVN replay` for the renderer's) |
+| F5 in game | 15 s of the sampling profiler, every thread with each one's load; F5 again: the game's main thread with whole call stacks and where it waits (`HOS_PROFILE_F5_THREAD=<name>` for another, or a list `a,b` for the next presses in turn: `GPU` is the renderer's submit and encoding threads, `NVN replay` its replay thread). Presses during a run are counted and run after it |
 | `RX_DUMP_DIR=<folder>` | Where F12 frame dumps go (default `rx_frame`) |
 
 ---

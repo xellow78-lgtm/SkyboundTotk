@@ -665,35 +665,59 @@ static DWORD WINAPI prof_main(void *p) {
 }
 
 static volatile LONG f5_running, f5_runs, f5_pending;
+static char f5_name[64];
 void hos_profile_start(int seconds);
 static void f5_setup(int seconds) {
     /* (the first F5 every thread, the next ones one thread with whole call stacks and where it waits:
        HOS_PROFILE_F5_THREAD, the game's main thread by default: at ~50 fps on 2026-11-08 it was 42 % busy and the
-       rest waiting, and the frame rate was 68.7 without draws, so what it waits on is the question) */
+       rest waiting, and the frame rate was 68.7 without draws, so what it waits on is the question. A list, "a,b":
+       the second F5 a, the third b, then round again. A name part matches every thread containing it: "GPU" is the
+       submit thread and the finishers together) */
     const char *t = getenv("HOS_PROFILE_F5_THREAD");
-    prof_only = InterlockedIncrement(&f5_runs) > 1 ? (t && *t ? t : "MainThread") : NULL;
+    if (!t || !*t) t = "MainThread";
+    const LONG run = InterlockedIncrement(&f5_runs);
+    if (run == 1) {
+        prof_only = NULL;
+    } else {
+        int n = 1;
+        for (const char *q = t; *q; q++) n += *q == ',';
+        int k = (int)((run - 2) % n);
+        const char *s = t;
+        while (k-- > 0) s = strchr(s, ',') + 1;
+        const char *e = strchr(s, ',');
+        snprintf(f5_name, sizeof f5_name, "%.*s", (int)(e ? e - s : (ptrdiff_t)strlen(s)), s);
+        prof_only = f5_name;
+    }
     prof_from_f5 = 1;
     hos_log("profile: sampling %s for %d s (F5)", prof_only ? prof_only : "every thread", seconds);
 }
-static DWORD WINAPI prof_f5_main(void *p) {   /* (an F5 run, then the one pressed for while it ran) */
+static int f5_take_pending(void) {
+    for (;;) {
+        const LONG n = f5_pending;
+        if (n <= 0) return 0;
+        if (InterlockedCompareExchange(&f5_pending, n - 1, n) == n) return 1;
+    }
+}
+static DWORD WINAPI prof_f5_main(void *p) {   /* (an F5 run, then the ones pressed for while it ran) */
     for (;;) {
         prof_main(p);
         prof_only = NULL;
-        if (!InterlockedExchange(&f5_pending, 0)) break;
+        if (!f5_take_pending()) break;
         f5_setup((int)(intptr_t)p);
     }
     InterlockedExchange(&f5_running, 0);
-    if (InterlockedExchange(&f5_pending, 0)) hos_profile_start((int)(intptr_t)p);   /* (pressed just then) */
+    if (f5_take_pending()) hos_profile_start((int)(intptr_t)p);   /* (pressed just then) */
     return 0;
 }
 
 /* F5 in the game (display.c): the sampling profiler for that many seconds from now, once at a time (what HOS_PROFILE
    does from the start, aimed at a place: a slow shrine). The report goes to the log as HOS_PROFILE's does. F5 while
-   one runs: the next starts when it ends (it used to be dropped: a second press at ~15 s was lost on 2026-11-08). */
+   one runs: one more run after it, each press counted (F5 three times: every thread, then the first two names of
+   HOS_PROFILE_F5_THREAD, one after the other; presses during a run used to be dropped). */
 void hos_profile_start(int seconds) {
     if (InterlockedCompareExchange(&f5_running, 1, 0)) {
-        InterlockedExchange(&f5_pending, 1);
-        hos_log("profile: one is running: the next starts when it ends");
+        const LONG n = InterlockedIncrement(&f5_pending);
+        hos_log("profile: one is running: %ld more after it", (long)n);
         return;
     }
     f5_setup(seconds);
