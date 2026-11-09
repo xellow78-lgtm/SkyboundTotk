@@ -557,6 +557,12 @@ bool init_device(HWND hwnd) {
     dev.depth32_stencil8 = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_Depth32FloatStencil8);
     dev.timestamps = env_flag("RX_GPU_TIMING") && wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_TimestampQuery);
     if (dev.timestamps) have.push_back(WGPUFeatureName_TimestampQuery);
+    // (a pass with timestamps goes wgpu's usual way, its own command buffers and one for its barriers: ~680 command
+    // buffers begun a frame instead of a few, ~4 ms a frame more of the driver's CPU at the 2026-11-08 test spot
+    // (WGPU_HAL_STATS). Every frame rate measured with it on was low by that)
+    if (dev.timestamps)
+        hos_log("rx: RX_GPU_TIMING: timestamps on every pass cost the renderer CPU time (each pass gets its own command "
+                "buffers): leave it off when measuring the frame rate");
     WGPULimits limits{};
     wgpuAdapterGetLimits(dev.adapter, &limits);
 
