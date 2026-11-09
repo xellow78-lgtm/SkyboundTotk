@@ -708,6 +708,12 @@ def cmd_native(a):
     # (rain) and 10-22 (castle, game threads bound: 3 interleaved rounds, mixed, median 69.4 vs 73.2 fps).
     if os.environ.get("RX_MARCH"):
         base.append("-march=" + os.environ["RX_MARCH"])
+    # RX_NO_ADDR_WRAP=1 (experiment): the lifted code's loads and stores without the mask that wraps a guest address
+    # into the window (rt/a64.h A64_NO_WRAP). On TOTK 1.4.3's f_08087560 (a hot pointer-chasing loop): 7,988 -> 6,536
+    # x86 instructions with clang 18. An address outside the window then faults in the host. Branches are unchanged, so
+    # an RX_PGO profile still fits.
+    if os.environ.get("RX_NO_ADDR_WRAP"):
+        base.append("-DA64_NO_WRAP")
     # Guest stores mark their pages (rt/a64.h A64_MARK, as the web build does) instead of Windows' write watch telling
     # the renderer which pages changed: GetWriteWatch over the ~2 GB the GPU sees took 20-50 ms while the game streamed
     # (the game waits for that scan at its fences: ~55 ms hitches every few seconds walking on Great Sky Island; the

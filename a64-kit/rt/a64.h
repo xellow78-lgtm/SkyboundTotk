@@ -82,6 +82,19 @@ typedef GuestContext Ctx;
 #define A64_PAGE(a) (((uint64_t)(a) & A64_SPACE_MASK) >> 12)
 #endif
 #define A64_PAGES (1u << (A64_SPACE_BITS - 12))   /* 4 KB pages in the window (a64_dirty) */
+/* A64_LPTR / A64_LPAGE: the lifted code's own loads and stores (the accessors below). As A64_PTR / A64_PAGE, or with
+   A64_NO_WRAP (build.py RX_NO_ADDR_WRAP=1, experiment) without the mask: a guest address the game uses is inside the
+   window, and the mask is an AND on the address of every access (0.39 for each ARM instruction of TOTK 1.4.3's first
+   code file, weighted by a play session's samples) that also keeps a constant offset out of the x86 addressing mode.
+   An address outside the window then faults in the host instead of wrapping; a store faults before its mark, so the
+   unmasked page index is never used. The OS layer's GP() keeps the mask. */
+#if defined(A64_NO_WRAP) && A64_SPACE_BITS != 32
+#define A64_LPTR(a) (A64_MEM + (uint64_t)(a))
+#define A64_LPAGE(a) ((uint64_t)(a) >> 12)
+#else
+#define A64_LPTR(a) A64_PTR(a)
+#define A64_LPAGE(a) A64_PAGE(a)
+#endif
 
 /* Browser builds (A64_WRITE_TRACK): wasm has no page write watch, so every guest store marks its 4 KB page (first
    and last byte's: an unaligned store may cross a page); hos/web/win32.c's GetWriteWatch reads and clears the marks
@@ -97,29 +110,29 @@ typedef GuestContext Ctx;
 extern uint8_t a64_dirty[A64_PAGES];
 /* (Tried 2026-10-21: reading a mark first and writing it only when clear, against cache lines moving between cores:
    game threads +1.1 ms a frame, the code 18 MB bigger. Not kept.) */
-#define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[A64_PAGE(a)], 1, __ATOMIC_RELEASE), \
-                        __atomic_store_n(&a64_dirty[A64_PAGE((a) + (n) - 1)], 1, __ATOMIC_RELEASE))
+#define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[A64_LPAGE(a)], 1, __ATOMIC_RELEASE), \
+                        __atomic_store_n(&a64_dirty[A64_LPAGE((a) + (n) - 1)], 1, __ATOMIC_RELEASE))
 #elif defined(A64_WRITE_TRACK)
 extern uint8_t a64_dirty[A64_PAGES];
-#define A64_MARK(a, n) (a64_dirty[A64_PAGE(a)] = 1, a64_dirty[A64_PAGE((a) + (n) - 1)] = 1)
+#define A64_MARK(a, n) (a64_dirty[A64_LPAGE(a)] = 1, a64_dirty[A64_LPAGE((a) + (n) - 1)] = 1)
 #else
 #define A64_MARK(a, n) ((void)0)
 #endif
 
-A64_INLINE uint64_t recomp_load8(GuestContext *c, uint64_t a) { (void)c; return *(const uint8_t *)A64_PTR(a); }
-A64_INLINE uint64_t recomp_load16(GuestContext *c, uint64_t a) { uint16_t v; (void)c; memcpy(&v, A64_PTR(a), 2); return v; }
-A64_INLINE uint64_t recomp_load32(GuestContext *c, uint64_t a) { uint32_t v; (void)c; memcpy(&v, A64_PTR(a), 4); return v; }
-A64_INLINE uint64_t recomp_load64(GuestContext *c, uint64_t a) { uint64_t v; (void)c; memcpy(&v, A64_PTR(a), 8); return v; }
-A64_INLINE void recomp_store8(GuestContext *c, uint64_t a, uint64_t v) { (void)c; *(uint8_t *)A64_PTR(a) = (uint8_t)v; A64_MARK(a, 1); }
-A64_INLINE void recomp_store16(GuestContext *c, uint64_t a, uint64_t v) { uint16_t t = (uint16_t)v; (void)c; memcpy(A64_PTR(a), &t, 2); A64_MARK(a, 2); }
-A64_INLINE void recomp_store32(GuestContext *c, uint64_t a, uint64_t v) { uint32_t t = (uint32_t)v; (void)c; memcpy(A64_PTR(a), &t, 4); A64_MARK(a, 4); }
-A64_INLINE void recomp_store64(GuestContext *c, uint64_t a, uint64_t v) { (void)c; memcpy(A64_PTR(a), &v, 8); A64_MARK(a, 8); }
+A64_INLINE uint64_t recomp_load8(GuestContext *c, uint64_t a) { (void)c; return *(const uint8_t *)A64_LPTR(a); }
+A64_INLINE uint64_t recomp_load16(GuestContext *c, uint64_t a) { uint16_t v; (void)c; memcpy(&v, A64_LPTR(a), 2); return v; }
+A64_INLINE uint64_t recomp_load32(GuestContext *c, uint64_t a) { uint32_t v; (void)c; memcpy(&v, A64_LPTR(a), 4); return v; }
+A64_INLINE uint64_t recomp_load64(GuestContext *c, uint64_t a) { uint64_t v; (void)c; memcpy(&v, A64_LPTR(a), 8); return v; }
+A64_INLINE void recomp_store8(GuestContext *c, uint64_t a, uint64_t v) { (void)c; *(uint8_t *)A64_LPTR(a) = (uint8_t)v; A64_MARK(a, 1); }
+A64_INLINE void recomp_store16(GuestContext *c, uint64_t a, uint64_t v) { uint16_t t = (uint16_t)v; (void)c; memcpy(A64_LPTR(a), &t, 2); A64_MARK(a, 2); }
+A64_INLINE void recomp_store32(GuestContext *c, uint64_t a, uint64_t v) { uint32_t t = (uint32_t)v; (void)c; memcpy(A64_LPTR(a), &t, 4); A64_MARK(a, 4); }
+A64_INLINE void recomp_store64(GuestContext *c, uint64_t a, uint64_t v) { (void)c; memcpy(A64_LPTR(a), &v, 8); A64_MARK(a, 8); }
 /* Stores through SP (stack_stores in lift/a64_lift.py): the guest stack is never memory the GPU reads, so they mark no
    page. They are a quarter of TOTK's store sites (prologue saves, nearly every STP). */
-A64_INLINE void recomp_store8_sp(GuestContext *c, uint64_t a, uint64_t v) { (void)c; *(uint8_t *)A64_PTR(a) = (uint8_t)v; }
-A64_INLINE void recomp_store16_sp(GuestContext *c, uint64_t a, uint64_t v) { uint16_t t = (uint16_t)v; (void)c; memcpy(A64_PTR(a), &t, 2); }
-A64_INLINE void recomp_store32_sp(GuestContext *c, uint64_t a, uint64_t v) { uint32_t t = (uint32_t)v; (void)c; memcpy(A64_PTR(a), &t, 4); }
-A64_INLINE void recomp_store64_sp(GuestContext *c, uint64_t a, uint64_t v) { (void)c; memcpy(A64_PTR(a), &v, 8); }
+A64_INLINE void recomp_store8_sp(GuestContext *c, uint64_t a, uint64_t v) { (void)c; *(uint8_t *)A64_LPTR(a) = (uint8_t)v; }
+A64_INLINE void recomp_store16_sp(GuestContext *c, uint64_t a, uint64_t v) { uint16_t t = (uint16_t)v; (void)c; memcpy(A64_LPTR(a), &t, 2); }
+A64_INLINE void recomp_store32_sp(GuestContext *c, uint64_t a, uint64_t v) { uint32_t t = (uint32_t)v; (void)c; memcpy(A64_LPTR(a), &t, 4); }
+A64_INLINE void recomp_store64_sp(GuestContext *c, uint64_t a, uint64_t v) { (void)c; memcpy(A64_LPTR(a), &v, 8); }
 A64_INLINE void recomp_stp32_sp(GuestContext *c, uint64_t a, uint64_t v0, uint64_t v1) { recomp_store32_sp(c, a, v0); recomp_store32_sp(c, a + 4, v1); }
 A64_INLINE void recomp_stp64_sp(GuestContext *c, uint64_t a, uint64_t v0, uint64_t v1) { recomp_store64_sp(c, a, v0); recomp_store64_sp(c, a + 8, v1); }
 A64_INLINE void recomp_ldp32(GuestContext *c, uint64_t a, uint64_t *lo, uint64_t *hi) { *lo = recomp_load32(c, a); *hi = recomp_load32(c, a + 4); }

@@ -381,6 +381,13 @@ the translated game code, `rt/`, `hos/` and the renderer:
 Functions are matched by name and a hash of their control flow, so code that changed after the training gets no
 counts, without a warning: train again after a change to the lifter or the renderer.
 
+**Guest addresses without the wrap (experiment, `RX_NO_ADDR_WRAP=1` in `build_options.txt`):** the translated code
+masks every guest address into the 8 GB window before it adds the window's base. The game only uses addresses inside
+the window, so the mask is an extra AND on every load and store, and it keeps constant offsets out of the x86
+addressing mode. With the option the translated code's own loads and stores leave it out (`rt/a64.h` `A64_NO_WRAP`;
+the OS layer keeps it). A wild address then crashes in the host instead of wrapping around. Not measured in the game
+yet. The option changes no branch, so a PGO profile still fits.
+
 **Troubleshooting:** Python or `lz4` missing → install them for the Python on PATH. Headers or libraries missing →
 use the x64 Native Tools prompt and check the C++ tools, Windows SDK, clang and lld. "Wrong module" → check the
 folder layout and version. DLSS starts as FSR 2 → build with **DLSS library** ticked (the WebGPU library has to be
