@@ -40,3 +40,6 @@ third_party/vulkan-headers/
 third_party/wgpu-native/lib/*.orig
 # Built locally for Linux. See README.md. Do not commit it.
 third_party/wgpu-native/lib/libwgpu_native.so
+
+# Local build options (a64-kit/build.py reads them; not shared).
+/build_options.txt

@@ -430,6 +430,166 @@ static void note_wait(HANDLE proc, const DWORD64 *stack, int depth, const char *
     if (c == nwaits && nwaits < 256) { snprintf(waits[c].chain, sizeof waits[c].chain, "%s", chain); waits[c].n = 0; nwaits++; }
     if (c < nwaits) waits[c].n++;
 }
+/* HOS_PROFILE_SAMPLE_PGO=<file>: an LLVM sample profile of the lifted code (clang -fprofile-sample-use), from the
+   game threads' self samples of every profiler run, written at the end of each run (the counts add up over the runs
+   of one session). Needs an exe whose lifted code has line tables (build_options.txt RX_PROFILE_LINES=1) and its PDB.
+   Each sample's address goes to its function (f_XXXXXXXX) and its line in that function's lifted C (one guest
+   instruction a line), as an offset from the line the function starts on. An address in code inlined from elsewhere
+   is put on the line of the call, through dbghelp's inline frames when the line table names the callee's file. */
+typedef struct { DWORD64 pc; unsigned n; } PgoPc;
+#define PGO_BITS 21
+static PgoPc *pgo_pcs;
+static unsigned pgo_npcs;
+static uint64_t pgo_samples;
+static void pgo_note(DWORD64 pc) {
+    unsigned h = (unsigned)((pc >> 2) * 0x9E3779B97F4A7C15ull >> (64 - PGO_BITS));
+    for (;;) {
+        PgoPc *e = &pgo_pcs[h];
+        if (e->pc == pc) { e->n++; break; }
+        if (!e->pc) {
+            if (pgo_npcs >= (1u << PGO_BITS) / 4 * 3) return;
+            e->pc = pc, e->n = 1, pgo_npcs++;
+            break;
+        }
+        h = (h + 1) & ((1u << PGO_BITS) - 1);
+    }
+    pgo_samples++;
+}
+static uint32_t pgo_file_hash(const char *f) {
+    uint32_t h = 2166136261u;
+    for (; f && *f; f++) h = (h ^ (uint8_t)(*f == '/' ? '\\' : *f >= 'A' && *f <= 'Z' ? *f + 32 : *f)) * 16777619u;
+    return h;
+}
+typedef struct { DWORD64 start; DWORD line0; uint32_t file; char name[24]; } PgoFn;
+typedef struct { uint32_t fn, off; uint64_t n; } PgoLine;
+static int pgo_cmp(const void *a, const void *b) {
+    const PgoLine *x = (const PgoLine *)a, *y = (const PgoLine *)b;
+    return x->fn != y->fn ? (x->fn < y->fn ? -1 : 1) : x->off != y->off ? (x->off < y->off ? -1 : 1) : 0;
+}
+/* (dbghelp's inline frames, Windows 8 and later: looked up at run time, so older headers build this) */
+typedef DWORD (WINAPI *PgoInlineCount)(HANDLE, DWORD64);
+typedef BOOL (WINAPI *PgoInlineTrace)(HANDLE, DWORD64, DWORD, DWORD64, DWORD64, LPDWORD, LPDWORD);
+typedef BOOL (WINAPI *PgoInlineLine)(HANDLE, DWORD64, ULONG, DWORD64, PDWORD, PIMAGEHLP_LINE64);
+static int pgo_line(HANDLE proc, DWORD64 pc, uint32_t file, DWORD *line, int *via_inline) {
+    IMAGEHLP_LINE64 li;
+    DWORD disp = 0;
+    memset(&li, 0, sizeof li);
+    li.SizeOfStruct = sizeof li;
+    *via_inline = 0;
+    if (SymGetLineFromAddr64(proc, pc, &disp, &li) && pgo_file_hash(li.FileName) == file) {
+        *line = li.LineNumber;
+        return 1;
+    }
+    static PgoInlineCount count;
+    static PgoInlineTrace trace;
+    static PgoInlineLine inl;
+    static int looked;
+    if (!looked) {
+        HMODULE m = GetModuleHandleA("dbghelp.dll");
+        count = m ? (PgoInlineCount)(void *)GetProcAddress(m, "SymAddrIncludeInlineTrace") : NULL;
+        trace = m ? (PgoInlineTrace)(void *)GetProcAddress(m, "SymQueryInlineTrace") : NULL;
+        inl = m ? (PgoInlineLine)(void *)GetProcAddress(m, "SymGetLineFromInlineContext") : NULL;
+        looked = 1;
+    }
+    if (!count || !trace || !inl) return 0;
+    const DWORD frames = count(proc, pc);
+    DWORD ctx = 0, index = 0;
+    if (!frames || !trace(proc, pc, 0, pc, pc, &ctx, &index)) return 0;
+    for (DWORD i = 0; i <= frames; i++) {   /* (the frame whose line is in the function's own file: the call) */
+        memset(&li, 0, sizeof li);
+        li.SizeOfStruct = sizeof li;
+        if (inl(proc, pc, ctx + i, 0, &disp, &li) && pgo_file_hash(li.FileName) == file) {
+            *line = li.LineNumber;
+            *via_inline = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+static void pgo_write(HANDLE proc, const char *path) {
+    enum { FN_BITS = 18, LN_BITS = 22 };
+    PgoFn *fns = (PgoFn *)calloc((size_t)1 << FN_BITS, sizeof *fns);
+    uint32_t *fn_slot = (uint32_t *)calloc((size_t)1 << FN_BITS, sizeof *fn_slot);
+    PgoLine *lines = (PgoLine *)calloc((size_t)1 << LN_BITS, sizeof *lines);
+    uint32_t *ln_slot = (uint32_t *)calloc((size_t)1 << LN_BITS, sizeof *ln_slot);
+    if (!fns || !fn_slot || !lines || !ln_slot) {
+        free(fns), free(fn_slot), free(lines), free(ln_slot);
+        hos_log("profile: sample profile: out of memory");
+        return;
+    }
+    unsigned nfn = 0, nln = 0;
+    uint64_t lifted = 0, mapped = 0, inlined = 0, other = 0;
+    char symbuf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)symbuf;
+    for (unsigned k = 0; k < (1u << PGO_BITS); k++) {
+        const PgoPc *e = &pgo_pcs[k];
+        if (!e->pc) continue;
+        memset(symbuf, 0, sizeof symbuf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        if (!SymFromAddr(proc, e->pc, &disp, sym) || strncmp(sym->Name, "f_", 2) || strlen(sym->Name) >= 24) {
+            other += e->n;
+            continue;
+        }
+        lifted += e->n;
+        unsigned h = (unsigned)((sym->Address >> 4) * 0x9E3779B1u) >> (32 - FN_BITS);
+        while (fn_slot[h] && fns[fn_slot[h] - 1].start != sym->Address) h = (h + 1) & ((1u << FN_BITS) - 1);
+        if (!fn_slot[h]) {
+            if (nfn + 1 >= (1u << FN_BITS) / 4 * 3) continue;
+            PgoFn *f = &fns[nfn];
+            f->start = sym->Address;
+            snprintf(f->name, sizeof f->name, "%s", sym->Name);
+            IMAGEHLP_LINE64 li;
+            DWORD d = 0;
+            memset(&li, 0, sizeof li);
+            li.SizeOfStruct = sizeof li;
+            if (SymGetLineFromAddr64(proc, sym->Address, &d, &li)) f->line0 = li.LineNumber, f->file = pgo_file_hash(li.FileName);
+            fn_slot[h] = ++nfn;
+        }
+        const uint32_t fi = fn_slot[h] - 1;
+        const PgoFn *f = &fns[fi];
+        DWORD line = 0;
+        int via = 0;
+        if (!f->line0 || !pgo_line(proc, e->pc, f->file, &line, &via) || line < f->line0 || line - f->line0 > 0xFFFF)
+            continue;
+        mapped += e->n;
+        inlined += via ? e->n : 0;
+        const uint32_t off = line - f->line0;
+        unsigned g = (unsigned)(((uint64_t)fi << 16 | off) * 0x9E3779B97F4A7C15ull >> (64 - LN_BITS));
+        while (ln_slot[g] && (lines[ln_slot[g] - 1].fn != fi || lines[ln_slot[g] - 1].off != off))
+            g = (g + 1) & ((1u << LN_BITS) - 1);
+        if (!ln_slot[g]) {
+            if (nln + 1 >= (1u << LN_BITS) / 4 * 3) continue;
+            lines[nln].fn = fi, lines[nln].off = off, lines[nln].n = 0;
+            ln_slot[g] = ++nln;
+        }
+        lines[ln_slot[g] - 1].n += e->n;
+    }
+    qsort(lines, nln, sizeof *lines, pgo_cmp);
+    FILE *out = fopen(path, "w");
+    unsigned written = 0;
+    for (unsigned i = 0; out && i < nln;) {
+        unsigned j = i;
+        uint64_t total = 0;
+        while (j < nln && lines[j].fn == lines[i].fn) total += lines[j].n, j++;
+        /* head (the function entered): the samples on its first sampled line, the entry or near it */
+        fprintf(out, "%s:%llu:%llu\n", fns[lines[i].fn].name, (unsigned long long)total, (unsigned long long)lines[i].n);
+        for (unsigned k = i; k < j; k++) fprintf(out, " %u: %llu\n", lines[k].off, (unsigned long long)lines[k].n);
+        written++;
+        i = j;
+    }
+    if (out) fclose(out);
+    hos_log("profile: sample profile %s: %llu samples of game threads, %llu in lifted code, %.1f%% of those on a line "
+            "of their function (%.1f%% through inline frames); %u functions, %u lines%s", path,
+            (unsigned long long)pgo_samples, (unsigned long long)lifted, lifted ? 100.0 * mapped / lifted : 0.0,
+            lifted ? 100.0 * inlined / lifted : 0.0, written, nln, out ? "" : " (could not write the file)");
+    if (lifted && mapped * 2 < lifted)
+        hos_log("profile: sample profile: most samples have no line: is the exe built with RX_PROFILE_LINES=1, and its "
+                "totk.pdb next to it?");
+    (void)other;
+    free(fns), free(fn_slot), free(lines), free(ln_slot);
+}
 static const char *volatile prof_only;   /* (hos_profile_start's second run: one thread, whole stacks) */
 static volatile int prof_from_f5;        /* (an F5 run: no HOS_PROFILE_DELAY, which is the startup run's) */
 static DWORD WINAPI prof_main(void *p) {
@@ -449,12 +609,17 @@ static DWORD WINAPI prof_main(void *p) {
     const char *callers_of = only ? getenv("HOS_PROFILE_CALLERS") : NULL;   /* (with HOS_PROFILE_THREAD) */
     const char *exclude = only ? getenv("HOS_PROFILE_EXCLUDE") : NULL;      /* samples under that frame: skipped */
     const char *lines_of = only ? getenv("HOS_PROFILE_LINES") : NULL;       /* self samples there, by source line */
-    if (lines_of) SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    const char *pgo_file = getenv("HOS_PROFILE_SAMPLE_PGO");
     if (delay && !prof_from_f5) Sleep((DWORD)atoi(delay) * 1000);
     HANDLE proc = GetCurrentProcess();
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-    static int sym_ready;   /* (once: an F5 run after another reuses it) */
-    if (!sym_ready) sym_init(proc), sym_ready = 1;
+    /* (line tables only when asked: a PDB with the lifted code's lines is big. The option used to be set and then
+       cleared again here, so HOS_PROFILE_LINES had none) */
+    const int want_lines = lines_of || pgo_file;
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | (want_lines ? SYMOPT_LOAD_LINES : 0));
+    static int sym_ready, sym_lines;   /* (once: an F5 run after another reuses it) */
+    if (sym_ready && want_lines && !sym_lines) SymCleanup(proc), sym_ready = 0;
+    if (!sym_ready) sym_init(proc), sym_ready = 1, sym_lines = want_lines;
+    if (pgo_file && !pgo_pcs) pgo_pcs = (PgoPc *)calloc((size_t)1 << PGO_BITS, sizeof *pgo_pcs);
     if (!hits) hits = (Hit *)calloc(MAXH, sizeof *hits);
     else memset(hits, 0, MAXH * sizeof *hits);
     /* HOS_PROFILE_PCS=<file>: every self sample's host instruction address and its function's start, as offsets in
@@ -475,6 +640,7 @@ static DWORD WINAPI prof_main(void *p) {
         HANDLE th[256];
         const char *names[256];
         int n = hos_thread_handles(th, names, 224);
+        const int ngame = n;   /* (the game's threads first, then the runtime's) */
         for (int i = 0; i < (nhost_threads < 32 ? (int)nhost_threads : 32) && n < 256; i++) {
             th[n] = host_threads[i].h;
             names[n++] = host_threads[i].name;
@@ -565,6 +731,7 @@ static DWORD WINAPI prof_main(void *p) {
                     if (k < nlines) lines[k].n++;
                 }
             }
+            if (pgo_pcs && i < ngame && depth && stack[0] >= exe_lo && stack[0] < exe_hi) pgo_note(stack[0]);
             if (pcs && npcs < MAXPCS && depth) {
                 const int j = hit_index(proc, stack[0], names[i]);
                 pcs[npcs] = stack[0], pcs_fn[npcs++] = j >= 0 ? hits[j].addr : 0;
@@ -684,6 +851,7 @@ static DWORD WINAPI prof_main(void *p) {
                 m_host, 100.0 * m_host / (busy ? busy : 1), m_wait);
     }
     fflush(stderr);
+    if (pgo_file && pgo_pcs) pgo_write(proc, pgo_file);
     if (getenv("HOS_PROFILE_EXIT")) {
         hos_log_flush();
         ExitProcess(4);
@@ -742,6 +910,9 @@ static DWORD WINAPI prof_f5_main(void *p) {   /* (an F5 run, then the ones press
    one runs: one more run after it, each press counted (F5 three times: every thread, then the first two names of
    HOS_PROFILE_F5_THREAD, one after the other; presses during a run used to be dropped). */
 void hos_profile_start(int seconds) {
+    /* (HOS_PROFILE_F5_SECONDS=<s>: longer runs, e.g. 300 for a sample profile of a play session) */
+    const char *len = getenv("HOS_PROFILE_F5_SECONDS");
+    if (len && atoi(len) > 0) seconds = atoi(len);
     if (InterlockedCompareExchange(&f5_running, 1, 0)) {
         const LONG n = InterlockedIncrement(&f5_pending);
         hos_log("profile: one is running: %ld more after it", (long)n);

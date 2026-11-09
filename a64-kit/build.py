@@ -620,10 +620,12 @@ def cmd_native(a):
     # Sample PGO of the lifted code (experiment): RX_PROFILE_LINES=1 builds it with line tables, so HOS_PROFILE_PCS
     # samples map to lifted source lines (scripts/sample_profile.py writes an LLVM sample profile from them);
     # RX_SAMPLE_PROFILE=<file> builds with that profile (line tables again: the profile is matched by line)
-    if os.environ.get("RX_PROFILE_LINES") or os.environ.get("RX_SAMPLE_PROFILE"):
+    # (hos_prof.c's HOS_PROFILE_SAMPLE_PGO writes one from a play session of an RX_PROFILE_LINES build;
+    # RX_SAMPLE_PROFILE=port: the port's ports/zelda-<name>/sample_profile.txt, used only when its .lifted stamp is
+    # the hash of the lifted code being built: the profile's samples are by line in that code)
+    sample_profile = os.environ.get("RX_SAMPLE_PROFILE") or ""
+    if os.environ.get("RX_PROFILE_LINES") or sample_profile:
         lifted_lto = lifted_lto + ["-gline-tables-only", "-fdebug-info-for-profiling"]
-    if os.environ.get("RX_SAMPLE_PROFILE"):
-        lifted_lto = lifted_lto + ["-fprofile-sample-use=" + os.path.abspath(os.environ["RX_SAMPLE_PROFILE"])]
     # The lifted code's context parameter is A64_NOESC (rt/a64.h), but LLVM only looks at a pointer's first 100 uses to
     # see whether it escapes and assumes it does past that: then every guest store may have changed the context.
     # RX_CAPTURE_USES=<n> (0: LLVM's default); with ThinLTO the link needs it too.
@@ -657,6 +659,34 @@ def cmd_native(a):
     # lifted chunks include only rt/ and generated headers; the OS layer also includes hos/*.h and the renderer's API
     apply_entry_hooks(gen, gv, img_dir)
     apply_splices(gen, gv)
+    # the lifted code's hash (native/lifted.sha1): a sample profile's lines are lines of this code
+    lifted_hash = hashlib.sha1()
+    for src in lifted:
+        lifted_hash.update(os.path.basename(src).encode())
+        with open(src, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                lifted_hash.update(chunk)
+    lifted_hash = lifted_hash.hexdigest()
+    stamp_path = os.path.join(nat, "lifted.sha1")
+    if not os.path.isfile(stamp_path) or open(stamp_path).read().strip() != lifted_hash:
+        open(stamp_path, "w").write(lifted_hash + "\n")
+    if sample_profile:
+        if sample_profile == "port":
+            sample_profile = os.path.join(HERE, "..", "ports", "zelda-" + a.name, "sample_profile.txt")
+            stamp = sample_profile[:-4] + ".lifted"
+            want = open(stamp).read().strip() if os.path.isfile(stamp) else None
+            if not os.path.isfile(sample_profile) or want != lifted_hash:
+                print("sample profile: %s is for other lifted code (%s, this build %s): not used" % (
+                    os.path.relpath(sample_profile, os.path.join(HERE, "..")), (want or "no stamp")[:12],
+                    lifted_hash[:12]))
+                sample_profile = ""
+        elif not os.path.isabs(sample_profile):
+            sample_profile = os.path.join(HERE, "..", sample_profile)
+        if sample_profile:
+            if not os.path.isfile(sample_profile):
+                sys.exit("RX_SAMPLE_PROFILE: no %s" % sample_profile)
+            print("sample profile: %s" % os.path.abspath(sample_profile))
+            lifted_lto = lifted_lto + ["-fprofile-sample-use=" + os.path.abspath(sample_profile)]
     deps_lifted = headers_key(RT, gen)
     deps_runtime = headers_key(RT, HOS, gen, os.path.join(GPU, "render"), *([linux_hos] if linux else []))
     # the renderer: WebGPU through wgpu-native (a release of github.com/gfx-rs/wgpu-native: include/, lib/)
@@ -971,7 +1001,28 @@ def cmd_run(a):
     sys.exit(subprocess.call(args + [r for r in a.rest if r != "--"]))
 
 
+def load_build_options():
+    """build_options.txt at the top of the source (not part of the repository): NAME=VALUE lines, environment
+    variables for this build that the launcher has no setting for (RX_PROFILE_LINES=1 for a sample profile, ...).
+    A variable already set in the environment wins. Lines starting with # are comments."""
+    path = os.path.join(HERE, "..", "build_options.txt")
+    if not os.path.isfile(path):
+        return
+    used = []
+    for line in open(path, encoding="utf-8", errors="replace").read().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = (x.strip() for x in line.split("=", 1))
+        if k and k not in os.environ:
+            os.environ[k] = v
+            used.append("%s=%s" % (k, v))
+    if used:
+        print("build options (build_options.txt): " + ", ".join(used))
+
+
 def main():
+    load_build_options()
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
     for name in ("lift", "native", "web", "stubs", "run"):

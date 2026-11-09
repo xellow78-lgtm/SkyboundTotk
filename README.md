@@ -346,6 +346,20 @@ clang, clang++ and lld (emsdk 6.0.9's LLVM: set `EMSDK`, default `C:\emsdk`, or 
 inputs match. If one was interrupted, move `build/` aside and retry. The script won't overwrite a non-empty
 `dist/SkyboundTOTK/`: move it aside first and keep its `user/` folder (your saves and settings).
 
+**Build options the launcher has no setting for:** put `NAME=VALUE` lines in `build_options.txt` at the top of the
+source folder (it is not part of the repository; a variable already set in the environment wins).
+
+**Profile-guided build of the game's code (experiment, sample PGO):** the game's own threads limit the frame rate
+in the open world, so their code is built with clang's `-fprofile-sample-use` from a profile of a play session:
+1. `RX_PROFILE_LINES=1` in `build_options.txt`, then build (the translated code is compiled again with line tables;
+   `totk.pdb` gets bigger).
+2. Play with `env.HOS_PROFILE_SAMPLE_PGO = <file>` and `env.HOS_PROFILE_F5_SECONDS = 300` in `launcher.ini`: press
+   F5 once in the world and play normally for 5 minutes. The profile is written when the run ends (the log says how
+   many samples landed on a line).
+3. `RX_SAMPLE_PROFILE=<file>` instead of `RX_PROFILE_LINES=1`, then build again. `RX_SAMPLE_PROFILE=port` takes
+   `ports/zelda-totk/sample_profile.txt`, only when its `.lifted` stamp matches the translated code being built
+   (`build/totk/native/lifted.sha1`): the profile counts samples by line of that code.
+
 **Troubleshooting:** Python or `lz4` missing → install them for the Python on PATH. Headers or libraries missing →
 use the x64 Native Tools prompt and check the C++ tools, Windows SDK, clang and lld. "Wrong module" → check the
 folder layout and version. DLSS starts as FSR 2 → build with **DLSS library** ticked (the WebGPU library has to be
